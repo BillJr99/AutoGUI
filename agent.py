@@ -123,8 +123,12 @@ class Agent:
         registry: ToolRegistry,
         cfg: dict,
         event_sink: Callable[["AgentEvent"], None] | None = None,
+        fast_client: OpenWebUIClient | None = None,
     ):
         self._client = client
+        # Optional cheap/fast model used for the validator; falls back to
+        # the primary client when not configured.
+        self._fast_client = fast_client
         self._registry = registry
         self._cfg = cfg
         self._agent_cfg = cfg.get("agent", {})
@@ -562,6 +566,29 @@ class Agent:
             vision_messages: list[dict] = []       # appended after tool results
             failed_tools:  list[str]  = []         # track failures for retry directive
 
+            # ---- Capture pre-action window state for the diff ------------
+            # Only relevant when at least one of the upcoming tool calls is a
+            # desktop action.  Skipped otherwise to avoid wasting a wmctrl call.
+            pre_windows = None
+            tool_names_pending = {
+                tc.get("function", {}).get("name", "") for tc in tool_calls
+            }
+            if (
+                any(n.startswith("desktop_") and n not in (
+                    "desktop_list_windows", "desktop_screenshot",
+                    "desktop_screenshot_marked", "desktop_get_active_window",
+                    "desktop_get_cursor_pos", "desktop_get_window_text",
+                    "desktop_get_window_tree", "desktop_find_element",
+                    "desktop_find_text",
+                ) for n in tool_names_pending)
+                and "desktop_list_windows" in available_tools
+            ):
+                try:
+                    pre_json = await self._registry.dispatch("desktop_list_windows", {})
+                    pre_windows = json.loads(pre_json).get("windows", [])
+                except Exception:
+                    pre_windows = None
+
             for tc in tool_calls:
                 tool_name = tc.get("function", {}).get("name", "unknown")
                 call_id = tc.get("id", "")
@@ -577,7 +604,16 @@ class Agent:
                 yield AgentEvent(
                     kind="tool_call",
                     content=f"→ {tool_name}({', '.join(f'{k}={repr(v)[:60]}' for k, v in args.items())})",
-                    data={"tool_name": tool_name, "args": args, "call_id": call_id, "iteration": iteration},
+                    data={
+                        "tool_name": tool_name,
+                        "args": args,
+                        "call_id": call_id,
+                        "iteration": iteration,
+                        # Phase 6b: stitch the model's preceding rationale onto
+                        # every tool_call event so observability tools can show
+                        # "why did the model do this?" without re-walking history.
+                        "rationale": (text_content or "")[:400],
+                    },
                 )
 
                 # Safety countdown: yield one event per second so consumers can
@@ -796,11 +832,63 @@ class Agent:
                         launch_reminder = ""
                         if "desktop_launch" in desktop_actions_taken:
                             launch_reminder = " " + self._prompts.text("runtime_launch_reminder")
+
+                        # ---- State-diff banner (Phases 4a/4b) -----------
+                        # Compare pre/post window sets and surface "nothing
+                        # happened" or "a modal popped up" as a one-line
+                        # banner, so the model deliberately notices the
+                        # change rather than glossing past it.
+                        diff_banner = ""
+                        modal_banner = ""
+                        try:
+                            post_windows = json.loads(windows_json).get("windows", [])
+                        except Exception:
+                            post_windows = []
+                        if pre_windows is not None:
+                            pre_ids = {(w.get("id"), w.get("title", "")) for w in pre_windows}
+                            post_ids = {(w.get("id"), w.get("title", "")) for w in post_windows}
+                            added = post_ids - pre_ids
+                            removed = pre_ids - post_ids
+                            yield AgentEvent(
+                                kind="state_diff",
+                                content=(
+                                    f"Δ windows added={len(added)} removed={len(removed)} "
+                                    f"total {len(pre_windows)}→{len(post_windows)}"
+                                ),
+                                data={
+                                    "added": [t for _, t in added],
+                                    "removed": [t for _, t in removed],
+                                    "iteration": iteration,
+                                },
+                            )
+                            if not added and not removed:
+                                diff_banner = (
+                                    " [State-diff: no window changes — the action "
+                                    "may not have taken effect; verify carefully.]"
+                                )
+                            else:
+                                diff_banner = (
+                                    f" [State-diff: +{len(added)} -{len(removed)} windows.]"
+                                )
+                            modal_pat = re.compile(
+                                r"\b(error|warning|sign[ -]?in|password|allow|"
+                                r"permission|are you sure|confirm|update available)\b",
+                                re.IGNORECASE,
+                            )
+                            modal_titles = [t for _, t in added if t and modal_pat.search(t)]
+                            if modal_titles:
+                                modal_banner = (
+                                    " [UNEXPECTED MODAL: new window(s) "
+                                    + ", ".join(repr(t) for t in modal_titles)
+                                    + " — handle this dialog before continuing.]"
+                                )
                         self._history.append({
                             "role": "user",
                             "content": (
                                 f"[Auto-verify after {', '.join(sorted(desktop_actions_taken))}] "
                                 f"Current desktop state: {windows_json}"
+                                + diff_banner
+                                + modal_banner
                                 + launch_reminder
                             ),
                         })
@@ -1041,10 +1129,11 @@ class Agent:
             },
         ]
 
+        validator_client = self._fast_client or self._client
         try:
-            response = await self._client.chat(messages=validator_messages, tools=None)
-            message = self._client.extract_message(response)
-            verdict = self._client.extract_text(message).strip()
+            response = await validator_client.chat(messages=validator_messages, tools=None)
+            message = validator_client.extract_message(response)
+            verdict = validator_client.extract_text(message).strip()
         except Exception as e:
             logger.warning("[agent.py:_check_command_coherence] Validator call failed: %s", e)
             return True, args, f"validator error (letting through): {e}"

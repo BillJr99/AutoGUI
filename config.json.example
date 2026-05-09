@@ -7,6 +7,15 @@
     "max_tokens": 4096,
     "timeout_seconds": 120
   },
+  "openwebui_fast": {
+    "_comment": "Optional second client used for cheap auxiliary calls (validator). Omit this block to reuse the primary client for everything.",
+    "base_url": "http://localhost:3000",
+    "api_key": "sk-your-openwebui-api-key-here",
+    "model": "llama3.1:8b",
+    "temperature": 0.0,
+    "max_tokens": 1024,
+    "timeout_seconds": 60
+  },
   "prompts_dir": "prompts",
   "agent": {
     "max_iterations": 30,
@@ -20,12 +29,17 @@
       "sudo rm",
       "rmdir"
     ],
-    "vision_screenshots": true
+    "vision_screenshots": true,
+    "record_trace": true,
+    "trace_dir": "logs/traces",
+    "suggest_skills": true,
+    "skills_path": "~/.autogui/skills.jsonl"
   },
   "tools": {
     "shell_timeout_seconds": 30,
     "screenshot_dir": "screenshots",
     "max_screenshot_width": 1280,
+    "perception_cache_ttl_seconds": 0.5,
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,
@@ -44,6 +58,10 @@
     "history_file": "logs/history.jsonl"
   },
   "safety": {
-    "command_confirm_delay_seconds": 5
+    "command_confirm_delay_seconds": 5,
+    "dry_run": false,
+    "allowed_apps": [],
+    "blocked_window_titles": [],
+    "fs_write_snapshot_dir": ""
   }
 }

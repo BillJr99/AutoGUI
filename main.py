@@ -141,6 +141,11 @@ def build_components(cfg: dict):
     """
     Construct and return the (client, registry, agent) triple.
 
+    When the config provides an `openwebui_fast` block, a second client is
+    instantiated and passed to the agent for cheap auxiliary calls (e.g.
+    the coherence validator).  The main client is still used for every
+    user-facing tool-calling turn.
+
     Returns
     -------
     tuple[OpenWebUIClient, ToolRegistry, Agent]
@@ -154,8 +159,23 @@ def build_components(cfg: dict):
         max_tokens=ow_cfg.get("max_tokens", 4096),
         timeout_seconds=ow_cfg.get("timeout_seconds", 120),
     )
+    fast_client = None
+    fast_cfg = cfg.get("openwebui_fast")
+    if fast_cfg:
+        try:
+            fast_client = OpenWebUIClient(
+                base_url=fast_cfg.get("base_url", ow_cfg.get("base_url", "")),
+                api_key=fast_cfg.get("api_key", ow_cfg.get("api_key", "")),
+                model=fast_cfg.get("model", ow_cfg.get("model", "")),
+                temperature=fast_cfg.get("temperature", 0.0),
+                max_tokens=fast_cfg.get("max_tokens", 1024),
+                timeout_seconds=fast_cfg.get("timeout_seconds", 60),
+            )
+        except Exception as e:
+            print(f"[main] Fast client init failed: {e}; using primary for everything.")
+            fast_client = None
     registry = ToolRegistry(cfg)
-    agent = Agent(client, registry, cfg)
+    agent = Agent(client, registry, cfg, fast_client=fast_client)
     return client, registry, agent
 
 
