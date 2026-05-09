@@ -275,10 +275,35 @@ pixel coordinates.
 
 The first time you start AutoGUI with browser tools enabled it will
 detect that Playwright + Chromium are missing and install them for
-you (`pip install playwright` then `playwright install chromium`).
-Loud by design — every command prints to stdout so you can see what
-gets installed and where. Set `tools.auto_install_playwright: false`
-to opt out and install manually.
+you. Loud by design — every command prints to stdout so you can see
+what gets installed and where. Set `tools.auto_install_playwright:
+false` to opt out and install manually.
+
+**What auto-install runs** (`tesseract_install.py` and
+`playwright_install.py` are the source of truth). Run any of these
+yourself if you want to do it by hand:
+
+```bash
+# Playwright + Chromium (auto-install does these in order)
+pip install playwright
+python -m playwright install chromium
+
+# Tesseract — manual install
+# Linux (Debian/Ubuntu)
+sudo apt-get update && sudo apt-get install -y tesseract-ocr
+# Linux (Fedora)
+sudo dnf install -y tesseract
+# Linux (Arch)
+sudo pacman -S --noconfirm tesseract
+# Linux (openSUSE)
+sudo zypper install -y tesseract-ocr
+# macOS
+brew install tesseract
+# Windows (PowerShell as admin)
+winget install --id=UB-Mannheim.TesseractOCR --silent --accept-package-agreements --accept-source-agreements
+# Then in every case
+pip install pytesseract
+```
 
 Selectors follow Playwright syntax:
 - CSS: `button.primary`, `#login-form input[name="email"]`

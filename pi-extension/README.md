@@ -88,6 +88,61 @@ npm run typecheck
 
 The extension targets the installed Pi package name `@earendil-works/pi-coding-agent`.
 
+### Optional system dependencies (`/autogui-install-*` commands)
+
+Two slash-commands install optional features for you. You can also run the underlying shell commands yourself if you'd rather skip the in-Pi installer.
+
+**`/autogui-install-ocr`** — installs Tesseract for `desktop_click_text` / `desktop_find_text`. Internally picks the right command for your platform. Manual equivalents:
+
+```bash
+# Linux (Debian/Ubuntu) and WSL
+sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+# Linux (Fedora)
+sudo dnf install -y tesseract
+
+# Linux (Arch)
+sudo pacman -S --noconfirm tesseract
+
+# Linux (openSUSE)
+sudo zypper install -y tesseract-ocr
+
+# macOS (requires Homebrew first; see https://brew.sh)
+brew install tesseract
+
+# Windows (PowerShell as admin)
+winget install --id=UB-Mannheim.TesseractOCR --silent --accept-package-agreements --accept-source-agreements
+```
+
+After the binary is on PATH, OCR is ready — the pi-extension talks to `tesseract` via CLI, no Python wrapper needed. (The mainline AutoGUI Python agent additionally needs `pip install pytesseract`; the pi-extension does not.)
+
+**`/autogui-install-browser`** — installs Playwright + Chromium for the `browser_*` tool family. Manual equivalents (run in `pi-extension/`):
+
+```bash
+npm install playwright
+npx --yes playwright install chromium
+```
+
+After this, set `allowedBrowser: true` in `pi-extension/config.json` (or `~/.autogui/pi-extension.json`) and restart Pi to register the `browser_*` tools.
+
+**Linux accessibility (`desktop_click_element`)** is *not* covered by an `/autogui-install` command because installation needs `apt`-installed gobject bindings, not just a binary. Manual install:
+
+```bash
+sudo apt install -y python3 python3-pyatspi gir1.2-atspi-2.0
+```
+
+Some apps need to be launched with `GTK_MODULES=gail:atk-bridge`, or the desktop session needs accessibility enabled, before they expose an AT-SPI tree. Without the helper, `desktop_click_element` returns the install instructions and the agent falls through the click ladder to `desktop_click_text` / `desktop_click_mark`.
+
+**ImageMagick** (used for the Set-of-Mark overlay on `desktop_screenshot_marked` and the failure-recording GIF assembly):
+
+```bash
+sudo apt install -y imagemagick      # Linux
+brew install imagemagick             # macOS
+winget install ImageMagick.ImageMagick   # Windows
+```
+
+When ImageMagick is missing, marks are still emitted as a list (you can call `desktop_click_mark(id)` even without the visual overlay), and failure recordings are written as a manifest file listing the captured PNG frames instead of a single GIF.
+
 ## Load The Extension
 
 For local development:
