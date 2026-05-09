@@ -35,7 +35,6 @@ is configured to use and exposes desktop tools plus `/autogui`.
 | **Browser (Playwright)** | First-class Chromium driver: real DOM/ARIA selectors, `browser_click`, `browser_fill`, `browser_eval` — opt-in via `allowed_browser` |
 | **Native input (Windows)** | `click`/`type_text`/`hotkey` go through `user32.SendInput` directly (real INPUT events, correct DPI, full Unicode) |
 | **Best-of-N sampling** | On uncertain steps (recent failure or non-APPROVED validator), sample N candidates and pick via self-consistency or a verifier model |
-| **Two-tier model** | Optional cheap `openwebui_fast` client for the validator/verifier; primary client owns user-facing turns |
 | **Skill library** | `skill_save`/`skill_list`/`skill_run`: persist successful tool sequences, retrieve them by keyword on the next task |
 | **Trajectory replay** | Per-session JSONL trace + `replay.py` re-runs any saved skill or trace deterministically (no LLM) |
 | **Failure recording** | Rolling 5-second screen buffer dumps to an animated GIF on tool failure |
@@ -236,7 +235,8 @@ produces a numbered, high-level plan (3–8 steps describing goals,
 not specific clicks). The plan is injected as a `[PLAN]` block into
 the executor's context so every subsequent decision has the full
 trajectory in mind. Configured under `agent.planner.enabled`,
-defaults on. The planner uses `openwebui_fast` when configured.
+defaults on. Same OpenWebUI client as the rest of the agent — one
+extra round-trip per task; no separate model required.
 
 **Dry-run** (`safety.dry_run: true`) is a *safety stub*, not a
 planner — it returns `{dry_run: true, would_execute: …}` for every
@@ -249,27 +249,7 @@ knots over the contradiction.
 If you want plan-first-then-execute semantics, leave dry-run off and
 keep the planner on — that's exactly what the planner does.
 
-**Why does the planner sometimes get a 401 when everything else
-works?** The planner uses `openwebui_fast` when configured. If you
-copied `config.json.example` and only updated the primary
-`openwebui.api_key`, the `openwebui_fast.api_key` field still has
-the placeholder `sk-your-openwebui-api-key-here`, which the server
-rejects with 401. AutoGUI now handles this two ways:
-
-1. **Startup detection.** If `openwebui_fast.api_key` is empty,
-   missing, or matches the example placeholder, AutoGUI logs a
-   warning and uses the primary key for the fast client. Prints:
-   ```
-   [main] openwebui_fast.api_key is empty/placeholder; using the
-   primary api_key for fast-client calls.
-   ```
-2. **Runtime auto-demote.** If the fast client returns 401 mid-
-   session (stale or revoked key), AutoGUI emits a `warning` event
-   and automatically falls back to the primary client for the rest
-   of the session. Fix or remove `openwebui_fast.api_key` to
-   silence the warning permanently.
-
-You can also turn the planner off entirely with
+You can turn the planner off entirely with
 `agent.planner.enabled: false` if you don't want the extra round-
 trip while debugging.
 
@@ -358,9 +338,9 @@ parallel, then choose between them via:
 
 1. **Self-consistency** — if a strong majority propose the same first
    tool + arg signature, that's the pick (no extra call).
-2. **Verifier** — otherwise the `openwebui_fast` client (or the
-   primary, if no fast client is configured) is given a one-line
-   summary of each candidate and asked which to use.
+2. **Verifier** — otherwise the same OpenWebUI client is given a
+   one-line summary of each candidate (no tools attached) and asked
+   to return only the index of the best one.
 3. **Fallback** — any failure path picks the first viable candidate,
    so BoN can never make the agent worse than baseline.
 
@@ -621,11 +601,6 @@ No configuration is needed.
     "max_tokens": 4096,                   // Max completion tokens per call
     "timeout_seconds": 120               // Per-request timeout
   },
-  "openwebui_fast": {                     // Optional second client used only for the
-    "base_url": "...",                    //   coherence validator (cheaper, faster
-    "api_key":  "...",                    //   model). Omit this whole block to reuse
-    "model":    "llama3.1:8b"             //   the primary client for everything.
-  },
   "install_dependencies": false,          // True = run scripts/install-dependencies.* at startup
   "agent": {
     "max_iterations": 30,                 // Hard stop after N agentic loop iterations
@@ -636,7 +611,7 @@ No configuration is needed.
     "suggest_skills": true,              // Offer top-K saved skills at task start
     "skills_path": "~/.autogui/skills.jsonl",  // Skill library location
     "planner": {                          // Pre-execution planning pass
-      "enabled": true                     // One extra LLM call up front; uses openwebui_fast when set
+      "enabled": true                     // One extra LLM call up front (uses the primary client)
     },
     "bon": {                              // Best-of-N action sampling
       "enabled": false,                   // Off by default — multiplies token cost on uncertain steps

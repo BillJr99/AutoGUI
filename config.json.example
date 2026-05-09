@@ -7,15 +7,6 @@
     "max_tokens": 4096,
     "timeout_seconds": 120
   },
-  "openwebui_fast": {
-    "_comment": "Optional second client used for cheap auxiliary calls (validator). Omit this block to reuse the primary client for everything.",
-    "base_url": "http://localhost:3000",
-    "api_key": "sk-your-openwebui-api-key-here",
-    "model": "llama3.1:8b",
-    "temperature": 0.0,
-    "max_tokens": 1024,
-    "timeout_seconds": 60
-  },
   "prompts_dir": "prompts",
   "_install_comment": "Set install_dependencies=true to run scripts/install-dependencies.* at startup (system + Python + Playwright + pi-extension Node deps).",
   "install_dependencies": false,
@@ -28,7 +19,7 @@
     "suggest_skills": true,
     "skills_path": "~/.autogui/skills.jsonl",
     "planner": {
-      "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces. Uses openwebui_fast when configured.",
+      "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces.",
       "enabled": true
     },
     "bon": {
