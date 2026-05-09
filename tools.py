@@ -712,7 +712,7 @@ class ToolRegistry:
                             "Find a UI element by its accessibility properties (name, type). "
                             "Returns the element's name, control type, and screen rect. "
                             "Use this to locate buttons/fields by name without knowing pixel positions. "
-                            "Supported on Windows (UIAutomation), macOS (osascript), and WSL."
+                            "Supported on Windows (UIAutomation), Linux (AT-SPI), and WSL."
                         ),
                         "parameters": {"type": "object", "properties": {
                             "name": {"type": "string", "description": "Element name or label (partial match)."},
@@ -725,6 +725,41 @@ class ToolRegistry:
                     lambda name=None, control_type=None, window_title=None, index=0:
                         b.find_element(name=name, control_type=control_type,
                                        window_title=window_title, index=index),
+                )
+                self._register(
+                    {"type": "function", "function": {
+                        "name": "desktop_click_element",
+                        "description": (
+                            "Find a UI element via the OS accessibility API and click it. "
+                            "PREFER THIS over desktop_click whenever the target has a "
+                            "visible name/label — it talks to the actual control instead "
+                            "of guessing pixel positions, so it survives DPI scaling, "
+                            "window moves, and UI redraws. Fall back to desktop_click_text "
+                            "or desktop_click_mark only when no a11y handle is exposed."
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "name": {"type": "string",
+                                     "description": "Element name or label (partial match)."},
+                            "control_type": {"type": "string",
+                                             "description": "Control type filter, e.g. 'ButtonControl' on Windows or 'push button' on Linux AT-SPI."},
+                            "window_title": {"type": "string",
+                                             "description": "Restrict to this window's subtree."},
+                            "index": {"type": "integer",
+                                      "description": "0-based index when multiple match."},
+                            "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                            "clicks": {"type": "integer",
+                                       "description": "1=single, 2=double."},
+                        }, "required": ["name"]},
+                    }},
+                    lambda name, control_type=None, window_title=None, index=0,
+                           button="left", clicks=1: b.click_element(
+                        name=str(name),
+                        control_type=str(control_type) if control_type else None,
+                        window_title=str(window_title) if window_title else None,
+                        index=int(index) if index else 0,
+                        button=str(button) if button else "left",
+                        clicks=int(clicks) if clicks else 1,
+                    ),
                 )
 
             # ── Extended: get_window_tree ─────────────────────────────

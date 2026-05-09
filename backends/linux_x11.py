@@ -22,7 +22,125 @@ logger = logging.getLogger(__name__)
 class X11Backend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
+        find_element = False
+        try:
+            import pyatspi  # noqa: F401
+            find_element = True
+        except Exception:
+            pass
+        return {
+            "find_element": find_element,
+            "get_window_tree": False,
+            "activate_window": True,
+            "get_active_window": True,
+            "get_window_text": True,
+        }
+
+    async def find_element(
+        self,
+        name: str | None = None,
+        control_type: str | None = None,
+        window_title: str | None = None,
+        index: int = 0,
+    ) -> dict:
+        """
+        Locate a UI element via the GNOME/Linux Accessibility bus (AT-SPI 2).
+
+        Requires pyatspi (and gir1.2-atspi-2.0). The whole walk runs in a
+        worker thread because pyatspi calls are blocking.
+
+        control_type filters by AT-SPI role name (case-insensitive),
+        e.g. "push button", "text", "label", "menu item", "frame".
+        window_title narrows the search to descendants of the matching
+        top-level frame.
+        """
+        if not name and not control_type:
+            return {"error": "Provide name or control_type"}
+        try:
+            import pyatspi  # type: ignore
+        except ImportError:
+            return {
+                "error": (
+                    "pyatspi not installed. Install with: "
+                    "sudo apt install python3-pyatspi gir1.2-atspi-2.0  "
+                    "(some apps must be launched with GTK_MODULES=gail:atk-bridge "
+                    "or under a session that has accessibility enabled)."
+                )
+            }
+
+        loop = asyncio.get_event_loop()
+
+        def _walk():
+            target_role = (control_type or "").lower().strip() or None
+            target_name = (name or "").lower().strip() or None
+            wanted_window = (window_title or "").lower().strip() or None
+            results: list[dict] = []
+
+            try:
+                desktop = pyatspi.Registry.getDesktop(0)
+            except Exception as e:
+                return {"error": f"AT-SPI desktop unavailable: {e}"}
+
+            def _node_to_dict(node):
+                try:
+                    role_name = node.getRoleName()
+                except Exception:
+                    role_name = ""
+                try:
+                    n = node.name or ""
+                except Exception:
+                    n = ""
+                rect = None
+                try:
+                    comp = node.queryComponent()
+                    extents = comp.getExtents(pyatspi.DESKTOP_COORDS)
+                    rect = {"x": extents.x, "y": extents.y,
+                            "width": extents.width, "height": extents.height}
+                except Exception:
+                    pass
+                return {"name": n, "control_type": role_name, "rect": rect}
+
+            def _recurse(node, restrict_window=False):
+                if len(results) > 50:
+                    return
+                info = _node_to_dict(node)
+                ok_name = (target_name is None) or (target_name in info["name"].lower())
+                ok_role = (target_role is None) or (target_role in info["control_type"].lower())
+                if info["rect"] and ok_name and ok_role and (info["name"] or info["control_type"]):
+                    results.append(info)
+                try:
+                    for child in node:
+                        _recurse(child, restrict_window=restrict_window)
+                except Exception:
+                    return
+
+            try:
+                for app in desktop:
+                    try:
+                        for top in app:
+                            top_name = (top.name or "").lower()
+                            if wanted_window and wanted_window not in top_name:
+                                continue
+                            _recurse(top)
+                    except Exception:
+                        continue
+            except Exception as e:
+                return {"error": f"AT-SPI walk failed: {e}"}
+
+            if not results:
+                return {"error": "No matching element found via AT-SPI."}
+            try:
+                idx = int(index or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            idx = max(0, min(idx, len(results) - 1))
+            return results[idx]
+
+        try:
+            return await loop.run_in_executor(None, _walk)
+        except Exception as e:
+            logger.debug("[x11:find_element] %s", traceback.format_exc())
+            return {"error": str(e)}
 
     async def type_text(self, text: str) -> dict:
         """Use xdotool type for reliable Unicode input on X11."""

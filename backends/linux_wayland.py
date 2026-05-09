@@ -41,7 +41,36 @@ _YDOTOOL_SCROLL = {
 class WaylandBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": False, "get_window_text": True}
+        find_element = False
+        try:
+            import pyatspi  # noqa: F401
+            find_element = True
+        except Exception:
+            pass
+        return {
+            "find_element": find_element,
+            "get_window_tree": False,
+            "activate_window": True,
+            "get_active_window": False,
+            "get_window_text": True,
+        }
+
+    async def find_element(
+        self,
+        name: str | None = None,
+        control_type: str | None = None,
+        window_title: str | None = None,
+        index: int = 0,
+    ) -> dict:
+        """AT-SPI lookup. Same implementation strategy as the X11 backend."""
+        from backends.linux_x11 import X11Backend
+        return await X11Backend.find_element(
+            self,
+            name=name,
+            control_type=control_type,
+            window_title=window_title,
+            index=index,
+        )
 
     async def screenshot(
         self,

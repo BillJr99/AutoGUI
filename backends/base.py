@@ -389,6 +389,51 @@ class DesktopBackend:
         click_r["method"] = result.get("method", "ocr")
         return click_r
 
+    async def click_element(
+        self,
+        name: str,
+        control_type: str | None = None,
+        window_title: str | None = None,
+        index: int = 0,
+        button: str = "left",
+        clicks: int = 1,
+    ) -> dict:
+        """
+        Find a UI element via the platform's accessibility API and click it.
+
+        This is the most reliable click variant — it talks to the actual
+        UI control by name/role rather than synthesizing an event at a
+        guessed pixel position.  Available wherever the backend reports
+        find_element=True (Windows UIAutomation, Linux AT-SPI, etc.).
+        """
+        if not name:
+            return {"error": "name is required"}
+        located = await self.find_element(
+            name=name,
+            control_type=control_type,
+            window_title=window_title,
+            index=int(index or 0),
+        )
+        if not isinstance(located, dict) or "error" in located:
+            return located if isinstance(located, dict) else {"error": str(located)}
+        rect = located.get("rect") or {}
+        try:
+            x = int(rect["x"]); y = int(rect["y"])
+            w = int(rect.get("width", rect.get("w", 0)))
+            h = int(rect.get("height", rect.get("h", 0)))
+        except (KeyError, TypeError, ValueError):
+            return {"error": f"find_element returned no usable rect: {located}"}
+        cx = x + max(1, w // 2)
+        cy = y + max(1, h // 2)
+        click_r = await self.click(cx, cy, button=button, clicks=int(clicks or 1))
+        click_r["resolved_to"] = {
+            "x": cx, "y": cy,
+            "name": located.get("name", name),
+            "control_type": located.get("control_type", control_type or ""),
+        }
+        click_r["method"] = "a11y"
+        return click_r
+
     async def click(
         self,
         x: int,
