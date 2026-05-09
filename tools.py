@@ -304,6 +304,20 @@ class ToolRegistry:
                 print(f"[tools.py:ToolRegistry.__init__] Backend init failed: {e}")
                 traceback.print_exc()
 
+        # Optional eager OCR install — runs once at startup when the user
+        # has explicitly opted in via tools.auto_install_tesseract.  Loud
+        # by design (prints every command) so the user sees what's happening.
+        if self._tools_cfg.get("auto_install_tesseract", False):
+            try:
+                from tesseract_install import ensure
+                snap = ensure(auto_install=True)
+                if snap.get("ready"):
+                    logger.info("[tools.py] OCR ready: %s", snap.get("tesseract_binary"))
+                else:
+                    logger.warning("[tools.py] OCR install: %s", snap.get("message"))
+            except Exception as e:
+                logger.warning("[tools.py] tesseract_install failed: %s", e)
+
         self._build()
 
     def _register(self, schema: dict, fn: Callable):

@@ -40,6 +40,7 @@
     "screenshot_dir": "screenshots",
     "max_screenshot_width": 1280,
     "perception_cache_ttl_seconds": 0.5,
+    "auto_install_tesseract": false,
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,

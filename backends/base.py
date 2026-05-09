@@ -314,9 +314,12 @@ class DesktopBackend:
         except ImportError:
             return {
                 "error": (
-                    "OCR fallback requires pytesseract — install with "
-                    "`pip install pytesseract` plus the tesseract system binary, "
-                    "or use desktop_find_element on Windows/macOS for a11y lookup."
+                    "OCR fallback requires pytesseract + the tesseract binary. "
+                    "Either set tools.auto_install_tesseract=true in config.json "
+                    "and restart so AutoGUI installs them for you, or install "
+                    "manually (see README → Set-of-Mark and click-by-text). "
+                    "Alternatively, on Windows/macOS use desktop_find_element "
+                    "for accessibility-tree lookup, which doesn't need OCR."
                 )
             }
 

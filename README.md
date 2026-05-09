@@ -155,6 +155,67 @@ pip install uiautomation pywin32
 pip install pyobjc-framework-Quartz pyobjc-framework-AppKit
 ```
 
+### OCR (click-by-text fallback)
+
+`desktop_click_text` and `desktop_find_text` use the accessibility tree on
+Windows/macOS. On Linux/X11/Wayland, or as a fallback when an element
+isn't exposed in the a11y tree, they use OCR via Tesseract. Setting up
+OCR is **optional** — without it the tools still work, they just return
+a "please install" message instead of a click.
+
+**Auto-install (recommended).** Set the config flag and AutoGUI handles
+the rest at startup:
+
+```jsonc
+{
+  "tools": {
+    "auto_install_tesseract": true
+  }
+}
+```
+
+On first launch with the flag enabled, AutoGUI runs the platform-native
+installer, then `pip install pytesseract`:
+
+| Platform        | Command issued                                                   |
+|-----------------|------------------------------------------------------------------|
+| Linux (Debian)  | `sudo apt-get install -y tesseract-ocr`                          |
+| Linux (Fedora)  | `sudo dnf install -y tesseract`                                  |
+| Linux (Arch)    | `sudo pacman -S --noconfirm tesseract`                           |
+| Linux (SUSE)    | `sudo zypper install -y tesseract-ocr`                           |
+| WSL             | uses the Linux side's `apt-get` (binary lives inside WSL)        |
+| macOS           | `brew install tesseract` (Homebrew must be installed first)      |
+| Windows         | `winget install --id=UB-Mannheim.TesseractOCR --silent`          |
+
+Each step is logged to stdout (`[tesseract_install] $ …`) so you can
+see exactly what's running. Auto-install attempts at most once per
+process; if the install fails, the message tells you why and you can
+fix it manually.
+
+**Manual install** if you'd rather not enable the flag:
+
+```bash
+# Linux / WSL
+sudo apt install tesseract-ocr && pip install pytesseract
+
+# macOS
+brew install tesseract && pip install pytesseract
+
+# Windows (PowerShell as admin)
+winget install UB-Mannheim.TesseractOCR
+pip install pytesseract
+# Then add C:\Program Files\Tesseract-OCR to PATH if winget didn't.
+```
+
+### Set-of-Mark grounding
+
+When vision is enabled, the agent uses **Set-of-Mark** screenshots:
+numbered boxes are drawn over detected UI elements, and the model
+clicks by ID via `desktop_click_mark(mark_id)` instead of guessing
+pixel coordinates. The marks come from the OS accessibility tree
+where available (Windows UIAutomation, macOS) and from window rects
+elsewhere. No setup required — it's on by default.
+
 ### Configuration
 
 ```bash
@@ -387,15 +448,27 @@ No configuration is needed.
     "max_tokens": 4096,                   // Max completion tokens per call
     "timeout_seconds": 120               // Per-request timeout
   },
+  "openwebui_fast": {                     // Optional second client used only for the
+    "base_url": "...",                    //   coherence validator (cheaper, faster
+    "api_key":  "...",                    //   model). Omit this whole block to reuse
+    "model":    "llama3.1:8b"             //   the primary client for everything.
+  },
   "agent": {
     "max_iterations": 30,                 // Hard stop after N agentic loop iterations
     "system_prompt": "...",              // Full system prompt (see config.json.example)
-    "confirm_destructive": true          // Block shell commands matching destructive patterns
+    "confirm_destructive": true,         // Block shell commands matching destructive patterns
+    "vision_screenshots": true,          // Send screenshots to vision-capable models
+    "record_trace": true,                // Persist every event to logs/traces/<session>.jsonl
+    "trace_dir": "logs/traces",          // Where the JSONL trajectory log lives
+    "suggest_skills": true,              // Offer top-K saved skills at task start
+    "skills_path": "~/.autogui/skills.jsonl"  // Skill library location
   },
   "tools": {
     "shell_timeout_seconds": 30,          // Per-command shell timeout
     "screenshot_dir": "screenshots",      // Directory for saved screenshots
     "max_screenshot_width": 1280,         // Resize screenshots wider than this (px)
+    "perception_cache_ttl_seconds": 0.5,  // Reuse the last screenshot for this long
+    "auto_install_tesseract": false,      // True = run the platform installer on startup
     "allowed_shell": true,               // Enable shell_run tool
     "allowed_filesystem": true,          // Enable fs_read / fs_write / fs_list
     "allowed_desktop": true,             // Enable all desktop/* tools
@@ -414,7 +487,12 @@ No configuration is needed.
     "history_file": "logs/history.jsonl" // Ctrl+S saves here
   },
   "safety": {
-    "command_confirm_delay_seconds": 5   // Countdown before each tool call (0 = off)
+    "command_confirm_delay_seconds": 5,  // Countdown before each tool call (0 = off)
+    "dry_run": false,                    // True = state-changing tools return a stub
+                                          //   {dry_run, would_execute} instead of running
+    "allowed_apps": [],                  // Restrict GUI actions to these apps; empty = unrestricted
+    "blocked_window_titles": [],         // Regex patterns; matching active window blocks GUI tools
+    "fs_write_snapshot_dir": ""           // Non-empty path = back up files before fs_write overwrite
   }
 }
 ```
