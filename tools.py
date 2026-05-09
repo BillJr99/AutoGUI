@@ -201,15 +201,41 @@ async def fs_read(path: str, max_bytes: int = 65536) -> dict:
         return {"error": str(e)}
 
 
-async def fs_write(path: str, content: str, mode: str = "w") -> dict:
+async def fs_write(
+    path: str,
+    content: str,
+    mode: str = "w",
+    snapshot_dir: str = "",
+) -> dict:
+    """
+    Write content to a file. When overwriting an existing file and
+    snapshot_dir is non-empty, copy the original aside first so the
+    write is recoverable.
+    """
     path = _coerce_path(path)
     content = content if isinstance(content, str) else str(content)
     try:
         p = Path(path).expanduser()
+        snapshot_path: str | None = None
+        if mode == "w" and snapshot_dir and p.exists() and p.is_file():
+            try:
+                import shutil
+                snap_dir = Path(snapshot_dir).expanduser()
+                snap_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(p))
+                snap = snap_dir / f"{ts}__{slug.strip('_')[:120]}"
+                shutil.copy2(p, snap)
+                snapshot_path = str(snap)
+            except Exception as e:
+                logger.warning("[fs_write] Snapshot failed for %s: %s", p, e)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open(mode, encoding="utf-8") as f:
             f.write(content)
-        return {"success": True, "path": str(p), "bytes_written": len(content.encode())}
+        result = {"success": True, "path": str(p), "bytes_written": len(content.encode())}
+        if snapshot_path:
+            result["snapshot"] = snapshot_path
+        return result
     except Exception as e:
         print(f"[tools.py:fs_write] {e}")
         traceback.print_exc()
@@ -340,6 +366,9 @@ class ToolRegistry:
                 }},
                 fs_read,
             )
+            snapshot_dir = self._safety_cfg.get(
+                "fs_write_snapshot_dir", ""
+            )  # empty string = snapshots disabled
             self._register(
                 {"type": "function", "function": {
                     "name": "fs_write",
@@ -350,7 +379,9 @@ class ToolRegistry:
                         "mode": {"type": "string", "enum": ["w", "a"]},
                     }, "required": ["path", "content"]},
                 }},
-                fs_write,
+                lambda path, content, mode="w": fs_write(
+                    path, content, mode=mode, snapshot_dir=snapshot_dir,
+                ),
             )
             self._register(
                 {"type": "function", "function": {
@@ -746,17 +777,104 @@ class ToolRegistry:
         },
         "fs_read": {"file": "path", "filename": "path", "filepath": "path"},
         "fs_write": {"file": "path", "filename": "path", "filepath": "path",
-                     "content": "text", "data": "text"},
+                     "text": "content", "data": "content"},
         "fs_list": {"dir": "path", "directory": "path", "folder": "path"},
     }
 
-    # Tools that mutate desktop state — perception cache must be flushed after.
+    # Tools that mutate desktop / system state — perception cache must be
+    # flushed after them, and they're the ones that dry-run / scoping gate.
     _STATE_CHANGING_TOOLS = frozenset({
         "desktop_click", "desktop_click_mark", "desktop_click_text",
         "desktop_type", "desktop_hotkey", "desktop_scroll",
         "desktop_launch", "desktop_activate_window", "desktop_mouse_move",
-        "shell_run",
+        "shell_run", "fs_write", "skill_run",
     })
+
+    # Tools that affect the GUI specifically — used by action scoping to
+    # decide whether the active window should be checked against the
+    # allow / block lists.
+    _GUI_ACTION_TOOLS = frozenset({
+        "desktop_click", "desktop_click_mark", "desktop_click_text",
+        "desktop_type", "desktop_hotkey", "desktop_scroll",
+        "desktop_mouse_move",
+    })
+
+    async def _check_action_scope(
+        self,
+        tool_name: str,
+        arguments: dict,
+    ) -> dict | None:
+        """
+        Apply the safety.allowed_apps / safety.blocked_window_titles policy.
+        Returns a dict (passed back as the tool result) when the action is
+        blocked, or None when it should proceed.
+
+        Both lists default to empty (no enforcement).
+        """
+        allowed = [a.lower() for a in self._safety_cfg.get("allowed_apps") or []]
+        blocked_titles = self._safety_cfg.get("blocked_window_titles") or []
+
+        if not allowed and not blocked_titles:
+            return None
+
+        # desktop_launch: gate on the application argument itself.
+        if tool_name == "desktop_launch":
+            if not allowed:
+                return None
+            app = str(arguments.get("application", "")).lower()
+            stem = app.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].rsplit(".", 1)[0]
+            for entry in allowed:
+                if entry in app or entry in stem:
+                    return None
+            return {
+                "error": (
+                    f"Action scope: application {app!r} is not in safety.allowed_apps "
+                    f"{allowed!r}. Update config or pick a permitted app."
+                )
+            }
+
+        if tool_name not in self._GUI_ACTION_TOOLS:
+            return None
+
+        # GUI action: consult the active window via the backend, if it has
+        # a get_active_window capability.  Without that capability we can't
+        # enforce, so let the action through — better than silent blocking.
+        if self._backend is None or not self._backend_caps.get("get_active_window"):
+            return None
+        try:
+            info = await self._backend.get_active_window()
+        except Exception as e:
+            logger.debug("[scope] get_active_window failed: %s", e)
+            return None
+        if not isinstance(info, dict) or not info.get("found"):
+            return None
+        win = info.get("window") or info
+        title = str(win.get("title", "") or "").lower()
+        app = str(win.get("app", "") or "").lower()
+
+        for pat in blocked_titles:
+            try:
+                if re.search(pat, title, re.IGNORECASE):
+                    return {
+                        "error": (
+                            f"Action scope: active window title {title!r} matches "
+                            f"safety.blocked_window_titles pattern {pat!r}."
+                        )
+                    }
+            except re.error:
+                continue
+
+        if allowed:
+            for entry in allowed:
+                if entry in app or entry in title:
+                    return None
+            return {
+                "error": (
+                    f"Action scope: active window app={app!r} title={title!r} "
+                    f"is not in safety.allowed_apps {allowed!r}."
+                )
+            }
+        return None
 
     async def dispatch(self, tool_name: str, arguments: dict) -> str:
         fn = self._dispatch.get(tool_name)
@@ -767,6 +885,25 @@ class ToolRegistry:
         aliases = self._ARG_ALIASES.get(tool_name, {})
         if aliases:
             arguments = {aliases.get(k, k): v for k, v in arguments.items()}
+
+        # Dry-run: short-circuit any state-changing tool with a synthetic
+        # result.  Read-only tools still execute so the model can reason
+        # over real screen / filesystem state.
+        if (
+            self._safety_cfg.get("dry_run", False)
+            and tool_name in self._STATE_CHANGING_TOOLS
+        ):
+            return json.dumps({
+                "dry_run": True,
+                "would_execute": {"tool": tool_name, "args": arguments},
+                "note": "safety.dry_run is on — no real action was taken.",
+            })
+
+        # Action scoping: refuse if the request falls outside the allow list
+        # or hits the block list.
+        block = await self._check_action_scope(tool_name, arguments)
+        if block is not None:
+            return json.dumps(block)
 
         try:
             logger.info("[tools.py:dispatch] %s(%s)", tool_name, list(arguments.keys()))
