@@ -1,0 +1,46 @@
+# OpenWebUI Desktop Agent — Python dependencies
+# Install: pip install -r requirements.txt
+
+# Core async HTTP client
+aiohttp>=3.9.0
+
+# TUI framework
+textual>=0.70.0
+
+# Rich output (pinned to avoid conflict with langflow-base)
+rich>=13.7.0,<14.0.0
+
+# Desktop automation baseline (cross-platform: Windows, macOS, Linux/X11)
+# Does NOT work on Wayland or headless WSL — those paths use CLI tools instead.
+pyautogui>=0.9.54
+Pillow>=10.0.0
+
+# ── Platform-specific (install only what applies to your OS) ──────────────
+
+# Windows native: UIAutomation element access (accessibility tree)
+# pip install uiautomation pywin32
+# uiautomation>=2.0.18
+# pywin32>=306
+
+# macOS: Quartz window listing and Retina screenshot support (via pyobjc)
+# pip install pyobjc-framework-Quartz pyobjc-framework-AppKit
+# pyobjc-framework-Quartz>=10.0
+# pyobjc-framework-AppKit>=10.0
+# Note: screencapture and osascript are always available on macOS without
+# any Python packages; Quartz is only needed for richer window metadata.
+
+# Linux/Wayland: no Python packages needed — uses system CLI tools:
+#   sudo apt install ydotool grim swaymsg   (Debian/Ubuntu)
+#   sudo pacman -S ydotool grim sway        (Arch)
+#   sudo ydotoold &                          (start the ydotool daemon)
+
+# Linux/X11: no Python packages needed beyond pyautogui — uses system CLI tools:
+#   sudo apt install wmctrl xdotool python3-tk python3-dev
+
+# WSL: no Python packages needed — uses powershell.exe via Windows interop.
+#   Ensure WSL interop is enabled: /etc/wsl.conf [interop] enabled=true
+#   For WSLg (GUI support): upgrade to Windows 11 or Windows 10 21H2+
+
+# ── Optional: browser automation (set "allowed_browser": true in config) ─
+# playwright>=1.40.0
+# After install: playwright install chromium
