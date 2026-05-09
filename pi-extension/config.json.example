@@ -1,0 +1,38 @@
+{
+  "_comment": "Optional config file for the AutoGUI Pi extension. Copy to pi-extension/config.json (or ~/.autogui/pi-extension.json) and edit. Every key has a sensible default — leave a key out to keep its default. The extension also boots cleanly with no config file at all.",
+
+  "skillsPath": "~/.autogui/skills.jsonl",
+  "recordTrace": true,
+  "traceDir": "~/.autogui/traces",
+
+  "autoInstallTesseract": false,
+  "autoInstallPlaywright": true,
+
+  "perceptionCacheTtlMs": 500,
+
+  "_browser_section": "Browser tools (Playwright). When allowedBrowser=true the extension installs Playwright + Chromium on first start (autoInstallPlaywright defaults to true).",
+  "allowedBrowser": false,
+  "browser": {
+    "headless": false,
+    "screenshotDir": "",
+    "userDataDir": "",
+    "viewport": { "width": 1280, "height": 800 }
+  },
+
+  "_safety_section": "Safety knobs. dryRun stubs every state-changing tool, allowedApps + blockedWindowTitles enforce a scoping policy before GUI actions.",
+  "dryRun": false,
+  "allowedApps": [],
+  "blockedWindowTitles": [],
+
+  "_planner_section": "When plannerEnabled is true (default), /autogui injects instructions telling the model to produce a numbered plan as its FIRST assistant message before executing.",
+  "plannerEnabled": true,
+
+  "_record_section": "Rolling screen buffer. On any tool failure the buffer is concatenated into a GIF under outDir for post-mortem.",
+  "screenRecord": {
+    "enabled": true,
+    "fps": 5,
+    "bufferSeconds": 5.0,
+    "maxWidth": 960,
+    "outDir": ""
+  }
+}

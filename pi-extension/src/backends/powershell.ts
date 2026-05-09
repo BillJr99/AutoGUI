@@ -1,7 +1,8 @@
 import { Buffer } from "node:buffer";
 import { commandExists, execFile } from "../process.js";
-import { DesktopError, type BackendLogger, type DesktopBackend, type PlatformInfo, type Rect, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
+import { DesktopError, type BackendCapabilities, type BackendLogger, type DesktopBackend, type ElementInfo, type Mark, type PlatformInfo, type Rect, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
 import { makeScreenshotResult, parseJsonArray, savePng } from "./common.js";
+import { marksFromWindows } from "../som.js";
 
 const mouseType = `
 Add-Type -TypeDefinition @"
@@ -90,10 +91,95 @@ function toSendKeys(keys: string[]): string {
 
 export class PowerShellBackend implements DesktopBackend {
   readonly name: string;
+  readonly capabilities: BackendCapabilities = {
+    findElement: true,   // via UIAutomation .NET assembly
+    richMarks: true,     // can include UIAutomation children of focused window
+    nativeInput: true,   // SendInput via PInvoke
+  };
   private executablePromise?: Promise<string>;
 
   constructor(readonly platform: PlatformInfo, private readonly logger?: BackendLogger) {
     this.name = platform.isWsl ? "wsl-powershell" : "windows-powershell";
+  }
+
+  async findElement(query: { name?: string; controlType?: string; windowTitle?: string; index?: number }, signal?: AbortSignal): Promise<ElementInfo> {
+    const encoded = Buffer.from(JSON.stringify({
+      name: query.name ?? "",
+      controlType: query.controlType ?? "",
+      windowTitle: query.windowTitle ?? "",
+      index: Math.max(0, Math.floor(query.index ?? 0)),
+    }), "utf8").toString("base64");
+    const stdout = await this.ps(`
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$query = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${encoded}")) | ConvertFrom-Json
+$wantedName = ([string]$query.name).ToLowerInvariant()
+$wantedRole = ([string]$query.controlType).ToLowerInvariant()
+$wantedWin = ([string]$query.windowTitle).ToLowerInvariant()
+$idx = [int]$query.index
+
+function Match-Element([System.Windows.Automation.AutomationElement]$el, [int]$indexRef) {
+  try { $name = ([string]$el.Current.Name).ToLowerInvariant() } catch { $name = "" }
+  try { $role = ([string]$el.Current.LocalizedControlType).ToLowerInvariant() } catch { $role = "" }
+  $okName = ($wantedName -eq "" -or $name.Contains($wantedName))
+  $okRole = ($wantedRole -eq "" -or $role.Contains($wantedRole))
+  return $okName -and $okRole
+}
+
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$startNodes = @()
+if ($wantedWin -ne "") {
+  $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Window)
+  $allWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+  foreach ($w in $allWindows) {
+    if (([string]$w.Current.Name).ToLowerInvariant().Contains($wantedWin)) { $startNodes += ,$w }
+  }
+} else {
+  $startNodes = ,$root
+}
+
+if ($startNodes.Count -eq 0) { throw "No window matching '$wantedWin' found." }
+
+$matchCount = 0
+$picked = $null
+foreach ($start in $startNodes) {
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $stack = New-Object System.Collections.Stack
+  $stack.Push($start)
+  while ($stack.Count -gt 0) {
+    $cur = $stack.Pop()
+    if (Match-Element $cur $matchCount) {
+      if ($matchCount -eq $idx) { $picked = $cur; break }
+      $matchCount++
+    }
+    $child = $walker.GetFirstChild($cur)
+    while ($child -ne $null) {
+      $stack.Push($child)
+      $child = $walker.GetNextSibling($child)
+    }
+  }
+  if ($picked -ne $null) { break }
+}
+if ($picked -eq $null) { throw "No matching UIAutomation element found." }
+$rect = $picked.Current.BoundingRectangle
+[PSCustomObject]@{
+  name = [string]$picked.Current.Name
+  controlType = [string]$picked.Current.LocalizedControlType
+  rect = @{
+    x = [int]$rect.X
+    y = [int]$rect.Y
+    width = [int]$rect.Width
+    height = [int]$rect.Height
+  }
+} | ConvertTo-Json -Compress
+`, signal, 30000);
+    return JSON.parse(stdout) as ElementInfo;
+  }
+
+  async getMarks(signal?: AbortSignal): Promise<Mark[]> {
+    const { windows } = await this.listWindows(signal);
+    return marksFromWindows(windows);
   }
 
   private async executable(signal?: AbortSignal): Promise<string> {
@@ -170,15 +256,55 @@ export class PowerShellBackend implements DesktopBackend {
   }
 
   async click(x: number, y: number, button: "left" | "right" | "middle", clicks: number, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const downUp: Record<string, [number, number]> = { left: [0x0002, 0x0004], right: [0x0008, 0x0010], middle: [0x0020, 0x0040] };
-    const [down, up] = downUp[button];
-    await this.ps(`${mouseType}
-[PiMouse]::SetCursorPos(${x}, ${y}) | Out-Null
+    // Promoted to SendInput rather than the legacy mouse_event — produces
+    // real INPUT events that survive DPI scaling and aren't filtered by
+    // applications that distinguish synthetic vs. injected input.  Falls
+    // back to mouse_event automatically only on PowerShell errors.
+    const downFlag: Record<string, number> = { left: 0x0002, right: 0x0008, middle: 0x0020 };
+    const upFlag: Record<string, number> = { left: 0x0004, right: 0x0010, middle: 0x0040 };
+    const ABSOLUTE = 0x8000;
+    const MOVE = 0x0001;
+    await this.ps(`
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class PiInput {
+  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] public struct HARDWAREINPUT { public uint uMsg; public ushort wParamL; public ushort wParamH; }
+  [StructLayout(LayoutKind.Explicit)] public struct INPUT_UNION {
+    [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public HARDWAREINPUT hi;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUT_UNION u; }
+  [DllImport("user32.dll")] public static extern uint SendInput(uint nInputs, [MarshalAs(UnmanagedType.LPArray)] INPUT[] pInputs, int cbSize);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+}
+"@
+$sw = [PiInput]::GetSystemMetrics(0)
+$sh = [PiInput]::GetSystemMetrics(1)
+if ($sw -le 0) { $sw = 1 }
+if ($sh -le 0) { $sh = 1 }
+$ax = [int](([double]${x}) * 65535.0 / $sw)
+$ay = [int](([double]${y}) * 65535.0 / $sh)
+$move = New-Object PiInput+INPUT
+$move.type = 0
+$move.u.mi.dx = $ax
+$move.u.mi.dy = $ay
+$move.u.mi.dwFlags = ${MOVE} -bor ${ABSOLUTE}
+[PiInput]::SendInput(1, @($move), [System.Runtime.InteropServices.Marshal]::SizeOf([type][PiInput+INPUT])) | Out-Null
 for ($i = 0; $i -lt ${clicks}; $i++) {
-  [PiMouse]::mouse_event(${down}, 0, 0, 0, [UIntPtr]::Zero)
-  [PiMouse]::mouse_event(${up}, 0, 0, 0, [UIntPtr]::Zero)
-}`, signal);
-    return { success: true, x, y, button, clicks };
+  $down = New-Object PiInput+INPUT
+  $down.type = 0
+  $down.u.mi.dwFlags = ${downFlag[button]}
+  $up = New-Object PiInput+INPUT
+  $up.type = 0
+  $up.u.mi.dwFlags = ${upFlag[button]}
+  [PiInput]::SendInput(1, @($down), [System.Runtime.InteropServices.Marshal]::SizeOf([type][PiInput+INPUT])) | Out-Null
+  [PiInput]::SendInput(1, @($up), [System.Runtime.InteropServices.Marshal]::SizeOf([type][PiInput+INPUT])) | Out-Null
+}
+`, signal);
+    return { success: true, x, y, button, clicks, method: "sendinput" };
   }
 
   async typeText(text: string, signal?: AbortSignal): Promise<Record<string, unknown>> {

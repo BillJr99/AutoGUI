@@ -1,13 +1,56 @@
 import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { commandExists, execFile, execFileWithStdin } from "../process.js";
-import { DesktopError, type DesktopBackend, type PlatformInfo, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
+import { DesktopError, type BackendCapabilities, type DesktopBackend, type ElementInfo, type Mark, type PlatformInfo, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
 import { createPngPath, makeScreenshotResult } from "./common.js";
+import { marksFromWindows } from "../som.js";
+
+const ATSPI_HELPER = join(dirname(dirname(fileURLToPath(import.meta.url))), "atspi_find.py");
 
 export class LinuxBackend implements DesktopBackend {
   readonly name: string;
+  readonly capabilities: BackendCapabilities = {
+    findElement: true,         // attempted via the python AT-SPI helper; degrades to error if missing
+    richMarks: false,          // window-level marks only on Linux v1
+    nativeInput: false,        // xdotool / ydotool — already platform-native
+  };
 
   constructor(readonly platform: PlatformInfo) {
     this.name = platform.isWayland ? "linux-wayland" : platform.isX11 ? "linux-x11" : "linux-headless";
+  }
+
+  async findElement(query: { name?: string; controlType?: string; windowTitle?: string; index?: number }, signal?: AbortSignal): Promise<ElementInfo> {
+    if (!await commandExists("python3", signal)) {
+      throw new DesktopError(
+        "python3 not found on PATH. desktop_click_element on Linux uses an AT-SPI helper " +
+        "that requires Python and pyatspi. Install with: sudo apt install python3 python3-pyatspi gir1.2-atspi-2.0",
+      );
+    }
+    const args = [ATSPI_HELPER];
+    if (query.name) args.push("--name", query.name);
+    if (query.controlType) args.push("--role", query.controlType);
+    if (query.windowTitle) args.push("--window", query.windowTitle);
+    if (typeof query.index === "number") args.push("--index", String(query.index));
+    const r = await execFile("python3", args, { timeoutMs: 15000, signal });
+    if (r.code !== 0 && !r.stdout.trim()) {
+      throw new DesktopError(`atspi_find helper failed: ${r.stderr.trim() || "unknown error"}`);
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(r.stdout.trim());
+    } catch {
+      throw new DesktopError(`atspi_find helper returned non-JSON: ${r.stdout.slice(0, 200)}`);
+    }
+    if ("error" in parsed) {
+      throw new DesktopError(String(parsed.error));
+    }
+    return parsed as unknown as ElementInfo;
+  }
+
+  async getMarks(signal?: AbortSignal): Promise<Mark[]> {
+    const { windows } = await this.listWindows(signal);
+    return marksFromWindows(windows);
   }
 
   async status(signal?: AbortSignal): Promise<Record<string, unknown>> {

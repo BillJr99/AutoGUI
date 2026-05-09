@@ -9,21 +9,73 @@ This extension is decoupled from OpenWebUI. It does not create a model client, m
 - `/autogui <task>`: sends a prepared desktop-automation prompt into Pi's normal agent loop.
 - `/autogui-abort`: aborts the current AutoGUI/Pi agent operation.
 - `/autogui-validate <task>`: spawns a separate read-only Pi validator in tmux.
-- `/desktop-status`: reports the detected backend and platform dependencies.
-- Desktop tools:
-  - `desktop_screenshot`
-  - `desktop_click`
-  - `desktop_type`
-  - `desktop_hotkey`
-  - `desktop_scroll`
-  - `desktop_list_windows`
-  - `desktop_active_window`
-  - `desktop_focus_window`
-  - `desktop_launch`
-  - `desktop_get_cursor_pos`
-  - `desktop_mouse_move`
+- `/autogui-install-ocr`: installs Tesseract OCR for `desktop_click_text`/`desktop_find_text`.
+- `/autogui-install-browser`: installs Playwright + Chromium for the `browser_*` tool family.
+- `/desktop-status`: reports the detected backend, capabilities, and config snapshot.
+- Desktop tools (all platforms):
+  - `desktop_screenshot`, `desktop_screenshot_marked`
+  - `desktop_click`, `desktop_click_mark`, `desktop_click_text`, `desktop_click_element`
+  - `desktop_find_text`
+  - `desktop_type`, `desktop_hotkey`, `desktop_scroll`
+  - `desktop_list_windows`, `desktop_active_window`, `desktop_focus_window`
+  - `desktop_launch`, `desktop_get_cursor_pos`, `desktop_mouse_move`
+  - `desktop_get_window_text`
+- Skill library (replayable macros):
+  - `skill_save`, `skill_list`, `skill_run`
+- Browser tools (registered when `allowedBrowser=true` in config; uses Playwright+Chromium):
+  - `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`
+  - `browser_click`, `browser_fill`, `browser_press`
+  - `browser_get_text`, `browser_screenshot`, `browser_eval`, `browser_close`
 
 Pi's built-in `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` tools remain responsible for coding and filesystem work.
+
+## Reliability Stack
+
+The tools above form a click-fidelity ladder; the system prompt teaches Pi to walk it in order:
+
+1. **`browser_click`** for any element on a web page (DOM/ARIA selectors).
+2. **`desktop_click_element`** for any native UI control with a visible name/label (UIAutomation on Windows, AT-SPI on Linux, AppleScript-AX on macOS).
+3. **`desktop_click_text`** finds visible text via OCR (Tesseract) and clicks the centre of its bounding box.
+4. **`desktop_screenshot_marked` + `desktop_click_mark`** uses Set-of-Mark grounding when the target lacks a clean name.
+5. **`desktop_click(x, y)`** is the last resort — only when none of the above can identify the target.
+
+Each step gracefully degrades: if Tesseract isn't installed `desktop_click_text` returns a "please install" message instead of failing silently. If the AT-SPI helper isn't available on Linux, `desktop_click_element` returns the install instructions. If `magick`/`convert` isn't on PATH, `desktop_screenshot_marked` still emits the marks list — the model can still call `desktop_click_mark(id)` even without the visual annotation overlay.
+
+## Other Features
+
+- **Planner**: when `plannerEnabled=true` (default) the `/autogui` system prompt instructs the model to produce a numbered plan as its first message before executing. No separate LLM call — Pi owns the model loop.
+- **Skill library**: `skill_save` snapshots the recipe of "what worked" in this session as a JSONL record at `~/.autogui/skills.jsonl` (shared format with the mainline AutoGUI). `/autogui` retrieves the top-3 candidate skills for the current task and lists them in the prompt; `skill_run` replays one deterministically through the same backend.
+- **Trajectory log**: every tool call (start, success, failure) is appended to `~/.autogui/traces/<session>.jsonl` for post-hoc inspection.
+- **Failure recording**: a daemon thread maintains a 5-second rolling screen buffer; on any tool failure it dumps the frames as an animated GIF (via ImageMagick) into `runtime/failures/` so you can see *how* the agent got into trouble.
+- **Action scoping & dry-run**: `allowedApps`, `blockedWindowTitles`, and `dryRun` config flags gate every state-changing tool. Default is unrestricted; turn them on for sensitive contexts.
+- **Pre/post window-set diff**: every state-changing desktop tool emits an `unchanged: true` flag if the window list didn't change, plus an `unexpectedModal` field when a new window matches `/error|warning|sign in|password|allow|permission|are you sure|confirm|update available/i`.
+- **Native Windows input**: on Windows/WSL, `desktop_click` uses `user32.SendInput` directly via PowerShell PInvoke — real INPUT events, correct DPI, falls back to legacy `mouse_event` only on PowerShell errors.
+- **Perception cache**: `desktop_screenshot` and `desktop_list_windows` results are cached for `perceptionCacheTtlMs` (500 ms default) and invalidated on any state-changing tool, so the auto-verify cycle is cheap.
+
+## Configuration
+
+The extension reads optional JSON from one of:
+
+1. `pi-extension/config.json` (next to `package.json`)
+2. `~/.autogui/pi-extension.json`
+
+Every key has a sensible default — leave the file out and everything works. See `config.json.example` for the full schema. Highlights:
+
+- `allowedBrowser`: false → set true to register the `browser_*` tools (Playwright auto-installs).
+- `autoInstallTesseract` / `autoInstallPlaywright`: enable optional one-shot installs at first use.
+- `dryRun` / `allowedApps` / `blockedWindowTitles`: safety gates.
+- `plannerEnabled`: planner-first protocol in the system prompt.
+- `screenRecord.*`: rolling screen buffer for failure post-mortem.
+
+Optional system dependencies for graceful-degrade features:
+
+| Feature                          | Dep                                                                 |
+|----------------------------------|---------------------------------------------------------------------|
+| `desktop_screenshot_marked` overlay | ImageMagick (`magick` or `convert`)                              |
+| `desktop_click_text`/`desktop_find_text` | Tesseract — auto-installable                              |
+| `desktop_click_element` on Linux | `python3` + `python3-pyatspi` + `gir1.2-atspi-2.0`                  |
+| `browser_*` tools                | Playwright + Chromium — auto-installable                            |
+| Failure GIF                      | ImageMagick (manifest written if missing)                           |
 
 ## Install Dependencies
 
