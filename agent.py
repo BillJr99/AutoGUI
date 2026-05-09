@@ -39,6 +39,7 @@ from typing import Any, AsyncIterator, Callable
 
 from client import OpenWebUIClient
 from prompt_loader import PromptLoader
+from screen_record import ScreenRecorder
 from skills import SkillStore
 from tools import ToolRegistry
 from trace import TraceWriter
@@ -217,6 +218,25 @@ class Agent:
 
         if self._skill_store is not None:
             self._register_skill_tools()
+
+        # Rolling screen buffer (Phase 11).  When a tool fails, the buffer
+        # is flushed to an animated GIF so the user can see exactly how
+        # the agent got into trouble.
+        rec_cfg = self._agent_cfg.get("screen_record", {}) or {}
+        self._record_enabled: bool = bool(rec_cfg.get("enabled", True))
+        self._recorder: ScreenRecorder | None = None
+        if self._record_enabled:
+            try:
+                self._recorder = ScreenRecorder(
+                    out_dir=rec_cfg.get("out_dir", "screenshots/failures"),
+                    fps=int(rec_cfg.get("fps", 5)),
+                    buffer_seconds=float(rec_cfg.get("buffer_seconds", 5.0)),
+                    max_width=int(rec_cfg.get("max_width", 960)),
+                )
+                self._recorder.start()
+            except Exception as e:
+                logger.warning("[agent] ScreenRecorder init failed: %s", e)
+                self._recorder = None
 
     # ------------------------------------------------------------------
     # Skill tool registration
@@ -812,6 +832,23 @@ class Agent:
                         "[TOOL FAILED: " + tool_name + "]\n"
                         + history_content
                     )
+                    # Phase 11: dump the rolling screen buffer so the user
+                    # has a visual of how the agent got here.  Cheap when
+                    # the buffer is small; silent if the recorder is off.
+                    if self._recorder is not None:
+                        gif_path = self._recorder.flush(
+                            label=f"{tool_name}_iter{iteration}"
+                        )
+                        if gif_path:
+                            yield AgentEvent(
+                                kind="failure_recording",
+                                content=f"Saved failure recording: {gif_path}",
+                                data={
+                                    "path": gif_path,
+                                    "tool_name": tool_name,
+                                    "iteration": iteration,
+                                },
+                            )
 
                 tool_result_messages.append({
                     "role": "tool",
@@ -1000,7 +1037,32 @@ class Agent:
         """Clear conversation history, preserving the system prompt."""
         self._history = [{"role": "system", "content": self._system_prompt}]
         self._completed_actions.clear()
+        self._session_steps.clear()
+        self._last_iteration_had_failure = False
+        self._last_validator_verdict = None
         logger.info("[agent.py:reset] Conversation history cleared.")
+
+    def shutdown(self):
+        """Best-effort release of background resources (rolling recorder,
+        trace writer).  Safe to call multiple times."""
+        try:
+            if self._recorder is not None:
+                self._recorder.stop()
+                self._recorder = None
+        except Exception:
+            pass
+        try:
+            if self._trace is not None:
+                self._trace.close()
+                self._trace = None
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     @property
     def history(self) -> list[dict]:

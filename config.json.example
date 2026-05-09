@@ -41,6 +41,14 @@
       "temperature": 0.7,
       "trigger_on_recent_failure": true,
       "trigger_on_validator_disagreement": true
+    },
+    "screen_record": {
+      "_comment": "Rolling screen buffer; flushes to an animated GIF on tool failure.",
+      "enabled": true,
+      "fps": 5,
+      "buffer_seconds": 5.0,
+      "max_width": 960,
+      "out_dir": "screenshots/failures"
     }
   },
   "tools": {
