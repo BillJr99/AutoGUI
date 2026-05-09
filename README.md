@@ -265,8 +265,8 @@ Open the model picker via **Ctrl+P** (the command palette) — type "model" and 
 │ │ mistral:7b                                  │ │
 │ │ phi3:mini                                   │ │
 │ └─────────────────────────────────────────────┘ │
-│ ☐ Save selection to config.json                 │
-│                        [Select]  [Cancel]        │
+│ [ ] Save selection to config.json               │
+│                        [Select]  [Cancel]       │
 └─────────────────────────────────────────────────┘
 ```
 
