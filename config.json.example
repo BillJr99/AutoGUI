@@ -49,10 +49,18 @@
     "max_screenshot_width": 1280,
     "perception_cache_ttl_seconds": 0.5,
     "auto_install_tesseract": false,
+    "auto_install_playwright": false,
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,
     "allowed_browser": false
+  },
+  "browser": {
+    "_comment": "Settings for the optional Playwright-driven browser backend.",
+    "headless": false,
+    "screenshot_dir": "screenshots/browser",
+    "user_data_dir": "",
+    "viewport": {"width": 1280, "height": 800}
   },
   "logging": {
     "level": "INFO",
