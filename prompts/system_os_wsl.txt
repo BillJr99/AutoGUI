@@ -19,6 +19,14 @@ LAUNCHING WITH FULL PATH from WSL: use desktop_launch with the path as the appli
 e.g. desktop_launch(application='/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe')
 or   desktop_launch(application='C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe')
 
+WINDOW ACTIVATION — always call desktop_activate_window before interacting with any window:
+  • desktop_launch automatically activates the window. Check window_activated in the result.
+  • If the app was already running, its existing window is activated (no new instance opened).
+  • If window_activated is false, call desktop_activate_window(title="Edge") as a follow-up.
+  • To switch to a specific window: desktop_activate_window(title=<partial title>)
+    or use the pid from desktop_list_windows: desktop_activate_window(pid=<pid>)
+  • Call desktop_activate_window before every desktop_type or desktop_hotkey sequence.
+
 CRITICAL: NEVER write shell commands or Windows CMD syntax in your text response.
 Writing 'find msedge -type f' or 'C:\Users\...>where msedge' as TEXT does nothing.
 You MUST call shell_run with the command string to actually execute it.

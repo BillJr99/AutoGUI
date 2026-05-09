@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class X11Backend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False}
+        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True}
 
     async def type_text(self, text: str) -> dict:
         """Use xdotool type for reliable Unicode input on X11."""
@@ -45,9 +45,10 @@ class X11Backend(DesktopBackend):
             return {"error": str(e)}
 
     async def list_windows(self) -> dict:
+        """List windows via wmctrl -lGpx (includes pid, geometry, wm_class)."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "wmctrl", "-l",
+                "wmctrl", "-lGpx",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -55,20 +56,146 @@ class X11Backend(DesktopBackend):
             lines = stdout.decode(errors="replace").strip().splitlines()
             windows = []
             for line in lines:
-                parts = line.split(None, 3)
-                if len(parts) >= 4:
-                    windows.append({
-                        "wid": parts[0],
-                        "desktop": parts[1],
-                        "host": parts[2],
-                        "title": parts[3],
-                    })
+                # Format: wid desktop pid x y width height wm_class host title
+                parts = line.split(None, 9)
+                if len(parts) < 9:
+                    continue
+                wid = parts[0]
+                pid = int(parts[2]) if parts[2].isdigit() else 0
+                wm_class = parts[7]
+                app = wm_class.split(".")[-1] if "." in wm_class else wm_class
+                windows.append({
+                    "id": wid,
+                    "pid": pid,
+                    "app": app,
+                    "x": int(parts[3]),
+                    "y": int(parts[4]),
+                    "width": int(parts[5]),
+                    "height": int(parts[6]),
+                    "title": parts[9] if len(parts) > 9 else "",
+                })
             return {"windows": windows, "count": len(windows)}
         except FileNotFoundError:
             return {"error": "wmctrl not found — install with: sudo apt install wmctrl"}
         except Exception as e:
             logger.debug("[x11:list_windows] %s", traceback.format_exc())
             return {"error": str(e)}
+
+    async def _get_active_wid_int(self) -> int | None:
+        """Return the active window ID as an integer, or None on failure."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "getactivewindow",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            dec = stdout.decode().strip()
+            return int(dec) if dec else None
+        except Exception:
+            return None
+
+    async def activate_window(
+        self,
+        title: str = "",
+        pid: int = 0,
+        app: str = "",
+        window_id: str = "",
+    ) -> dict:
+        """
+        Focus an X11 window.  Method priority:
+          1. wmctrl -ia <wid>  (raises window and gives focus)
+          2. xdotool windowfocus --sync <wid>
+          3. Click the title-bar area as a final fallback.
+        Verification uses xdotool getactivewindow.
+        """
+        if not any([title, pid, app, window_id]):
+            return {"error": "Provide at least one of: title, pid, app, window_id (hex wid)"}
+
+        # Find the target window
+        windows_result = await self.list_windows()
+        if "error" in windows_result:
+            return {"error": f"Cannot list windows: {windows_result['error']}"}
+
+        match = None
+        for w in windows_result.get("windows", []):
+            if window_id and w.get("id", "").lower() == window_id.lower():
+                match = w; break
+            if pid and w.get("pid") == int(pid):
+                match = w; break
+            if title and title.lower() in w.get("title", "").lower():
+                match = w; break
+            if app and app.lower() in w.get("app", "").lower():
+                match = w; break
+
+        if not match:
+            return {"error": "No window found matching the given criteria"}
+
+        wid_hex = match["id"]
+        try:
+            wid_int = int(wid_hex, 16)
+        except ValueError:
+            wid_int = None
+
+        # --- Try wmctrl -ia ---
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "wmctrl", "-ia", wid_hex,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+            if proc.returncode == 0:
+                active = await self._get_active_wid_int()
+                if wid_int is not None and active == wid_int:
+                    return {"success": True, "active": True, "method": "wmctrl", **match}
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug("[x11:activate_window:wmctrl] %s", traceback.format_exc())
+
+        # --- Try xdotool windowfocus ---
+        if wid_int is not None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "xdotool", "windowfocus", "--sync", str(wid_int),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                if proc.returncode == 0:
+                    active = await self._get_active_wid_int()
+                    if active == wid_int:
+                        return {"success": True, "active": True, "method": "xdotool", **match}
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("[x11:activate_window:xdotool] %s", traceback.format_exc())
+
+        # --- Click fallback ---
+        if match.get("width"):
+            cx = match["x"] + match["width"] // 2
+            cy = match["y"] + 15
+            click_r = await self.click(cx, cy)
+            if not click_r.get("error"):
+                return {"success": True, "active": True, "method": "click_fallback", **match}
+
+        return {"success": True, "active": False, "method": "failed", **match}
+
+    async def get_active_window(self) -> dict:
+        """Return info about the active X11 window using xdotool."""
+        wid_int = await self._get_active_wid_int()
+        if wid_int is None:
+            return {"found": False}
+        wid_hex = hex(wid_int)
+        windows_result = await self.list_windows()
+        for w in windows_result.get("windows", []):
+            try:
+                if int(w["id"], 16) == wid_int:
+                    return {"found": True, "window": {**w, "active": True}}
+            except ValueError:
+                pass
+        return {"found": True, "window": {"id": wid_hex, "active": True}}
 
     async def launch(
         self,

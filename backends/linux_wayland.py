@@ -41,7 +41,7 @@ _YDOTOOL_SCROLL = {
 class WaylandBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False}
+        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": False}
 
     async def screenshot(
         self,
@@ -205,6 +205,61 @@ class WaylandBackend(DesktopBackend):
         except Exception as e:
             logger.debug("[wayland:list_windows] %s", traceback.format_exc())
             return {"error": str(e)}
+
+    async def activate_window(
+        self,
+        title: str = "",
+        pid: int = 0,
+        app: str = "",
+        window_id: str = "",
+    ) -> dict:
+        """
+        Focus a Wayland window.  Only works on the Sway compositor via swaymsg.
+        Falls back to clicking the window center as a universal last resort.
+        Other compositors (GNOME, KDE, Hyprland) are not yet supported natively.
+        """
+        if not any([title, pid, app, window_id]):
+            return {"error": "Provide at least one of: title, pid, app, window_id"}
+
+        # Try swaymsg focus criteria (Sway compositor only)
+        if title:
+            criteria = f'[title="{title}"]'
+        elif app:
+            criteria = f'[app_id="{app}"]'
+        else:
+            criteria = None
+
+        if criteria:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "swaymsg", f"{criteria} focus",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+                if proc.returncode == 0:
+                    return {"success": True, "active": True, "method": "swaymsg"}
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("[wayland:activate_window:swaymsg] %s", traceback.format_exc())
+
+        # Click fallback: find the window in swaymsg tree and click its center
+        windows_result = await self.list_windows()
+        for w in windows_result.get("windows", []):
+            match = False
+            if title and title.lower() in w.get("title", "").lower():
+                match = True
+            elif app and app.lower() in w.get("title", "").lower():
+                match = True
+            if match and w.get("width"):
+                cx = w["x"] + w["width"] // 2
+                cy = w["y"] + 15
+                click_r = await self.click(cx, cy)
+                if not click_r.get("error"):
+                    return {"success": True, "active": True, "method": "click_fallback"}
+
+        return {"error": "activate_window: no supported method available on this Wayland compositor"}
 
     async def launch(
         self,

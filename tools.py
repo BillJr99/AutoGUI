@@ -426,12 +426,14 @@ class ToolRegistry:
                 {"type": "function", "function": {
                     "name": "desktop_list_windows",
                     "description": (
-                        "List currently open windows with their titles and screen bounding boxes "
+                        "List currently open windows with their titles, PIDs, window IDs, and screen bounding boxes "
                         "(x, y, width, height in screen pixels). "
                         "Use x/y/width/height to compute click coordinates: "
                         "to click inside a window use x=window.x+window.width//2, "
                         "y=window.y+window.height//2 for center, or offset slightly from "
-                        "x+20, y+80 to hit the client area below the title bar."
+                        "x+20, y+80 to hit the client area below the title bar. "
+                        "Use the id (window handle) or pid with desktop_activate_window to bring a window to front — "
+                        "id is the most precise match."
                     ),
                     "parameters": {"type": "object", "properties": {}},
                 }},
@@ -442,9 +444,11 @@ class ToolRegistry:
                     "name": "desktop_launch",
                     "description": (
                         "Launch an application by executable name or full path. "
-                        "After launching: (1) call desktop_list_windows to confirm it opened, "
-                        "then (2) call desktop_click inside the window to give it keyboard "
-                        "focus before any desktop_type or desktop_hotkey call."
+                        "Automatically brings the window to the foreground after launching — "
+                        "check window_activated in the result. "
+                        "If the app is already running its existing window is activated instead "
+                        "of opening a new instance. "
+                        "If window_activated is false, call desktop_activate_window as a follow-up."
                     ),
                     "parameters": {"type": "object", "properties": {
                         "application": {"type": "string"},
@@ -453,6 +457,52 @@ class ToolRegistry:
                 }},
                 lambda application, args=None: b.launch(_coerce_path(application), _coerce_args(args)),
             )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_activate_window",
+                    "description": (
+                        "Bring an already-open window to the foreground (make it the active focused window). "
+                        "Call this before desktop_type or desktop_hotkey to guarantee the right window has focus. "
+                        "Uses the best available native method for the platform (SetForegroundWindow on Windows/WSL, "
+                        "AppleScript on macOS, wmctrl/xdotool on X11, swaymsg on Wayland) and falls back to "
+                        "clicking the title-bar area if native focus is not confirmed. "
+                        "Returns active=true when focus is verified. "
+                        "Match priority: window_id (most precise) > pid > title > app. "
+                        "Use id and pid from desktop_list_windows for exact matching."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "title": {"type": "string",
+                                  "description": "Partial window title (case-insensitive substring)"},
+                        "pid": {"type": "integer",
+                                "description": "Process ID from desktop_list_windows"},
+                        "app": {"type": "string",
+                                "description": "Process/app name (case-insensitive substring), e.g. 'msedge', 'chrome'"},
+                        "window_id": {"type": "string",
+                                      "description": "Window handle string (id field from desktop_list_windows) — most precise"},
+                    }},
+                }},
+                lambda title="", pid=0, app="", window_id="": b.activate_window(
+                    title=str(title) if title else "",
+                    pid=int(pid) if pid else 0,
+                    app=str(app) if app else "",
+                    window_id=str(window_id) if window_id else "",
+                ),
+            )
+            if self._backend_caps.get("get_active_window"):
+                self._register(
+                    {"type": "function", "function": {
+                        "name": "desktop_get_active_window",
+                        "description": (
+                            "Return information about the currently focused window "
+                            "(title, app, pid, id, x, y, width, height). "
+                            "Use this to verify that desktop_activate_window succeeded, "
+                            "or to check which window is in front before taking action. "
+                            "Returns {found: false} when no foreground window is detected."
+                        ),
+                        "parameters": {"type": "object", "properties": {}},
+                    }},
+                    lambda: b.get_active_window(),
+                )
             self._register(
                 {"type": "function", "function": {
                     "name": "desktop_scroll",
@@ -576,6 +626,12 @@ class ToolRegistry:
             "x": "dx", "delta_x": "dx", "offset_x": "dx",
             "y": "dy", "delta_y": "dy", "offset_y": "dy",
             "button_click": "click", "left_click": "click",
+        },
+        "desktop_activate_window": {
+            "window_title": "title", "name": "title", "process": "title",
+            "process_id": "pid",
+            "id": "window_id", "handle": "window_id", "wid": "window_id",
+            "application": "app", "process_name": "app", "exe": "app",
         },
         "fs_read": {"file": "path", "filename": "path", "filepath": "path"},
         "fs_write": {"file": "path", "filename": "path", "filepath": "path",

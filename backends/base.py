@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 try:
     import pyautogui as _pyautogui
     _pyautogui.FAILSAFE = False
-except ImportError:
+except Exception:
+    # ImportError when pyautogui isn't installed; on Linux without an X
+    # display (e.g. WSL) pyautogui raises OSError trying to open
+    # ~/.Xauthority.  Either way, platform backends that need pyautogui
+    # import it lazily inside their own methods.
     pass
 
 
@@ -245,3 +249,15 @@ class DesktopBackend:
         depth: int = 3,
     ) -> dict:
         return {"error": "get_window_tree not supported on this platform"}
+
+    async def activate_window(
+        self,
+        title: str = "",
+        pid: int = 0,
+        app: str = "",
+        window_id: str = "",
+    ) -> dict:
+        return {"error": "activate_window not supported on this platform"}
+
+    async def get_active_window(self) -> dict:
+        return {"found": False, "error": "get_active_window not supported on this platform"}

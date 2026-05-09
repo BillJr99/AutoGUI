@@ -101,7 +101,7 @@ def _to_sendkeys(keys: list[str]) -> str:
 class WSLBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False}
+        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True}
 
     # ------------------------------------------------------------------
     # PowerShell helper
@@ -304,6 +304,23 @@ class WSLBackend(DesktopBackend):
             logger.debug("[wsl:click] %s", traceback.format_exc())
             return {"error": str(e)}
 
+    # C# type for window focus operations (focus, verify, bounds).
+    # ShowWindowAsync is non-blocking; SW_RESTORE=9 un-minimises.
+    _WIN_FOCUS_TYPE = (
+        "Add-Type -TypeDefinition @\"\n"
+        "using System;\n"
+        "using System.Runtime.InteropServices;\n"
+        "public class WinFocus {\n"
+        "    [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);\n"
+        "    [DllImport(\"user32.dll\")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);\n"
+        "    [DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();\n"
+        "    [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);\n"
+        "    [StructLayout(LayoutKind.Sequential)]\n"
+        "    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }\n"
+        "}\n"
+        "\"@ -Language CSharp\n"
+    )
+
     # Shared C# type with GetCursorPos, SetCursorPos, and mouse_event in one class.
     _MOVE_TYPE = (
         "Add-Type -TypeDefinition @\"\n"
@@ -472,25 +489,20 @@ class WSLBackend(DesktopBackend):
     # ------------------------------------------------------------------
 
     async def list_windows(self) -> dict:
-        """List visible Windows windows with titles, pids, and bounding boxes."""
+        """List visible Windows windows with titles, pids, bounding boxes, and active status."""
         script = (
+            self._WIN_FOCUS_TYPE +
             "$ErrorActionPreference = 'SilentlyContinue'\n"
-            "Add-Type -TypeDefinition @\"\n"
-            "using System;\n"
-            "using System.Runtime.InteropServices;\n"
-            "public class WinBounds {\n"
-            "    [DllImport(\"user32.dll\")]\n"
-            "    public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);\n"
-            "    [StructLayout(LayoutKind.Sequential)]\n"
-            "    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }\n"
-            "}\n"
-            "\"@\n"
+            "$active = [WinFocus]::GetForegroundWindow()\n"
             "Get-Process | Where-Object { $_.MainWindowTitle -ne '' } | ForEach-Object {\n"
-            "    $r = New-Object WinBounds+RECT\n"
-            "    [WinBounds]::GetWindowRect($_.MainWindowHandle, [ref]$r) | Out-Null\n"
+            "    $r = New-Object WinFocus+RECT\n"
+            "    [WinFocus]::GetWindowRect($_.MainWindowHandle, [ref]$r) | Out-Null\n"
             "    [PSCustomObject]@{\n"
+            "        id     = $_.MainWindowHandle.ToString()\n"
             "        title  = $_.MainWindowTitle\n"
+            "        app    = $_.ProcessName\n"
             "        pid    = [int]$_.Id\n"
+            "        active = ($_.MainWindowHandle -eq $active)\n"
             "        x      = [int]$r.Left\n"
             "        y      = [int]$r.Top\n"
             "        width  = [int]($r.Right  - $r.Left)\n"
@@ -519,6 +531,7 @@ class WSLBackend(DesktopBackend):
 
         Accepts args as a list or as a JSON string (the LLM sometimes sends "[]").
         Tries direct execution first, then falls back to PowerShell Start-Process.
+        After a successful launch the window is brought to the foreground automatically.
         """
         # Normalize application in case the LLM sent a dict instead of a string.
         if not isinstance(application, str):
@@ -534,7 +547,14 @@ class WSLBackend(DesktopBackend):
                 args = [args] if args.strip() else []
         args = [str(a) for a in (args or [])]
 
+        # Derive a process-name hint (basename without .exe) for window activation.
+        app_basename = application.replace("\\", "/").rsplit("/", 1)[-1]
+        name_hint = app_basename.lower()
+        if name_hint.endswith(".exe"):
+            name_hint = name_hint[:-4]
+
         parts = [application] + args
+        result: dict = {}
         try:
             proc = await asyncio.create_subprocess_exec(
                 *parts,
@@ -549,7 +569,7 @@ class WSLBackend(DesktopBackend):
             except asyncio.TimeoutError:
                 # Still running after 3 s — normal for GUI apps.
                 pass
-            return {"success": True, "application": application, "args": args, "method": "direct"}
+            result = {"success": True, "application": application, "args": args, "method": "direct"}
         except Exception as direct_err:
             # Fall back to PowerShell Start-Process.
             try:
@@ -565,7 +585,7 @@ class WSLBackend(DesktopBackend):
                 _, ps_err = await asyncio.wait_for(ps.communicate(), timeout=10)
                 if ps.returncode != 0:
                     raise RuntimeError(ps_err.decode(errors="replace").strip())
-                return {
+                result = {
                     "success": True,
                     "application": application,
                     "args": args,
@@ -574,3 +594,169 @@ class WSLBackend(DesktopBackend):
             except Exception as ps_err:
                 logger.debug("[wsl:launch] %s", traceback.format_exc())
                 return {"error": f"direct: {direct_err}; powershell: {ps_err}"}
+
+        # Bring the launched application's window to the foreground.
+        act = await self._activate_after_launch(name_hint)
+        result["window_activated"] = act.get("window_activated", False)
+        return result
+
+    # ------------------------------------------------------------------
+    # Window activation
+    # ------------------------------------------------------------------
+
+    async def _activate_after_launch(self, name_hint: str) -> dict:
+        """
+        Find a window whose process name matches name_hint and bring it to front.
+
+        Checks immediately first (for apps already running), then polls for up to
+        4 s to handle newly started processes that need time to create their window.
+        SW_RESTORE (9) un-minimizes; SW_SHOW (5) ensures visibility.
+        """
+        safe = name_hint.replace("'", "''")
+        proc_filter = (
+            f"$_.Name -like '*{safe}*' -and "
+            "$_.MainWindowHandle -ne [IntPtr]::Zero -and "
+            "$_.MainWindowTitle -ne ''"
+        )
+        script = (
+            self._WIN_FOCUS_TYPE +
+            "$ErrorActionPreference = 'SilentlyContinue'\n"
+            f"$w = Get-Process | Where-Object {{ {proc_filter} }} | Select-Object -First 1\n"
+            "if (-not $w) {\n"
+            "    $t = (Get-Date).AddSeconds(4)\n"
+            "    do {\n"
+            "        Start-Sleep -Milliseconds 300\n"
+            f"        $w = Get-Process | Where-Object {{ {proc_filter} }} | Select-Object -First 1\n"
+            "    } while (-not $w -and (Get-Date) -lt $t)\n"
+            "}\n"
+            "if (-not $w) { Write-Output 'NOT_FOUND'; exit 0 }\n"
+            "[WinFocus]::ShowWindowAsync($w.MainWindowHandle, 9) | Out-Null\n"
+            "Start-Sleep -Milliseconds 100\n"
+            "[WinFocus]::SetForegroundWindow($w.MainWindowHandle) | Out-Null\n"
+            "Write-Output \"ok pid=$($w.Id)\"\n"
+        )
+        try:
+            returncode, stdout, _ = await self._ps(script, timeout=12)
+            return {"window_activated": "NOT_FOUND" not in stdout}
+        except Exception:
+            logger.debug("[wsl:_activate_after_launch] %s", traceback.format_exc())
+            return {"window_activated": False}
+
+    async def activate_window(
+        self,
+        title: str = "",
+        pid: int = 0,
+        app: str = "",
+        window_id: str = "",
+    ) -> dict:
+        """
+        Bring a window to the foreground.  Match priority:
+          1. window_id (MainWindowHandle string from desktop_list_windows — most precise)
+          2. pid
+          3. title (case-insensitive substring of MainWindowTitle)
+          4. app (case-insensitive substring of ProcessName)
+
+        Uses ShowWindowAsync + SetForegroundWindow with timing delays, then verifies
+        via GetForegroundWindow.  If the OS does not confirm focus, falls back to
+        clicking the title-bar area of the window.
+        """
+        if not any([title, pid, app, window_id]):
+            return {"error": "Provide at least one of: title, pid, app, window_id"}
+
+        target = {"id": window_id, "pid": pid, "title": title, "app": app}
+        target_b64 = base64.b64encode(json.dumps(target).encode("utf-8")).decode("ascii")
+
+        script = (
+            self._WIN_FOCUS_TYPE +
+            "$ErrorActionPreference = 'SilentlyContinue'\n"
+            f"$t = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{target_b64}')) | ConvertFrom-Json\n"
+            "$procs = @(Get-Process | Where-Object { $_.MainWindowTitle -ne '' -and $_.MainWindowHandle -ne [IntPtr]::Zero })\n"
+            "if     ($t.id    -and $t.id    -ne '') { $p = $procs | Where-Object { $_.MainWindowHandle.ToString() -eq $t.id } | Select-Object -First 1 }\n"
+            "elseif ($t.pid   -and $t.pid   -gt 0)  { $p = $procs | Where-Object { $_.Id -eq [int]$t.pid } | Select-Object -First 1 }\n"
+            "elseif ($t.title -and $t.title -ne '') { $p = $procs | Where-Object { $_.MainWindowTitle.ToLowerInvariant().Contains($t.title.ToLowerInvariant()) } | Select-Object -First 1 }\n"
+            "elseif ($t.app   -and $t.app   -ne '') { $p = $procs | Where-Object { $_.ProcessName.ToLowerInvariant().Contains($t.app.ToLowerInvariant()) } | Select-Object -First 1 }\n"
+            "if (-not $p) { [PSCustomObject]@{ found = $false } | ConvertTo-Json -Compress; exit 1 }\n"
+            "$h = $p.MainWindowHandle\n"
+            "[WinFocus]::ShowWindowAsync($h, 9) | Out-Null\n"
+            "Start-Sleep -Milliseconds 100\n"
+            "[WinFocus]::SetForegroundWindow($h) | Out-Null\n"
+            "Start-Sleep -Milliseconds 150\n"
+            "$fg = [WinFocus]::GetForegroundWindow()\n"
+            "$r = New-Object WinFocus+RECT\n"
+            "[WinFocus]::GetWindowRect($h, [ref]$r) | Out-Null\n"
+            "[PSCustomObject]@{\n"
+            "    found  = $true\n"
+            "    active = ($fg -eq $h)\n"
+            "    id     = $h.ToString()\n"
+            "    title  = $p.MainWindowTitle\n"
+            "    app    = $p.ProcessName\n"
+            "    pid    = [int]$p.Id\n"
+            "    x      = [int]$r.Left\n"
+            "    y      = [int]$r.Top\n"
+            "    width  = [int]($r.Right - $r.Left)\n"
+            "    height = [int]($r.Bottom - $r.Top)\n"
+            "} | ConvertTo-Json -Compress\n"
+        )
+        try:
+            returncode, stdout, _ = await self._ps(script, timeout=10)
+            if not stdout:
+                return {"error": f"activate_window got no output (rc={returncode})"}
+
+            result = json.loads(stdout)
+            if not result.get("found"):
+                criteria = " ".join(filter(None, [
+                    f"id={window_id!r}" if window_id else "",
+                    f"pid={pid}" if pid else "",
+                    f"title={title!r}" if title else "",
+                    f"app={app!r}" if app else "",
+                ]))
+                return {"error": f"No window found ({criteria})"}
+
+            # OS did not confirm focus — click the title-bar area as a fallback.
+            if not result.get("active"):
+                cx = result.get("x", 0) + result.get("width", 200) // 2
+                cy = result.get("y", 0) + 15
+                click_r = await self.click(cx, cy)
+                if not click_r.get("error"):
+                    result["active"] = True
+                    result["method"] = "click_fallback"
+
+            return {"success": True, **result}
+        except json.JSONDecodeError:
+            return {"error": f"activate_window: unexpected output: {stdout!r}"}
+        except Exception as e:
+            logger.debug("[wsl:activate_window] %s", traceback.format_exc())
+            return {"error": str(e)}
+
+    async def get_active_window(self) -> dict:
+        """Return info about the currently focused window."""
+        script = (
+            self._WIN_FOCUS_TYPE +
+            "$ErrorActionPreference = 'SilentlyContinue'\n"
+            "$h = [WinFocus]::GetForegroundWindow()\n"
+            "if ($h -eq [IntPtr]::Zero) { [PSCustomObject]@{ found = $false } | ConvertTo-Json -Compress; exit 0 }\n"
+            "$p = Get-Process | Where-Object { $_.MainWindowHandle -eq $h } | Select-Object -First 1\n"
+            "$r = New-Object WinFocus+RECT\n"
+            "[WinFocus]::GetWindowRect($h, [ref]$r) | Out-Null\n"
+            "[PSCustomObject]@{\n"
+            "    found  = $true\n"
+            "    window = [PSCustomObject]@{\n"
+            "        id     = $h.ToString()\n"
+            "        title  = if ($p) { $p.MainWindowTitle } else { '' }\n"
+            "        app    = if ($p) { $p.ProcessName } else { '' }\n"
+            "        pid    = if ($p) { [int]$p.Id } else { 0 }\n"
+            "        x      = [int]$r.Left\n"
+            "        y      = [int]$r.Top\n"
+            "        width  = [int]($r.Right - $r.Left)\n"
+            "        height = [int]($r.Bottom - $r.Top)\n"
+            "    }\n"
+            "} | ConvertTo-Json -Compress -Depth 3\n"
+        )
+        try:
+            returncode, stdout, _ = await self._ps(script, timeout=10)
+            if not stdout:
+                return {"found": False}
+            return json.loads(stdout)
+        except Exception as e:
+            logger.debug("[wsl:get_active_window] %s", traceback.format_exc())
+            return {"found": False, "error": str(e)}
