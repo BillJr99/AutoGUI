@@ -261,3 +261,6 @@ class DesktopBackend:
 
     async def get_active_window(self) -> dict:
         return {"found": False, "error": "get_active_window not supported on this platform"}
+
+    async def get_window_text(self, max_chars: int = 50000) -> dict:
+        return {"error": "get_window_text not supported on this platform"}

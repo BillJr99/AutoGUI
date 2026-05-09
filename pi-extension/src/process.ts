@@ -78,6 +78,61 @@ export async function commandExists(command: string, signal?: AbortSignal): Prom
   }
 }
 
+export async function execFileWithStdin(
+  command: string,
+  args: string[] = [],
+  stdin: string | Buffer,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<ExecResult> {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  return await new Promise<ExecResult>((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    const finish = (result: ExecResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      resolve(result);
+    };
+    const abort = () => {
+      child.kill("SIGTERM");
+      finish({ code: null, stdout, stderr: "Aborted", timedOut: false });
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+      reject(error);
+    });
+    child.on("close", (code) => finish({ code, stdout, stderr, timedOut }));
+    if (options.signal?.aborted) {
+      abort();
+    } else {
+      options.signal?.addEventListener("abort", abort, { once: true });
+    }
+    if (typeof stdin === "string") {
+      child.stdin?.write(stdin, "utf8");
+    } else {
+      child.stdin?.write(stdin);
+    }
+    child.stdin?.end();
+  });
+}
+
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }

@@ -41,7 +41,7 @@ _YDOTOOL_SCROLL = {
 class WaylandBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": False}
+        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": False, "get_window_text": True}
 
     async def screenshot(
         self,
@@ -260,6 +260,58 @@ class WaylandBackend(DesktopBackend):
                     return {"success": True, "active": True, "method": "click_fallback"}
 
         return {"error": "activate_window: no supported method available on this Wayland compositor"}
+
+    async def get_window_text(self, max_chars: int = 50000) -> dict:
+        """Select all + copy via ydotool, read via wl-paste, restore with wl-copy."""
+        try:
+            # Save old clipboard
+            old_proc = await asyncio.create_subprocess_exec(
+                "wl-paste", "--no-newline",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            old_out, _ = await asyncio.wait_for(old_proc.communicate(), timeout=5)
+
+            # Select all + copy
+            for combo in ("ctrl+a", "ctrl+c"):
+                proc = await asyncio.create_subprocess_exec(
+                    "ydotool", "key", "--", combo,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.sleep(0.3)
+            await asyncio.sleep(0.3)
+
+            # Read clipboard
+            paste_proc = await asyncio.create_subprocess_exec(
+                "wl-paste", "--no-newline",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            paste_out, _ = await asyncio.wait_for(paste_proc.communicate(), timeout=5)
+            text = paste_out.decode(errors="replace")
+
+            # Restore old clipboard
+            restore_proc = await asyncio.create_subprocess_exec(
+                "wl-copy",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            restore_proc.stdin.write(old_out)
+            restore_proc.stdin.close()
+            await asyncio.wait_for(restore_proc.wait(), timeout=5)
+
+            truncated = len(text) > max_chars
+            text = text[:max_chars] if truncated else text
+            return {"text": text, "length": len(text), "truncated": truncated}
+        except FileNotFoundError as e:
+            missing = "wl-paste/wl-copy" if "wl-" in str(e) else "ydotool"
+            return {"error": f"{missing} not found — install with: sudo apt install wl-clipboard ydotool"}
+        except Exception as e:
+            logger.debug("[wayland:get_window_text] %s", traceback.format_exc())
+            return {"error": str(e)}
 
     async def launch(
         self,

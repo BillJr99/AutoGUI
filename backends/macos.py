@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class MacOSBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True}
+        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
 
     async def screenshot(
         self,
@@ -246,6 +246,64 @@ class MacOSBackend(DesktopBackend):
         except Exception as e:
             logger.debug("[macos:get_active_window] %s", traceback.format_exc())
             return {"found": False, "error": str(e)}
+
+    async def get_window_text(self, max_chars: int = 50000) -> dict:
+        """
+        Select all text in the focused window (Cmd+A, Cmd+C), read via pbpaste,
+        restore the old clipboard with pbcopy, and return the text.
+        """
+        try:
+            # Save old clipboard
+            old_proc = await asyncio.create_subprocess_exec(
+                "pbpaste",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            old_out, _ = await asyncio.wait_for(old_proc.communicate(), timeout=5)
+            old_clip = old_out  # raw bytes
+
+            # Select all + copy via osascript (uses Command key, not Control)
+            select_script = (
+                'tell application "System Events"\n'
+                '    keystroke "a" using command down\n'
+                '    delay 0.3\n'
+                '    keystroke "c" using command down\n'
+                'end tell'
+            )
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", select_script,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=10)
+            await asyncio.sleep(0.5)
+
+            # Read clipboard
+            paste_proc = await asyncio.create_subprocess_exec(
+                "pbpaste",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            paste_out, _ = await asyncio.wait_for(paste_proc.communicate(), timeout=5)
+            text = paste_out.decode(errors="replace")
+
+            # Restore old clipboard
+            restore_proc = await asyncio.create_subprocess_exec(
+                "pbcopy",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            restore_proc.stdin.write(old_clip)
+            restore_proc.stdin.close()
+            await asyncio.wait_for(restore_proc.wait(), timeout=5)
+
+            truncated = len(text) > max_chars
+            text = text[:max_chars] if truncated else text
+            return {"text": text, "length": len(text), "truncated": truncated}
+        except Exception as e:
+            logger.debug("[macos:get_window_text] %s", traceback.format_exc())
+            return {"error": str(e)}
 
     async def launch(
         self,

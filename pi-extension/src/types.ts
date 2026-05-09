@@ -51,6 +51,7 @@ export interface DesktopBackend {
   launch(application: string, args: string[], signal?: AbortSignal): Promise<Record<string, unknown>>;
   getCursorPos(signal?: AbortSignal): Promise<{ x: number; y: number }>;
   mouseMove(dx: number, dy: number, click: boolean, signal?: AbortSignal): Promise<Record<string, unknown>>;
+  getWindowText(maxChars?: number, signal?: AbortSignal): Promise<{ text: string; length: number; truncated: boolean }>;
 }
 
 export interface BackendLogger {

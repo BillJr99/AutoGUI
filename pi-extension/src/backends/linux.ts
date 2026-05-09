@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { commandExists, execFile } from "../process.js";
+import { commandExists, execFile, execFileWithStdin } from "../process.js";
 import { DesktopError, type DesktopBackend, type PlatformInfo, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
 import { createPngPath, makeScreenshotResult } from "./common.js";
 
@@ -66,13 +66,61 @@ export class LinuxBackend implements DesktopBackend {
     return { success: true, keys };
   }
 
-  async scroll(x: number, y: number, clicks: number, direction: "up" | "down", signal?: AbortSignal): Promise<Record<string, unknown>> {
-    if (this.platform.isWayland) throw new DesktopError("Wayland scrolling requires ydotool support and is not enabled in this v1 backend.");
+  async scroll(_x: number, _y: number, clicks: number, direction: "up" | "down", signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const n = Math.max(1, clicks);
+    // X11 keysym names: Next = Page Down, Prior = Page Up
+    const key = direction === "down" ? "Next" : "Prior";
+    if (this.platform.isWayland) {
+      await requireCommand("ydotool", signal);
+      for (let i = 0; i < n; i++) {
+        const r = await execFile("ydotool", ["key", "--", key], { timeoutMs: 5000, signal });
+        if (r.code !== 0 && i === 0) throw new DesktopError("ydotool scroll failed", { stderr: r.stderr, code: r.code });
+      }
+      return { success: true, clicks, direction, method: "keyboard" };
+    }
     await requireCommand("xdotool", signal);
-    const button = direction === "up" ? "4" : "5";
-    const result = await execFile("xdotool", ["mousemove", String(x), String(y), "click", "--repeat", String(clicks), button], { timeoutMs: 5000, signal });
+    const result = await execFile("xdotool", ["key", "--clearmodifiers", "--repeat", String(n), "--delay", "50", key], { timeoutMs: 10000, signal });
     if (result.code !== 0) throw new DesktopError("xdotool scroll failed", { stderr: result.stderr, code: result.code });
-    return { success: true, x, y, clicks, direction };
+    return { success: true, clicks, direction, method: "keyboard" };
+  }
+
+  async getWindowText(maxChars = 50000, signal?: AbortSignal): Promise<{ text: string; length: number; truncated: boolean }> {
+    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+    if (this.platform.isWayland) {
+      await requireCommand("ydotool", signal);
+      if (!await commandExists("wl-paste", signal)) throw new DesktopError("Missing dependency: wl-paste (install wl-clipboard)");
+      const oldResult = await execFile("wl-paste", ["--no-newline"], { timeoutMs: 5000, signal });
+      const oldClip = Buffer.from(oldResult.stdout, "utf8");
+      for (const key of ["ctrl+a", "ctrl+c"]) {
+        const r = await execFile("ydotool", ["key", "--", key], { timeoutMs: 5000, signal });
+        if (r.code !== 0) throw new DesktopError("ydotool key failed", { key, stderr: r.stderr });
+        await sleep(300);
+      }
+      await sleep(300);
+      const pasteResult = await execFile("wl-paste", ["--no-newline"], { timeoutMs: 5000, signal });
+      let text = pasteResult.stdout;
+      await execFileWithStdin("wl-copy", [], oldClip, { timeoutMs: 5000, signal });
+      const truncated = text.length > maxChars;
+      text = truncated ? text.slice(0, maxChars) : text;
+      return { text, length: text.length, truncated };
+    }
+    // X11
+    await requireCommand("xdotool", signal);
+    if (!await commandExists("xclip", signal)) throw new DesktopError("Missing dependency: xclip (sudo apt install xclip)");
+    const oldResult = await execFile("xclip", ["-o", "-selection", "clipboard"], { timeoutMs: 5000, signal });
+    const oldClip = Buffer.from(oldResult.stdout, "utf8");
+    for (const key of ["ctrl+a", "ctrl+c"]) {
+      const r = await execFile("xdotool", ["key", "--clearmodifiers", key], { timeoutMs: 5000, signal });
+      if (r.code !== 0) throw new DesktopError("xdotool key failed", { key, stderr: r.stderr });
+      await sleep(300);
+    }
+    await sleep(300);
+    const pasteResult = await execFile("xclip", ["-o", "-selection", "clipboard"], { timeoutMs: 5000, signal });
+    let text = pasteResult.stdout;
+    await execFileWithStdin("xclip", ["-i", "-selection", "clipboard"], oldClip, { timeoutMs: 5000, signal });
+    const truncated = text.length > maxChars;
+    text = truncated ? text.slice(0, maxChars) : text;
+    return { text, length: text.length, truncated };
   }
 
   async listWindows(signal?: AbortSignal): Promise<{ windows: WindowInfo[]; count: number }> {

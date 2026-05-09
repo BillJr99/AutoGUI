@@ -59,9 +59,9 @@ class WindowsBackend(DesktopBackend):
     def capabilities(self) -> dict:
         try:
             import uiautomation  # noqa: F401
-            return {"find_element": True, "get_window_tree": True, "activate_window": True, "get_active_window": True}
+            return {"find_element": True, "get_window_tree": True, "activate_window": True, "get_active_window": True, "get_window_text": True}
         except ImportError:
-            return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True}
+            return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
 
     async def list_windows(self) -> dict:
         """List visible windows with titles, pids, bounding boxes, and active status."""
@@ -228,6 +228,35 @@ class WindowsBackend(DesktopBackend):
         except Exception as e:
             logger.debug("[windows:get_active_window] %s", traceback.format_exc())
             return {"found": False, "error": str(e)}
+
+    async def get_window_text(self, max_chars: int = 50000) -> dict:
+        """Select all + copy in the focused window, return text via clipboard."""
+        script = (
+            "$ErrorActionPreference = 'SilentlyContinue'\n"
+            "Add-Type -AssemblyName System.Windows.Forms\n"
+            "$old = Get-Clipboard -Raw\n"
+            "[System.Windows.Forms.SendKeys]::SendWait('^a')\n"
+            "Start-Sleep -Milliseconds 300\n"
+            "[System.Windows.Forms.SendKeys]::SendWait('^c')\n"
+            "Start-Sleep -Milliseconds 500\n"
+            "$text = Get-Clipboard -Raw\n"
+            "try { if ($null -ne $old -and $old -ne '') { Set-Clipboard -Value $old } else { Set-Clipboard -Value '' } } catch {}\n"
+            f"$maxLen = {int(max_chars)}\n"
+            "$truncated = $false\n"
+            "if ($null -eq $text) { $text = '' }\n"
+            "if ($text.Length -gt $maxLen) { $text = $text.Substring(0, $maxLen); $truncated = $true }\n"
+            "[PSCustomObject]@{ text = $text; length = $text.Length; truncated = $truncated } | ConvertTo-Json -Compress\n"
+        )
+        try:
+            _, stdout, stderr = await self._ps(script, timeout=15)
+            if not stdout:
+                return {"error": f"get_window_text got no output: {stderr}"}
+            return json.loads(stdout)
+        except json.JSONDecodeError:
+            return {"text": stdout, "length": len(stdout), "truncated": False}
+        except Exception as e:
+            logger.debug("[windows:get_window_text] %s", traceback.format_exc())
+            return {"error": str(e)}
 
     async def find_element(
         self,

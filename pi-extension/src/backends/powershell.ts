@@ -202,12 +202,54 @@ Add-Type -AssemblyName System.Windows.Forms
   }
 
   async scroll(x: number, y: number, clicks: number, direction: "up" | "down", signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const delta = (direction === "up" ? 120 : -120) * clicks;
-    await this.ps(`${mouseType}
-[PiMouse]::SetCursorPos(${x}, ${y}) | Out-Null
-[PiMouse]::mouse_event(0x0800, 0, 0, ${delta}, [UIntPtr]::Zero)
+    const n = Math.max(1, clicks);
+    const key = direction === "down" ? "{PGDN}" : "{PGUP}";
+    const sk = key.repeat(n);
+    // When coordinates are provided, use WindowFromPoint to focus the target window first.
+    const focusBlock = x > 0 && y > 0 ? `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class PiScrollFocus {
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+"@ -Language CSharp
+$pt = New-Object PiScrollFocus+POINT
+$pt.X = ${x}; $pt.Y = ${y}
+$child = [PiScrollFocus]::WindowFromPoint($pt)
+$root = [PiScrollFocus]::GetAncestor($child, 2)
+if ($root -ne [IntPtr]::Zero) { [PiScrollFocus]::SetForegroundWindow($root) | Out-Null }
+Start-Sleep -Milliseconds 100` : "";
+    await this.ps(`
+$ErrorActionPreference = 'SilentlyContinue'
+${focusBlock}
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.SendKeys]::SendWait("${sk}")
 `, signal);
-    return { success: true, x, y, clicks, direction };
+    return { success: true, x, y, clicks, direction, method: "keyboard" };
+  }
+
+  async getWindowText(maxChars = 50000, signal?: AbortSignal): Promise<{ text: string; length: number; truncated: boolean }> {
+    const stdout = await this.ps(`
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+$old = Get-Clipboard -Raw
+[System.Windows.Forms.SendKeys]::SendWait("^a")
+Start-Sleep -Milliseconds 300
+[System.Windows.Forms.SendKeys]::SendWait("^c")
+Start-Sleep -Milliseconds 500
+$text = Get-Clipboard -Raw
+try { if ($null -ne $old -and $old -ne '') { Set-Clipboard -Value $old } else { Set-Clipboard -Value '' } } catch {}
+$maxLen = ${maxChars}
+$truncated = $false
+if ($null -eq $text) { $text = '' }
+if ($text.Length -gt $maxLen) { $text = $text.Substring(0, $maxLen); $truncated = $true }
+[PSCustomObject]@{ text = $text; length = $text.Length; truncated = $truncated } | ConvertTo-Json -Compress
+`, signal, 15000);
+    return JSON.parse(stdout) as { text: string; length: number; truncated: boolean };
   }
 
   async listWindows(signal?: AbortSignal): Promise<{ windows: WindowInfo[]; count: number }> {

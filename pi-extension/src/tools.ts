@@ -143,19 +143,51 @@ export function createDesktopTools(getBackend: BackendProvider, saveDir: string,
     defineTool({
       name: "desktop_scroll",
       label: "Scroll",
-      description: "Scroll the mouse wheel at an absolute screen position.",
-      promptSnippet: "desktop_scroll: scroll at absolute screen coordinates.",
+      description: "Scroll the focused window. Each 'clicks' value scrolls one page (Page Down/Up) on Windows/WSL/macOS, or one notch on Linux X11. Call desktop_focus_window first. x and y are optional: when both are > 0 they focus the window at that position before scrolling; pass 0 (or omit) to scroll the currently active window.",
+      promptSnippet: "desktop_scroll: scroll the focused window by page.",
+      promptGuidelines: [
+        "Call desktop_focus_window before desktop_scroll to ensure the right window receives the scroll.",
+        "Pass x=0, y=0 (or omit) to scroll the active window without needing coordinates.",
+        "Each 'clicks' = one Page Down or Page Up on most platforms.",
+      ],
       parameters: Type.Object({
-        x: Type.Number(),
-        y: Type.Number(),
-        clicks: Type.Optional(Type.Number()),
+        x: Type.Optional(Type.Number({ description: "Screen x of scroll target; 0 or omit to scroll active window" })),
+        y: Type.Optional(Type.Number({ description: "Screen y of scroll target; 0 or omit to scroll active window" })),
+        clicks: Type.Optional(Type.Number({ description: "Number of scroll steps (default 3)" })),
         direction: Type.Optional(Type.Union([Type.Literal("up"), Type.Literal("down")])),
       }),
       executionMode: "sequential",
       execute: wrap("desktop_scroll", async (params, signal) => {
         const backend = await getBackend();
-        const result = await backend.scroll(Math.round(params.x), Math.round(params.y), Math.max(1, Math.round(params.clicks ?? 3)), params.direction ?? "down", signal);
+        const x = Math.round(params.x ?? 0);
+        const y = Math.round(params.y ?? 0);
+        const result = await backend.scroll(x, y, Math.max(1, Math.round(params.clicks ?? 3)), params.direction ?? "down", signal);
         return textResult("Scrolled desktop.", result);
+      }),
+    }),
+
+    defineTool({
+      name: "desktop_get_window_text",
+      label: "Get Window Text",
+      description: "Extract visible text from the focused window by selecting all (Ctrl+A / Cmd+A) and copying to clipboard. Returns up to 50,000 characters. Useful for reading web page content, search results, or document text without needing pixel coordinates. The clipboard is restored after reading.",
+      promptSnippet: "desktop_get_window_text: read all visible text from the focused window.",
+      promptGuidelines: [
+        "Use desktop_focus_window and click in the page body before calling desktop_get_window_text in a browser.",
+        "Use the returned text to find links, read search results, or determine the next action.",
+        "The clipboard is restored to its previous content automatically.",
+      ],
+      parameters: Type.Object({
+        max_chars: Type.Optional(Type.Number({ description: "Maximum characters to return (default 50000)" })),
+      }),
+      executionMode: "sequential",
+      execute: wrap("desktop_get_window_text", async (params, signal) => {
+        const backend = await getBackend();
+        const result = await backend.getWindowText(params.max_chars ?? 50000, signal);
+        const preview = result.text.slice(0, 200).replace(/\s+/g, " ").trim();
+        return textResult(
+          `Got ${result.length} characters of window text${result.truncated ? " (truncated)" : ""}. Preview: ${preview}`,
+          result,
+        );
       }),
     }),
 

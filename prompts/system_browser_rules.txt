@@ -20,6 +20,14 @@ OTHER ESSENTIAL BROWSER HOTKEYS:
   Ctrl+R or F5       — reload page
   Ctrl+N             — new window
 
+READING PAGE CONTENT:
+  • desktop_get_window_text — extracts all visible text from the browser page (Ctrl+A + Ctrl+C).
+    Use this to read search results, article text, or link lists without needing pixel-perfect coordinates.
+    Workflow: desktop_activate_window → click in page body → desktop_get_window_text
+  • desktop_scroll — scroll the page. Each 'clicks' = one Page Down / Page Up.
+    Do NOT pass x/y unless you need to target a specific window; pass 0 (or omit) to scroll the active window.
+    Workflow: desktop_activate_window → desktop_scroll(direction="down", clicks=2)
+
 BROWSER STATE CHECKS:
   • After Ctrl+T, verify in desktop_list_windows that the tab count changed
     (the window title often shows '… and N more pages').

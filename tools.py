@@ -506,15 +506,47 @@ class ToolRegistry:
             self._register(
                 {"type": "function", "function": {
                     "name": "desktop_scroll",
-                    "description": "Scroll the mouse wheel at a given position.",
+                    "description": (
+                        "Scroll the focused window. "
+                        "Each 'click' scrolls one page (Page Down / Page Up) on Windows/WSL, "
+                        "or one mouse-wheel notch (~3 lines) on other platforms. "
+                        "Call desktop_activate_window first to ensure the right window has focus. "
+                        "x and y are optional: when both are > 0 the window at that position is "
+                        "focused before scrolling; pass 0 (or omit) to scroll the active window."
+                    ),
                     "parameters": {"type": "object", "properties": {
-                        "x": {"type": "integer"}, "y": {"type": "integer"},
-                        "clicks": {"type": "integer"},
+                        "x": {"type": "integer", "description": "Screen x coordinate of scroll target (0 = active window)"},
+                        "y": {"type": "integer", "description": "Screen y coordinate of scroll target (0 = active window)"},
+                        "clicks": {"type": "integer", "description": "Number of scroll steps (default 3)"},
                         "direction": {"type": "string", "enum": ["up", "down"]},
-                    }, "required": ["x", "y"]},
+                    }},
                 }},
-                lambda x, y, clicks=3, direction="down": b.scroll(x, y, clicks=clicks, direction=direction),
+                lambda x=0, y=0, clicks=3, direction="down": b.scroll(
+                    int(x) if x else 0, int(y) if y else 0,
+                    clicks=int(clicks) if clicks else 3,
+                    direction=direction or "down",
+                ),
             )
+            if self._backend_caps.get("get_window_text"):
+                self._register(
+                    {"type": "function", "function": {
+                        "name": "desktop_get_window_text",
+                        "description": (
+                            "Extract the visible text from the focused window by selecting all (Ctrl+A / Cmd+A) "
+                            "and copying to clipboard. Returns up to 50,000 characters of text. "
+                            "Useful for reading search results, web page content, documents, or any "
+                            "window whose contents cannot be fully seen in a screenshot. "
+                            "For a browser: call desktop_activate_window, click in the page body area, "
+                            "then call this tool. The clipboard is restored after reading. "
+                            "Returns {text, length, truncated}."
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "max_chars": {"type": "integer",
+                                          "description": "Maximum characters to return (default 50000)"},
+                        }},
+                    }},
+                    lambda max_chars=50000: b.get_window_text(max_chars=int(max_chars) if max_chars else 50000),
+                )
             self._register(
                 {"type": "function", "function": {
                     "name": "desktop_get_cursor_pos",

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class X11Backend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True}
+        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
 
     async def type_text(self, text: str) -> dict:
         """Use xdotool type for reliable Unicode input on X11."""
@@ -196,6 +196,58 @@ class X11Backend(DesktopBackend):
             except ValueError:
                 pass
         return {"found": True, "window": {"id": wid_hex, "active": True}}
+
+    async def get_window_text(self, max_chars: int = 50000) -> dict:
+        """Select all + copy via xdotool, read via xclip, restore clipboard."""
+        try:
+            # Save old clipboard
+            old_proc = await asyncio.create_subprocess_exec(
+                "xclip", "-o", "-selection", "clipboard",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            old_out, _ = await asyncio.wait_for(old_proc.communicate(), timeout=5)
+
+            # Select all + copy
+            for key in ("ctrl+a", "ctrl+c"):
+                proc = await asyncio.create_subprocess_exec(
+                    "xdotool", "key", "--clearmodifiers", key,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+                await asyncio.sleep(0.3)
+            await asyncio.sleep(0.3)
+
+            # Read clipboard
+            paste_proc = await asyncio.create_subprocess_exec(
+                "xclip", "-o", "-selection", "clipboard",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            paste_out, _ = await asyncio.wait_for(paste_proc.communicate(), timeout=5)
+            text = paste_out.decode(errors="replace")
+
+            # Restore old clipboard
+            restore_proc = await asyncio.create_subprocess_exec(
+                "xclip", "-i", "-selection", "clipboard",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            restore_proc.stdin.write(old_out)
+            restore_proc.stdin.close()
+            await asyncio.wait_for(restore_proc.wait(), timeout=5)
+
+            truncated = len(text) > max_chars
+            text = text[:max_chars] if truncated else text
+            return {"text": text, "length": len(text), "truncated": truncated}
+        except FileNotFoundError as e:
+            missing = "xclip" if "xclip" in str(e) else "xdotool"
+            return {"error": f"{missing} not found — install with: sudo apt install {missing}"}
+        except Exception as e:
+            logger.debug("[x11:get_window_text] %s", traceback.format_exc())
+            return {"error": str(e)}
 
     async def launch(
         self,

@@ -101,7 +101,7 @@ def _to_sendkeys(keys: list[str]) -> str:
 class WSLBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True}
+        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
 
     # ------------------------------------------------------------------
     # PowerShell helper
@@ -396,35 +396,72 @@ class WSLBackend(DesktopBackend):
             logger.debug("[wsl:mouse_move] %s", traceback.format_exc())
             return {"error": str(e)}
 
+    # C# type for WindowFromPoint + GetAncestor — used by scroll to focus the
+    # right window before sending keyboard scroll events.
+    _SCROLL_FOCUS_TYPE = (
+        "Add-Type -TypeDefinition @\"\n"
+        "using System;\n"
+        "using System.Runtime.InteropServices;\n"
+        "public class WinScrFocus {\n"
+        "    [StructLayout(LayoutKind.Sequential)]\n"
+        "    public struct POINT { public int X; public int Y; }\n"
+        "    [DllImport(\"user32.dll\")] public static extern IntPtr WindowFromPoint(POINT p);\n"
+        "    [DllImport(\"user32.dll\")] public static extern IntPtr GetAncestor(IntPtr h, uint f);\n"
+        "    [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n"
+        "}\n"
+        "\"@ -Language CSharp\n"
+    )
+
     async def scroll(
         self,
-        x: int,
-        y: int,
+        x: int = 0,
+        y: int = 0,
         clicks: int = 3,
         direction: str = "down",
     ) -> dict:
-        """Scroll via MOUSEEVENTF_WHEEL using PowerShell."""
+        """
+        Scroll using keyboard Page Down/Up for reliable behaviour in all
+        Windows apps (including browsers where mouse-wheel routing can fail).
+
+        If x and y are both > 0, use WindowFromPoint to bring that window to
+        the foreground before sending keys; otherwise the current foreground
+        window receives the scroll.
+
+        Each "click" = one Page Down or Page Up keystroke.
+        """
         try:
-            # WHEEL_DELTA = 120 per notch; positive = up, negative = down.
-            delta_signed = clicks * 120 if direction == "up" else -(clicks * 120)
-            # Cast to uint32 two's-complement for the PowerShell uint parameter.
-            delta_uint = delta_signed & 0xFFFFFFFF
+            n = max(1, int(clicks))
+            key = "{PGDN}" if direction == "down" else "{PGUP}"
+            sk_str = key * n
+
+            x_int, y_int = int(x), int(y)
+            if x_int > 0 and y_int > 0:
+                focus_block = (
+                    self._SCROLL_FOCUS_TYPE +
+                    "$ErrorActionPreference = 'SilentlyContinue'\n"
+                    "$pt = New-Object WinScrFocus+POINT\n"
+                    f"$pt.X = {x_int}; $pt.Y = {y_int}\n"
+                    "$child = [WinScrFocus]::WindowFromPoint($pt)\n"
+                    # GA_ROOT = 2: get the top-level ancestor window
+                    "$root = [WinScrFocus]::GetAncestor($child, 2)\n"
+                    "if ($root -ne [IntPtr]::Zero) { [WinScrFocus]::SetForegroundWindow($root) | Out-Null }\n"
+                    "Start-Sleep -Milliseconds 100\n"
+                )
+            else:
+                focus_block = "$ErrorActionPreference = 'SilentlyContinue'\n"
 
             script = (
-                self._MOUSE_TYPE +
-                "[WslMouse]::SetCursorPos(__X__, __Y__)\n"
-                "Start-Sleep -Milliseconds 30\n"
-                "[WslMouse]::mouse_event(0x0800, 0, 0, __DELTA__, [UIntPtr]::Zero)"
-            ).replace("__X__",     str(int(x))) \
-             .replace("__Y__",     str(int(y))) \
-             .replace("__DELTA__", str(delta_uint))
+                focus_block +
+                "Add-Type -AssemblyName System.Windows.Forms\n"
+                f"[System.Windows.Forms.SendKeys]::SendWait('{sk_str}')\n"
+            )
 
             returncode, _, stderr = await self._ps(script, timeout=10)
             if returncode != 0:
                 return {"error": f"scroll failed (code {returncode}): {stderr}"}
             if stderr:
                 logger.debug("[wsl:scroll] stderr (non-fatal): %s", stderr)
-            return {"success": True, "direction": direction, "clicks": clicks}
+            return {"success": True, "direction": direction, "clicks": clicks, "method": "keyboard"}
         except Exception as e:
             logger.debug("[wsl:scroll] %s", traceback.format_exc())
             return {"error": str(e)}
@@ -599,6 +636,48 @@ class WSLBackend(DesktopBackend):
         act = await self._activate_after_launch(name_hint)
         result["window_activated"] = act.get("window_activated", False)
         return result
+
+    # ------------------------------------------------------------------
+    # Window text extraction
+    # ------------------------------------------------------------------
+
+    async def get_window_text(self, max_chars: int = 50000) -> dict:
+        """
+        Select all text in the focused window (Ctrl+A then Ctrl+C), read the
+        clipboard, restore the previous clipboard content, and return the text.
+        Works in browsers, text editors, terminals, and most Windows apps.
+        """
+        script = (
+            "$ErrorActionPreference = 'SilentlyContinue'\n"
+            "Add-Type -AssemblyName System.Windows.Forms\n"
+            # Save old clipboard (null if empty)
+            "$old = Get-Clipboard -Raw\n"
+            # Select all + copy
+            "[System.Windows.Forms.SendKeys]::SendWait('^a')\n"
+            "Start-Sleep -Milliseconds 300\n"
+            "[System.Windows.Forms.SendKeys]::SendWait('^c')\n"
+            "Start-Sleep -Milliseconds 500\n"
+            # Read new clipboard
+            "$text = Get-Clipboard -Raw\n"
+            # Restore old clipboard
+            "try { if ($null -ne $old -and $old -ne '') { Set-Clipboard -Value $old } else { Set-Clipboard -Value '' } } catch {}\n"
+            # Truncate and return as JSON
+            f"$maxLen = {int(max_chars)}\n"
+            "$truncated = $false\n"
+            "if ($null -eq $text) { $text = '' }\n"
+            "if ($text.Length -gt $maxLen) { $text = $text.Substring(0, $maxLen); $truncated = $true }\n"
+            "[PSCustomObject]@{ text = $text; length = $text.Length; truncated = $truncated } | ConvertTo-Json -Compress\n"
+        )
+        try:
+            returncode, stdout, stderr = await self._ps(script, timeout=15)
+            if not stdout:
+                return {"error": f"get_window_text got no output (rc={returncode}): {stderr}"}
+            return json.loads(stdout)
+        except json.JSONDecodeError:
+            return {"text": stdout, "length": len(stdout), "truncated": False}
+        except Exception as e:
+            logger.debug("[wsl:get_window_text] %s", traceback.format_exc())
+            return {"error": str(e)}
 
     # ------------------------------------------------------------------
     # Window activation

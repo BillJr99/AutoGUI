@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { execFile } from "../process.js";
+import { execFile, execFileWithStdin } from "../process.js";
 import { DesktopError, type DesktopBackend, type PlatformInfo, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
 import { createPngPath, makeScreenshotResult, parseJsonArray, quoteAppleScript } from "./common.js";
 
@@ -63,10 +63,35 @@ export class MacBackend implements DesktopBackend {
   }
 
   async scroll(_x: number, _y: number, clicks: number, direction: "up" | "down", signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const amount = direction === "down" ? -clicks : clicks;
-    const result = await execFile("osascript", ["-e", `tell application "System Events" to scroll wheel ${amount}`], { timeoutMs: 5000, signal });
+    // key code 121 = Page Down (kVK_PageDown), 116 = Page Up (kVK_PageUp)
+    const keyCode = direction === "down" ? 121 : 116;
+    const n = Math.max(1, clicks);
+    const script = `tell application "System Events"\n  repeat ${n} times\n    key code ${keyCode}\n    delay 0.05\n  end repeat\nend tell`;
+    const result = await execFile("osascript", ["-e", script], { timeoutMs: 15000, signal });
     if (result.code !== 0) throw permissionError("scroll", result.stderr);
-    return { success: true, clicks, direction };
+    return { success: true, clicks, direction, method: "keyboard" };
+  }
+
+  async getWindowText(maxChars = 50000, signal?: AbortSignal): Promise<{ text: string; length: number; truncated: boolean }> {
+    // Save old clipboard content via pbpaste
+    const oldResult = await execFile("pbpaste", [], { timeoutMs: 5000, signal });
+    const oldClip = Buffer.from(oldResult.stdout, "utf8");
+
+    // Cmd+A then Cmd+C via osascript
+    const selectScript = `tell application "System Events"\n  keystroke "a" using command down\n  delay 0.3\n  keystroke "c" using command down\nend tell`;
+    await execFile("osascript", ["-e", selectScript], { timeoutMs: 10000, signal });
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+
+    // Read new clipboard via pbpaste
+    const pasteResult = await execFile("pbpaste", [], { timeoutMs: 5000, signal });
+    let text = pasteResult.stdout;
+
+    // Restore old clipboard via pbcopy (requires stdin)
+    await execFileWithStdin("pbcopy", [], oldClip, { timeoutMs: 5000, signal });
+
+    const truncated = text.length > maxChars;
+    text = truncated ? text.slice(0, maxChars) : text;
+    return { text, length: text.length, truncated };
   }
 
   async listWindows(signal?: AbortSignal): Promise<{ windows: WindowInfo[]; count: number }> {
