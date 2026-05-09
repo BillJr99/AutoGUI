@@ -258,17 +258,18 @@ class _AgentCommands(Provider):
         ("Help",               "action_help",             "Key bindings and registered tool list"),
     ]
 
-    async def search(self, query: str) -> Hits:
-        matcher = self.matcher(query)
-        stripped = query.strip()
+    async def discover(self) -> Hits:
+        """Show all commands when the palette opens with no query."""
         for label, action_name, help_text in self._ITEMS:
-            if not stripped:
-                # Discovery mode: show all commands with plain label (no highlight).
-                yield Hit(1.0, label, getattr(self.app, action_name), help_text)
-            else:
-                score = matcher.match(label)
-                if score > 0:
-                    yield Hit(score, matcher.highlight(label), getattr(self.app, action_name), help_text)
+            yield Hit(1.0, label, getattr(self.app, action_name), help_text)
+
+    async def search(self, query: str) -> Hits:
+        """Filter commands by fuzzy match as the user types."""
+        matcher = self.matcher(query)
+        for label, action_name, help_text in self._ITEMS:
+            score = matcher.match(label)
+            if score > 0:
+                yield Hit(score, matcher.highlight(label), getattr(self.app, action_name), help_text)
 
 
 # ---------------------------------------------------------------------------
