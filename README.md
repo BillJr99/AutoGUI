@@ -26,9 +26,21 @@ is configured to use and exposes desktop tools plus `/autogui`.
 |----------|--------------|
 | **ReAct loop** | Reason → tool call → observe result → repeat, up to configurable iteration limit |
 | **Shell** | Run any shell command with timeout, destructive-pattern guard, and confirmation delay |
-| **Filesystem** | Read, write (or append), and list files/directories |
-| **Desktop** | Screenshot, click, double-click, type text, hotkeys, scroll, launch apps, list windows |
-| **Accessibility** | Find UI elements by name/type (Windows UIAutomation, macOS osascript, WSL) |
+| **Filesystem** | Read, write (or append), and list files/directories; optional pre-overwrite snapshots |
+| **Desktop (pixel)** | Screenshot, click, double-click, type text, hotkeys, scroll, launch apps, list windows |
+| **Desktop (a11y-first)** | `desktop_click_element(name, …)` clicks real UI controls via UIAutomation (Windows), AT-SPI (Linux), and AppleScript (macOS) — no pixel guessing |
+| **Set-of-Mark grounding** | Numbered overlay on detected elements; the model clicks by id (`desktop_click_mark`) instead of pixel coords |
+| **Click-by-text** | OCR-anchored click (`desktop_click_text`) with optional auto-install of Tesseract |
+| **Browser (Playwright)** | First-class Chromium driver: real DOM/ARIA selectors, `browser_click`, `browser_fill`, `browser_eval` — opt-in via `allowed_browser` |
+| **Native input (Windows)** | `click`/`type_text`/`hotkey` go through `user32.SendInput` directly (real INPUT events, correct DPI, full Unicode) |
+| **Best-of-N sampling** | On uncertain steps (recent failure or non-APPROVED validator), sample N candidates and pick via self-consistency or a verifier model |
+| **Two-tier model** | Optional cheap `openwebui_fast` client for the validator/verifier; primary client owns user-facing turns |
+| **Skill library** | `skill_save`/`skill_list`/`skill_run`: persist successful tool sequences, retrieve them by keyword on the next task |
+| **Trajectory replay** | Per-session JSONL trace + `replay.py` re-runs any saved skill or trace deterministically (no LLM) |
+| **Failure recording** | Rolling 5-second screen buffer dumps to an animated GIF on tool failure |
+| **State diff & modal flag** | Pre/post-action window-set diff with an `[UNEXPECTED MODAL: …]` banner when an error/permission/confirm dialog appears |
+| **Dry-run mode** | Stub all state-changing tools while keeping observation tools live |
+| **Action scoping** | `allowed_apps` + `blocked_window_titles` enforced before every GUI action |
 | **Platform-aware prompts** | Auto-injects OS-specific instructions (WSL `.exe`, `where.exe`, `which`, etc.) |
 | **Startup validation** | Checks API key and model against the live server; prompts to fix or save |
 | **Live model picker** | Ctrl+P → "Change Model" fetches the live model list; select and optionally persist to config |
@@ -206,6 +218,82 @@ winget install UB-Mannheim.TesseractOCR
 pip install pytesseract
 # Then add C:\Program Files\Tesseract-OCR to PATH if winget didn't.
 ```
+
+### A11y-first clicking (most reliable)
+
+`desktop_click_element(name=…, control_type=…)` talks to the real UI
+control by name/role via the OS accessibility API instead of clicking
+at a guessed pixel position. **Prefer this over `desktop_click`
+whenever the target has a visible label** — it survives DPI scaling,
+window moves, and async UI redraws.
+
+| Platform     | Backend used                        | Install                                                |
+|--------------|-------------------------------------|--------------------------------------------------------|
+| Windows      | UIAutomation (`uiautomation` pkg)   | `pip install uiautomation pywin32`                     |
+| macOS        | AppleScript / AX (`pyobjc`)         | `pip install pyobjc-framework-Quartz pyobjc-framework-AppKit` (built-in if installed) |
+| Linux X11    | AT-SPI 2 (`pyatspi`)                | `sudo apt install python3-pyatspi gir1.2-atspi-2.0`    |
+| Linux Wayland| AT-SPI 2 (`pyatspi`)                | same as X11                                             |
+
+When the a11y backend isn't available the fallback ladder is:
+`desktop_click_text` (OCR/a11y text match) → `desktop_click_mark`
+(Set-of-Mark) → `desktop_click(x, y)`. The agent's system prompt
+encourages the model to walk this ladder.
+
+### Browser automation (Playwright)
+
+Set `tools.allowed_browser: true` and (optionally)
+`tools.auto_install_playwright: true` to enable the `browser_*` tool
+family — a Playwright-driven Chromium that the agent can navigate,
+inspect, and interact with via real DOM/ARIA selectors instead of
+pixel coordinates.
+
+Selectors follow Playwright syntax:
+- CSS: `button.primary`, `#login-form input[name="email"]`
+- Text: `text=Sign in`, `text=/^Continue$/i`
+- ARIA role: `role=button[name="Sign in"]`
+- XPath: `xpath=//button[contains(.,"Sign in")]`
+
+Use `browser.user_data_dir` to point at a persistent profile if you
+want logins/cookies to survive restarts.
+
+### Native input on Windows
+
+On Windows, `desktop_click` / `desktop_type` / `desktop_hotkey` go
+through `user32.SendInput` directly via ctypes when available. This
+gives you real INPUT events (indistinguishable from a physical
+keyboard/mouse), correct per-monitor DPI behaviour, and full Unicode
+text input via `KEYEVENTF_UNICODE`. Falls back to pyautogui if
+SendInput initialisation fails. No configuration required.
+
+### Best-of-N action sampling
+
+Optional. Set `agent.bon.enabled: true` and on uncertain steps the
+agent will sample N candidate completions from the primary model in
+parallel, then choose between them via:
+
+1. **Self-consistency** — if a strong majority propose the same first
+   tool + arg signature, that's the pick (no extra call).
+2. **Verifier** — otherwise the `openwebui_fast` client (or the
+   primary, if no fast client is configured) is given a one-line
+   summary of each candidate and asked which to use.
+3. **Fallback** — any failure path picks the first viable candidate,
+   so BoN can never make the agent worse than baseline.
+
+Triggers (also configurable):
+- `trigger_on_recent_failure` — last iteration had a failed tool.
+- `trigger_on_validator_disagreement` — last validator verdict was
+  not `APPROVED`.
+
+Cost: 3–5× tokens on triggered steps. Spend nothing on confident
+steps. Defaults are conservative; turn it on when you're chasing the
+last ~20% of accuracy.
+
+### Failure recording
+
+A daemon thread maintains a rolling 5-second screen buffer at 5 fps.
+On any failed tool call the buffer is flushed to an animated GIF
+under `screenshots/failures/`, and a `failure_recording` event is
+emitted with the path. Defaults to on; tune via `agent.screen_record`.
 
 ### Set-of-Mark grounding
 
@@ -461,7 +549,21 @@ No configuration is needed.
     "record_trace": true,                // Persist every event to logs/traces/<session>.jsonl
     "trace_dir": "logs/traces",          // Where the JSONL trajectory log lives
     "suggest_skills": true,              // Offer top-K saved skills at task start
-    "skills_path": "~/.autogui/skills.jsonl"  // Skill library location
+    "skills_path": "~/.autogui/skills.jsonl",  // Skill library location
+    "bon": {                              // Best-of-N action sampling
+      "enabled": false,                   // Off by default — multiplies token cost on uncertain steps
+      "n": 3,                             // Number of candidates to sample
+      "temperature": 0.7,                 // Sampling temperature for diverse candidates
+      "trigger_on_recent_failure": true,
+      "trigger_on_validator_disagreement": true
+    },
+    "screen_record": {                    // Rolling screen buffer
+      "enabled": true,                    // Capture into a deque while running
+      "fps": 5,                           // Frames per second
+      "buffer_seconds": 5.0,              // Length of rolling window in seconds
+      "max_width": 960,                   // Downscale before storing
+      "out_dir": "screenshots/failures"   // GIFs are written here on tool failure
+    }
   },
   "tools": {
     "shell_timeout_seconds": 30,          // Per-command shell timeout
@@ -469,10 +571,17 @@ No configuration is needed.
     "max_screenshot_width": 1280,         // Resize screenshots wider than this (px)
     "perception_cache_ttl_seconds": 0.5,  // Reuse the last screenshot for this long
     "auto_install_tesseract": false,      // True = run the platform installer on startup
+    "auto_install_playwright": false,     // True = pip install playwright + playwright install chromium
     "allowed_shell": true,               // Enable shell_run tool
     "allowed_filesystem": true,          // Enable fs_read / fs_write / fs_list
     "allowed_desktop": true,             // Enable all desktop/* tools
-    "allowed_browser": false             // Playwright browser tools (not yet implemented)
+    "allowed_browser": false             // Playwright browser_* tools
+  },
+  "browser": {                            // Settings for the Playwright backend
+    "headless": false,                    // Run with a visible window
+    "screenshot_dir": "screenshots/browser",
+    "user_data_dir": "",                 // Non-empty path = persistent profile (keeps logins)
+    "viewport": {"width": 1280, "height": 800}
   },
   "logging": {
     "level": "INFO",                     // Log level for file handler
