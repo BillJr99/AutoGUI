@@ -257,6 +257,7 @@ class ToolRegistry:
         self._cfg = cfg
         self._tools_cfg = cfg.get("tools", {})
         self._agent_cfg = cfg.get("agent", {})
+        self._safety_cfg = cfg.get("safety", {})
         self._dispatch: dict[str, Callable] = {}
         self._schemas: list[dict] = []
 
@@ -271,6 +272,8 @@ class ToolRegistry:
                 self._backend = get_backend(self._platform_info)
                 self._backend_caps = self._backend.capabilities()
                 logger.info("[tools.py] Backend capabilities: %s", self._backend_caps)
+                cache_ttl = self._tools_cfg.get("perception_cache_ttl_seconds", 0.5)
+                self._backend.configure_cache(cache_ttl)
             except Exception as e:
                 print(f"[tools.py:ToolRegistry.__init__] Backend init failed: {e}")
                 traceback.print_exc()
@@ -362,7 +365,10 @@ class ToolRegistry:
                     "name": "desktop_screenshot",
                     "description": (
                         "Capture a screenshot of the screen or a region. "
-                        "Returns base64-encoded PNG. Use before clicking to verify screen state."
+                        "Returns base64-encoded PNG. Use before clicking to verify screen state. "
+                        "Tip: when you need to click a labelled UI element, prefer "
+                        "desktop_screenshot_marked + desktop_click_mark instead — much more "
+                        "reliable than guessing pixel coordinates."
                     ),
                     "parameters": {"type": "object", "properties": {
                         "region": {"type": "object", "description": "Optional {x,y,width,height}",
@@ -371,6 +377,71 @@ class ToolRegistry:
                     }},
                 }},
                 lambda region=None: b.screenshot(region=region, save_dir=save_dir, resize_width=resize_w),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_screenshot_marked",
+                    "description": (
+                        "Capture a screenshot with numbered Set-of-Mark boxes drawn over "
+                        "detected UI elements (top-level windows, plus accessibility-tree "
+                        "controls when available). Use this BEFORE attempting to click any "
+                        "named element — then call desktop_click_mark(mark_id) using one of "
+                        "the ids returned in the 'marks' list. Far more reliable than "
+                        "guessing pixel coordinates from a plain screenshot."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                }},
+                lambda: b.screenshot_marked(save_dir=save_dir, resize_width=resize_w),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_click_mark",
+                    "description": (
+                        "Click the centre of a previously-marked UI element by its mark id. "
+                        "Requires a recent desktop_screenshot_marked call. "
+                        "If the screen has changed materially since then, refresh the marks "
+                        "first or the id may resolve to the wrong location."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "mark_id": {"type": "integer",
+                                    "description": "Numeric id from the marks list."},
+                    }, "required": ["mark_id"]},
+                }},
+                lambda mark_id: b.click_mark(int(mark_id)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_click_text",
+                    "description": (
+                        "Find a visible text label on screen and click its centre. "
+                        "On Windows/macOS this consults the accessibility tree first; "
+                        "as a fallback (or on Linux) it uses OCR via pytesseract if "
+                        "installed. Prefer this over pixel-coordinate clicks for any "
+                        "text-labelled button or link."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "text": {"type": "string",
+                                 "description": "The visible label to click (case-insensitive)."},
+                        "occurrence": {"type": "integer",
+                                       "description": "0-based index when multiple matches (default 0)."},
+                    }, "required": ["text"]},
+                }},
+                lambda text, occurrence=0: b.click_text(str(text), int(occurrence) if occurrence else 0),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_find_text",
+                    "description": (
+                        "Locate visible text on screen and return its bounding rect "
+                        "without clicking. Useful for verifying that something is "
+                        "displayed, or for computing a click position relative to a label."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "text": {"type": "string"},
+                        "occurrence": {"type": "integer"},
+                    }, "required": ["text"]},
+                }},
+                lambda text, occurrence=0: b.find_text_on_screen(str(text), int(occurrence) if occurrence else 0),
             )
             self._register(
                 {"type": "function", "function": {
@@ -671,6 +742,14 @@ class ToolRegistry:
         "fs_list": {"dir": "path", "directory": "path", "folder": "path"},
     }
 
+    # Tools that mutate desktop state — perception cache must be flushed after.
+    _STATE_CHANGING_TOOLS = frozenset({
+        "desktop_click", "desktop_click_mark", "desktop_click_text",
+        "desktop_type", "desktop_hotkey", "desktop_scroll",
+        "desktop_launch", "desktop_activate_window", "desktop_mouse_move",
+        "shell_run",
+    })
+
     async def dispatch(self, tool_name: str, arguments: dict) -> str:
         fn = self._dispatch.get(tool_name)
         if fn is None:
@@ -684,6 +763,8 @@ class ToolRegistry:
         try:
             logger.info("[tools.py:dispatch] %s(%s)", tool_name, list(arguments.keys()))
             result = await fn(**arguments)
+            if tool_name in self._STATE_CHANGING_TOOLS and self._backend is not None:
+                self._backend.invalidate_cache()
             return json.dumps(result, default=str)
         except TypeError as e:
             # Print argument types to help diagnose "not str/PathLike" errors

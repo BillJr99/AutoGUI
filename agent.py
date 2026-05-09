@@ -192,16 +192,31 @@ class Agent:
             except Exception:
                 pass
 
-        if self._vision_screenshots and "desktop_screenshot" in available_tools:
+        # Pick the best screenshot tool: marked (Set-of-Mark) when available,
+        # else plain.  The marked variant draws numbered boxes over UI elements
+        # so the model can refer to them by id.
+        shot_tool = (
+            "desktop_screenshot_marked"
+            if "desktop_screenshot_marked" in available_tools
+            else "desktop_screenshot"
+        )
+        if self._vision_screenshots and shot_tool in available_tools:
             try:
-                shot_json = await self._registry.dispatch("desktop_screenshot", {})
+                shot_json = await self._registry.dispatch(shot_tool, {})
                 result_obj = json.loads(shot_json)
                 b64 = result_obj.pop("base64_png", None)
+                marks = result_obj.get("marks") or []
                 if b64:
+                    text_parts = [user_input + initial_suffix]
+                    if marks:
+                        text_parts.append(
+                            f"[Set-of-Mark active — {len(marks)} numbered boxes drawn. "
+                            "Use desktop_click_mark(id) to click any of them.]"
+                        )
                     self._history.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": user_input + initial_suffix},
+                            {"type": "text", "text": "\n".join(text_parts)},
                             {"type": "image_url",
                              "image_url": {"url": "data:image/png;base64," + b64}},
                         ],
