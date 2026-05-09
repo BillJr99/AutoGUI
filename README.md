@@ -24,6 +24,7 @@ is configured to use and exposes desktop tools plus `/autogui`.
 
 | Category | What it does |
 |----------|--------------|
+| **Planner** | One LLM call up front produces a numbered plan; executor follows it across the ReAct loop. Off-switchable, defaults on |
 | **ReAct loop** | Reason → tool call → observe result → repeat, up to configurable iteration limit |
 | **Shell** | Run any shell command with timeout, destructive-pattern guard, and confirmation delay |
 | **Filesystem** | Read, write (or append), and list files/directories; optional pre-overwrite snapshots |
@@ -79,8 +80,14 @@ main.py             Entry point — argparse, validation, component wiring, TUI/
 │   ├─ shell_run             Shell command with timeout and destructive guard
 │   ├─ fs_read / fs_write / fs_list
 │   ├─ desktop_screenshot / click / type / hotkey / scroll / launch / list_windows
-│   ├─ desktop_find_element  (Windows, macOS, WSL — when backend supports it)
-│   ├─ desktop_get_window_tree (Windows, macOS)
+│   ├─ desktop_find_element  (Windows UIAutomation, Linux AT-SPI, WSL)
+│   ├─ desktop_click_element (a11y-first click — same backends as find_element)
+│   ├─ desktop_click_text    (OCR / a11y text match)
+│   ├─ desktop_screenshot_marked / desktop_click_mark  (Set-of-Mark)
+│   ├─ skill_save / skill_list / skill_run  (persistent macros)
+│   ├─ browser_navigate / click / fill / press / get_text / screenshot / eval
+│   │   (Playwright; registered when allowed_browser=true)
+│   ├─ desktop_get_window_tree (Windows)
 │   └─ ToolRegistry          JSON Schema catalog + async dispatch
 │
 ├── agent.py        Agentic loop
@@ -219,6 +226,26 @@ pip install pytesseract
 # Then add C:\Program Files\Tesseract-OCR to PATH if winget didn't.
 ```
 
+### Planner (vs. dry-run — they're different things)
+
+**Planner** = one extra LLM call at the start of each task that
+produces a numbered, high-level plan (3–8 steps describing goals,
+not specific clicks). The plan is injected as a `[PLAN]` block into
+the executor's context so every subsequent decision has the full
+trajectory in mind. Configured under `agent.planner.enabled`,
+defaults on. The planner uses `openwebui_fast` when configured.
+
+**Dry-run** (`safety.dry_run: true`) is a *safety stub*, not a
+planner — it returns `{dry_run: true, would_execute: …}` for every
+state-changing tool while leaving the real screen unchanged. Useful
+for "rehearse a task without touching anything", but not as a
+plan-then-execute mechanism: the executor would think each step
+succeeded, observe the unchanged real screen, and tie itself in
+knots over the contradiction.
+
+If you want plan-first-then-execute semantics, leave dry-run off and
+keep the planner on — that's exactly what the planner does.
+
 ### A11y-first clicking (most reliable)
 
 `desktop_click_element(name=…, control_type=…)` talks to the real UI
@@ -241,11 +268,17 @@ encourages the model to walk this ladder.
 
 ### Browser automation (Playwright)
 
-Set `tools.allowed_browser: true` and (optionally)
-`tools.auto_install_playwright: true` to enable the `browser_*` tool
+Set `tools.allowed_browser: true` to enable the `browser_*` tool
 family — a Playwright-driven Chromium that the agent can navigate,
 inspect, and interact with via real DOM/ARIA selectors instead of
 pixel coordinates.
+
+The first time you start AutoGUI with browser tools enabled it will
+detect that Playwright + Chromium are missing and install them for
+you (`pip install playwright` then `playwright install chromium`).
+Loud by design — every command prints to stdout so you can see what
+gets installed and where. Set `tools.auto_install_playwright: false`
+to opt out and install manually.
 
 Selectors follow Playwright syntax:
 - CSS: `button.primary`, `#login-form input[name="email"]`
@@ -543,13 +576,15 @@ No configuration is needed.
   },
   "agent": {
     "max_iterations": 30,                 // Hard stop after N agentic loop iterations
-    "system_prompt": "...",              // Full system prompt (see config.json.example)
-    "confirm_destructive": true,         // Block shell commands matching destructive patterns
+    "confirm_destructive": true,         // Block shell commands matching destructive regex patterns
     "vision_screenshots": true,          // Send screenshots to vision-capable models
     "record_trace": true,                // Persist every event to logs/traces/<session>.jsonl
     "trace_dir": "logs/traces",          // Where the JSONL trajectory log lives
     "suggest_skills": true,              // Offer top-K saved skills at task start
     "skills_path": "~/.autogui/skills.jsonl",  // Skill library location
+    "planner": {                          // Pre-execution planning pass
+      "enabled": true                     // One extra LLM call up front; uses openwebui_fast when set
+    },
     "bon": {                              // Best-of-N action sampling
       "enabled": false,                   // Off by default — multiplies token cost on uncertain steps
       "n": 3,                             // Number of candidates to sample
@@ -571,7 +606,7 @@ No configuration is needed.
     "max_screenshot_width": 1280,         // Resize screenshots wider than this (px)
     "perception_cache_ttl_seconds": 0.5,  // Reuse the last screenshot for this long
     "auto_install_tesseract": false,      // True = run the platform installer on startup
-    "auto_install_playwright": false,     // True = pip install playwright + playwright install chromium
+    "auto_install_playwright": true,      // Install Playwright + Chromium when allowed_browser=true (default true)
     "allowed_shell": true,               // Enable shell_run tool
     "allowed_filesystem": true,          // Enable fs_read / fs_write / fs_list
     "allowed_desktop": true,             // Enable all desktop/* tools

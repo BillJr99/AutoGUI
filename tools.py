@@ -16,10 +16,11 @@ desktop tool functions in the registry then delegate to backend methods.
 New LLM tools (platform-dependent)
 -----------------------------------
   desktop_find_element   — find a UI element by accessibility properties.
-                           Supported: Windows (uiautomation), macOS (osascript),
-                           WSL (PowerShell UIAutomation).
+                           Supported: Windows (uiautomation), Linux X11 +
+                           Wayland (AT-SPI via pyatspi), WSL (PowerShell
+                           UIAutomation).
   desktop_get_window_tree — dump the accessibility tree for a window.
-                           Supported: Windows, macOS.
+                           Supported: Windows.
 
 These tools are registered only when the active backend reports support for
 them via capabilities()["find_element"] / capabilities()["get_window_tree"].
@@ -319,14 +320,19 @@ class ToolRegistry:
                 logger.warning("[tools.py] tesseract_install failed: %s", e)
 
         # Same pattern for Playwright — only when browser tools are enabled.
+        # auto_install_playwright defaults to True when allowed_browser=true:
+        # if you've committed to browser automation, you almost certainly want
+        # the deps installed.  Set the flag explicitly to false to opt out.
         self._browser_backend = None
         if self._tools_cfg.get("allowed_browser", False):
-            if self._tools_cfg.get("auto_install_playwright", False):
+            if self._tools_cfg.get("auto_install_playwright", True):
                 try:
                     from playwright_install import ensure as ensure_pw
                     snap = ensure_pw(auto_install=True)
                     if not snap.get("ready"):
                         logger.warning("[tools.py] Playwright install: %s", snap.get("message"))
+                    else:
+                        logger.info("[tools.py] Playwright + Chromium ready.")
                 except Exception as e:
                     logger.warning("[tools.py] playwright_install failed: %s", e)
             try:

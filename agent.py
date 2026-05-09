@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
 from client import OpenWebUIClient
+from planner import Planner
 from prompt_loader import PromptLoader
 from screen_record import ScreenRecorder
 from skills import SkillStore
@@ -218,6 +219,23 @@ class Agent:
 
         if self._skill_store is not None:
             self._register_skill_tools()
+
+        # Planner (Phase 12).  When enabled, the agent issues one extra
+        # LLM call BEFORE the action loop to produce a numbered plan, then
+        # injects the plan into history so the executor sees the full
+        # trajectory it's working towards.  Disabled = legacy behaviour.
+        planner_cfg = self._agent_cfg.get("planner", {}) or {}
+        self._planner_enabled: bool = bool(planner_cfg.get("enabled", True))
+        # Use the fast client for planning when available; planning is a
+        # cheap-to-cheaper-than-execution call that benefits from speed
+        # over depth.
+        self._planner: Planner | None = None
+        if self._planner_enabled:
+            try:
+                self._planner = Planner(self._fast_client or self._client)
+            except Exception as e:
+                logger.warning("[agent] Planner init failed: %s", e)
+                self._planner = None
 
         # Rolling screen buffer (Phase 11).  When a tool fails, the buffer
         # is flushed to an animated GIF so the user can see exactly how
@@ -420,12 +438,48 @@ class Agent:
         else:
             initial_suffix = "\n" + self._prompts.text("runtime_vision_disabled")
 
+        windows_json = ""
         if "desktop_list_windows" in available_tools:
             try:
                 windows_json = await self._registry.dispatch("desktop_list_windows", {})
                 initial_suffix += f"\n\n[Desktop state at task start: {windows_json}]"
             except Exception:
                 pass
+
+        # ---- Planner pass (Phase 12) -------------------------------------
+        # One extra LLM call BEFORE the executor loop produces a numbered
+        # plan; the plan is injected as a [PLAN] block so every subsequent
+        # tool decision has the full trajectory in mind.  Falls back to a
+        # plan-less run on any failure so this can never make things worse.
+        if self._planner is not None:
+            try:
+                browser_avail = any(
+                    t.startswith("browser_") for t in available_tools
+                )
+                a11y_avail = "desktop_click_element" in available_tools
+                os_label = _platform.system()
+                plan_text = await self._planner.plan(
+                    task=user_input,
+                    os_label=os_label,
+                    vision=self._vision_screenshots,
+                    browser_available=browser_avail,
+                    a11y_available=a11y_avail,
+                    windows_summary=windows_json,
+                )
+            except Exception as e:
+                logger.warning("[agent] planner failed: %s", e)
+                plan_text = ""
+            if plan_text:
+                yield AgentEvent(
+                    kind="plan",
+                    content=plan_text,
+                    data={"plan": plan_text},
+                )
+                initial_suffix += (
+                    "\n\n[PLAN — follow this trajectory, but adapt if the "
+                    "screen state diverges from what a step expects:]\n"
+                    + plan_text
+                )
 
         # Skill retrieval — show the model up to 3 saved procedures whose
         # keywords overlap with the user's request, so it can opt to skill_run

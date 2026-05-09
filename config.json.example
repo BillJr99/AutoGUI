@@ -20,20 +20,15 @@
   "agent": {
     "max_iterations": 30,
     "confirm_destructive": true,
-    "destructive_keywords": [
-      "rm",
-      "delete",
-      "format",
-      "truncate",
-      "DROP",
-      "sudo rm",
-      "rmdir"
-    ],
     "vision_screenshots": true,
     "record_trace": true,
     "trace_dir": "logs/traces",
     "suggest_skills": true,
     "skills_path": "~/.autogui/skills.jsonl",
+    "planner": {
+      "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces. Uses openwebui_fast when configured.",
+      "enabled": true
+    },
     "bon": {
       "_comment": "Best-of-N action sampling. Multiplies token cost on uncertain steps.",
       "enabled": false,
@@ -57,7 +52,7 @@
     "max_screenshot_width": 1280,
     "perception_cache_ttl_seconds": 0.5,
     "auto_install_tesseract": false,
-    "auto_install_playwright": false,
+    "auto_install_playwright": true,
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,
