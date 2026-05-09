@@ -35,11 +35,13 @@ import platform as _platform
 import re
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from client import OpenWebUIClient
 from prompt_loader import PromptLoader
+from skills import SkillStore
 from tools import ToolRegistry
+from trace import TraceWriter
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +117,19 @@ class Agent:
         Full configuration dict (agent section used for system prompt, etc.).
     """
 
-    def __init__(self, client: OpenWebUIClient, registry: ToolRegistry, cfg: dict):
+    def __init__(
+        self,
+        client: OpenWebUIClient,
+        registry: ToolRegistry,
+        cfg: dict,
+        event_sink: Callable[["AgentEvent"], None] | None = None,
+    ):
         self._client = client
         self._registry = registry
+        self._cfg = cfg
         self._agent_cfg = cfg.get("agent", {})
         self._max_iterations: int = self._agent_cfg.get("max_iterations", 30)
+        self._event_sink = event_sink
 
         # Load prompt files; fall back to config system_prompt for the base if missing.
         self._prompts = PromptLoader(cfg.get("prompts_dir", "prompts"))
@@ -150,11 +160,194 @@ class Agent:
         # checker so it can flag duplicates (e.g. launching the same app twice).
         self._completed_actions: list[str] = []
 
+        # Full-fidelity record of successful tool dispatches for the current
+        # session.  Used by skill_save to snapshot the recipe of "what worked"
+        # and by the trace writer for post-hoc inspection.
+        self._session_steps: list[dict] = []
+
+        # Trace + skill store wiring (Phase 2).
+        trace_dir = self._agent_cfg.get("trace_dir", "logs/traces")
+        skills_path = self._agent_cfg.get("skills_path", "~/.autogui/skills.jsonl")
+        self._suggest_skills: bool = bool(self._agent_cfg.get("suggest_skills", True))
+        self._record_trace: bool = bool(self._agent_cfg.get("record_trace", True))
+
+        try:
+            self._trace = TraceWriter(trace_dir) if self._record_trace else None
+        except Exception as e:
+            logger.warning("[agent] TraceWriter init failed: %s", e)
+            self._trace = None
+
+        try:
+            self._skill_store = SkillStore(skills_path)
+        except Exception as e:
+            logger.warning("[agent] SkillStore init failed: %s", e)
+            self._skill_store = None
+
+        if self._trace:
+            try:
+                self._trace.write_meta(
+                    event="session_start",
+                    model=cfg.get("openwebui", {}).get("model", "?"),
+                    vision=self._vision_screenshots,
+                )
+            except Exception:
+                pass
+
+        if self._skill_store is not None:
+            self._register_skill_tools()
+
+    # ------------------------------------------------------------------
+    # Skill tool registration
+    # ------------------------------------------------------------------
+
+    def _register_skill_tools(self):
+        """Add skill_save / skill_list / skill_run to the registry."""
+        store = self._skill_store
+        registry = self._registry
+
+        async def _skill_save(name: str, keywords=None, app: str = "") -> dict:
+            if not self._session_steps:
+                return {"error": "No successful steps in this session yet to save."}
+            kw = keywords or []
+            if isinstance(kw, str):
+                kw = [k.strip() for k in re.split(r"[,;\s]+", kw) if k.strip()]
+            try:
+                skill = store.save(
+                    name=str(name),
+                    keywords=list(kw),
+                    app=str(app or ""),
+                    steps=list(self._session_steps),
+                )
+                return {"success": True, "name": skill["name"], "step_count": len(skill["steps"])}
+            except Exception as e:
+                return {"error": str(e)}
+
+        async def _skill_list(query: str = "", limit: int = 5) -> dict:
+            try:
+                results = store.search(str(query) if query else "", limit=int(limit) if limit else 5)
+                return {
+                    "skills": [
+                        {
+                            "name": s.get("name"),
+                            "app": s.get("app", ""),
+                            "keywords": s.get("keywords", []),
+                            "step_count": len(s.get("steps", [])),
+                            "success_count": s.get("success_count", 0),
+                        }
+                        for s in results
+                    ],
+                    "count": len(results),
+                }
+            except Exception as e:
+                return {"error": str(e)}
+
+        async def _skill_run(name: str) -> dict:
+            skill = store.get(str(name))
+            if not skill:
+                return {"error": f"No skill named {name!r}"}
+            executed: list[dict] = []
+            for step in skill.get("steps", []):
+                tool = step.get("tool")
+                args = step.get("args", {}) or {}
+                if not tool:
+                    continue
+                result_json = await registry.dispatch(tool, args)
+                try:
+                    result = json.loads(result_json)
+                except json.JSONDecodeError:
+                    result = {"raw": result_json[:120]}
+                executed.append({"tool": tool, "args": args, "ok": "error" not in result})
+                if "error" in result:
+                    return {
+                        "skill": name,
+                        "executed": executed,
+                        "stopped_at": tool,
+                        "error": result["error"],
+                    }
+            try:
+                store.increment_success(str(name))
+            except Exception:
+                pass
+            return {"skill": name, "executed": executed, "step_count": len(executed), "success": True}
+
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "skill_save",
+                "description": (
+                    "Save the sequence of tool calls completed in this session as a "
+                    "named, replayable skill. Provide keywords describing when this "
+                    "skill applies (e.g. 'open weather forecast in browser'). "
+                    "Call this only after the task has succeeded — earlier failed "
+                    "attempts in the same session are not included. "
+                    "Saved skills can later be invoked by skill_run or replayed "
+                    "outside the agent via replay.py."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "name": {"type": "string", "description": "Short unique identifier for the skill."},
+                    "keywords": {"type": "array", "items": {"type": "string"},
+                                 "description": "Words/phrases that describe when to use this skill."},
+                    "app": {"type": "string",
+                            "description": "Primary app or context this skill targets (optional)."},
+                }, "required": ["name"]},
+            }},
+            _skill_save,
+        )
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "skill_list",
+                "description": (
+                    "List saved skills, optionally filtered by a search query. "
+                    "Use this at the start of a task to check whether a known "
+                    "procedure already exists for what the user asked."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string", "description": "Optional keyword filter."},
+                    "limit": {"type": "integer", "description": "Max skills to return (default 5)."},
+                }},
+            }},
+            _skill_list,
+        )
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "skill_run",
+                "description": (
+                    "Replay every step of a previously saved skill in order. "
+                    "Stops at the first failing step. Use only when the current "
+                    "screen state and target app match the conditions under which "
+                    "the skill was originally recorded."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "name": {"type": "string"},
+                }, "required": ["name"]},
+            }},
+            _skill_run,
+        )
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     async def run(self, user_input: str) -> AsyncIterator[AgentEvent]:
+        """
+        Public entry point.  Tees every yielded event through the trace
+        writer and the optional event_sink before passing it to the caller,
+        so observability / replay logging can be added without modifying
+        each yield site individually.
+        """
+        async for event in self._run_inner(user_input):
+            if self._trace is not None:
+                try:
+                    self._trace.write_event(event)
+                except Exception:
+                    pass
+            if self._event_sink is not None:
+                try:
+                    self._event_sink(event)
+                except Exception:
+                    pass
+            yield event
+
+    async def _run_inner(self, user_input: str) -> AsyncIterator[AgentEvent]:
         """
         Append user_input to the history and drive the agentic loop until
         the model produces a final response or the iteration ceiling is reached.
@@ -191,6 +384,25 @@ class Agent:
                 initial_suffix += f"\n\n[Desktop state at task start: {windows_json}]"
             except Exception:
                 pass
+
+        # Skill retrieval — show the model up to 3 saved procedures whose
+        # keywords overlap with the user's request, so it can opt to skill_run
+        # instead of re-deriving from scratch.
+        if self._suggest_skills and self._skill_store is not None and "skill_run" in available_tools:
+            try:
+                candidates = self._skill_store.search(user_input, limit=3)
+            except Exception:
+                candidates = []
+            if candidates:
+                lines = ["[Candidate saved skills (call skill_run if one matches):]"]
+                for s in candidates:
+                    lines.append(
+                        f"  - {s.get('name')!r} (app={s.get('app','?')}, "
+                        f"steps={len(s.get('steps', []))}, "
+                        f"successes={s.get('success_count', 0)}, "
+                        f"keywords={s.get('keywords', [])[:5]})"
+                    )
+                initial_suffix += "\n\n" + "\n".join(lines)
 
         # Pick the best screenshot tool: marked (Set-of-Mark) when available,
         # else plain.  The marked variant draws numbered boxes over UI elements
@@ -508,6 +720,19 @@ class Agent:
                             self._completed_actions.append(entry)
                         if len(self._completed_actions) > 20:
                             self._completed_actions = self._completed_actions[-20:]
+
+                    # Full-fidelity record for skill snapshotting / trace export.
+                    # Skip the meta tools — they're not meaningful to replay.
+                    if tool_name not in (
+                        "skill_save", "skill_list", "skill_run",
+                        "desktop_screenshot", "desktop_screenshot_marked",
+                        "desktop_list_windows", "desktop_get_active_window",
+                        "desktop_get_cursor_pos", "desktop_get_window_text",
+                        "desktop_get_window_tree", "desktop_find_element",
+                        "desktop_find_text",
+                        "fs_read", "fs_list",
+                    ):
+                        self._session_steps.append({"tool": tool_name, "args": dict(args)})
 
                 # ---- Error injection: fail loud, not quiet -----------------
                 # Prepend a header inside the tool result AND track the failure

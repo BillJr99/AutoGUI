@@ -284,6 +284,14 @@ class ToolRegistry:
         self._schemas.append(schema)
         self._dispatch[schema["function"]["name"]] = fn
 
+    def add_tool(self, schema: dict, fn: Callable):
+        """
+        Public hook so callers (e.g. the agent) can extend the catalog
+        after construction.  Used to inject skill_save / skill_list /
+        skill_run since those need access to the agent's session state.
+        """
+        self._register(schema, fn)
+
     def _build(self):
         shell_ok = self._tools_cfg.get("allowed_shell", True)
         fs_ok = self._tools_cfg.get("allowed_filesystem", True)
