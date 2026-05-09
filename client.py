@@ -153,9 +153,14 @@ class OpenWebUIClient:
                 ) as resp:
                     raw = await resp.text()
                     if resp.status != 200:
-                        raise RuntimeError(
+                        # Tag auth failures so callers can detect them
+                        # programmatically (e.g. fast-client → primary
+                        # auto-demote without needing to grep error text).
+                        err = RuntimeError(
                             f"[client.py:chat] API returned HTTP {resp.status}: {raw[:500]}"
                         )
+                        err.http_status = resp.status  # type: ignore[attr-defined]
+                        raise err
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError as e:

@@ -246,6 +246,30 @@ knots over the contradiction.
 If you want plan-first-then-execute semantics, leave dry-run off and
 keep the planner on — that's exactly what the planner does.
 
+**Why does the planner sometimes get a 401 when everything else
+works?** The planner uses `openwebui_fast` when configured. If you
+copied `config.json.example` and only updated the primary
+`openwebui.api_key`, the `openwebui_fast.api_key` field still has
+the placeholder `sk-your-openwebui-api-key-here`, which the server
+rejects with 401. AutoGUI now handles this two ways:
+
+1. **Startup detection.** If `openwebui_fast.api_key` is empty,
+   missing, or matches the example placeholder, AutoGUI logs a
+   warning and uses the primary key for the fast client. Prints:
+   ```
+   [main] openwebui_fast.api_key is empty/placeholder; using the
+   primary api_key for fast-client calls.
+   ```
+2. **Runtime auto-demote.** If the fast client returns 401 mid-
+   session (stale or revoked key), AutoGUI emits a `warning` event
+   and automatically falls back to the primary client for the rest
+   of the session. Fix or remove `openwebui_fast.api_key` to
+   silence the warning permanently.
+
+You can also turn the planner off entirely with
+`agent.planner.enabled: false` if you don't want the extra round-
+trip while debugging.
+
 ### A11y-first clicking (most reliable)
 
 `desktop_click_element(name=…, control_type=…)` talks to the real UI
@@ -322,6 +346,31 @@ gives you real INPUT events (indistinguishable from a physical
 keyboard/mouse), correct per-monitor DPI behaviour, and full Unicode
 text input via `KEYEVENTF_UNICODE`. Falls back to pyautogui if
 SendInput initialisation fails. No configuration required.
+
+### Typing reliability
+
+`desktop_type` always tries clipboard paste first (one event,
+arbitrary length, perfect Unicode), with the platform-correct
+modifier — `Cmd+V` on macOS, `Ctrl+V` everywhere else. Only when
+the clipboard path fails or `pyperclip` isn't installed does it
+fall back to per-character keystrokes. Per-platform fallbacks:
+
+- **Windows / WSL** — `SendInput KEYEVENTF_UNICODE` with a 5 ms
+  inter-event pause and 15 ms inter-character pause (slow targets
+  used to drop keys at the previous 0 ms cadence).
+- **Linux X11** — `xdotool type --clearmodifiers --delay 30` (the
+  default 12 ms cadence sometimes loses keys on slow targets,
+  producing artefacts like `hello world` → `hello ddddd`).
+- **Linux Wayland** — `ydotool type --key-delay 20` with a fallback
+  to plain `ydotool type` for older versions.
+
+Every typing call is now logged at INFO level with the actual text
+(truncated to 60 chars) and the method that ran, so if a target app
+keeps losing keys you can see which path is being used.
+
+The clipboard-paste path saves the user's clipboard before pasting
+and restores it afterward, so automation doesn't clobber whatever
+the user had copied.
 
 ### Best-of-N action sampling
 

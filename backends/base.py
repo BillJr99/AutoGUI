@@ -11,12 +11,17 @@ import asyncio
 import base64
 import io
 import logging
+import platform as _platform
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _is_macos() -> bool:
+    return _platform.system() == "Darwin"
 
 # Disable pyautogui's fail-safe (moving mouse to top-left corner raises an
 # exception).  That guard is useful for interactive scripts but breaks
@@ -453,19 +458,62 @@ class DesktopBackend:
             return {"error": str(e)}
 
     async def type_text(self, text: str) -> dict:
+        """
+        Cross-platform text entry with the most reliable method first.
+
+        Order:
+          1. Clipboard paste with the OS-correct paste shortcut
+             (Cmd+V on macOS, Ctrl+V elsewhere).  Most reliable —
+             one event regardless of length, perfect Unicode.
+          2. pyautogui.write with a generous per-character interval
+             (50 ms by default) when the clipboard path fails or
+             pyperclip isn't installed.  The slower default beats
+             the previous 20 ms cadence which dropped/repeated keys
+             on slower windows.
+
+        Returns a dict including which method was actually used so
+        the caller can diagnose subsequent typing artefacts.
+        """
         try:
             import pyautogui
             loop = asyncio.get_event_loop()
-            # Clipboard paste handles Unicode reliably; fall back to write() otherwise.
+            log_text = (text[:60] + "…") if len(text) > 60 else text
+            logger.info("[backend:type_text] len=%d text=%r", len(text), log_text)
+
+            paste_modifier = "command" if _is_macos() else "ctrl"
+
             try:
                 import pyperclip
+                # Save current clipboard contents and restore afterward so
+                # the user's clipboard isn't clobbered by automation.
+                try:
+                    saved = pyperclip.paste()
+                except Exception:
+                    saved = None
                 pyperclip.copy(text)
-                await loop.run_in_executor(None, lambda: pyautogui.hotkey("ctrl", "v"))
-            except ImportError:
+                # Tiny pause so the clipboard write is visible to the OS
+                # before we trigger paste.
+                await asyncio.sleep(0.05)
                 await loop.run_in_executor(
-                    None, lambda: pyautogui.write(text, interval=0.02)
+                    None, lambda: pyautogui.hotkey(paste_modifier, "v")
                 )
-            return {"success": True, "length": len(text)}
+                await asyncio.sleep(0.1)
+                if saved is not None:
+                    try:
+                        pyperclip.copy(saved)
+                    except Exception:
+                        pass
+                return {"success": True, "length": len(text), "method": "clipboard_paste"}
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.warning("[backend:type_text] clipboard paste failed: %s — falling back to keystrokes", e)
+
+            # Per-character keystroke fallback with a comfortable interval.
+            await loop.run_in_executor(
+                None, lambda: pyautogui.write(text, interval=0.05)
+            )
+            return {"success": True, "length": len(text), "method": "keystrokes"}
         except Exception as e:
             logger.debug("[backend:type_text] %s", traceback.format_exc())
             return {"error": str(e)}

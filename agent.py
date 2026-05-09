@@ -226,6 +226,11 @@ class Agent:
         # trajectory it's working towards.  Disabled = legacy behaviour.
         planner_cfg = self._agent_cfg.get("planner", {}) or {}
         self._planner_enabled: bool = bool(planner_cfg.get("enabled", True))
+        # Tracks whether we've already demoted the fast client to the
+        # primary client for this session (e.g. after a 401 response).
+        # Auto-demotion makes a stale openwebui_fast.api_key recoverable
+        # without restarting the agent.
+        self._fast_client_demoted: bool = False
         # Use the fast client for planning when available; planning is a
         # cheap-to-cheaper-than-execution call that benefits from speed
         # over depth.
@@ -452,12 +457,11 @@ class Agent:
         # tool decision has the full trajectory in mind.  Falls back to a
         # plan-less run on any failure so this can never make things worse.
         if self._planner is not None:
+            browser_avail = any(t.startswith("browser_") for t in available_tools)
+            a11y_avail = "desktop_click_element" in available_tools
+            os_label = _platform.system()
+            plan_text = ""
             try:
-                browser_avail = any(
-                    t.startswith("browser_") for t in available_tools
-                )
-                a11y_avail = "desktop_click_element" in available_tools
-                os_label = _platform.system()
                 plan_text = await self._planner.plan(
                     task=user_input,
                     os_label=os_label,
@@ -467,8 +471,38 @@ class Agent:
                     windows_summary=windows_json,
                 )
             except Exception as e:
-                logger.warning("[agent] planner failed: %s", e)
-                plan_text = ""
+                # Auto-demote the fast client on a 401 — typically caused
+                # by a stale or placeholder openwebui_fast.api_key.  The
+                # primary client is known-good (the user is running a
+                # session with it) so re-trying with it is safe.
+                status = getattr(e, "http_status", None)
+                if status == 401 and not self._fast_client_demoted and self._fast_client is not None:
+                    logger.warning(
+                        "[agent] Fast client returned 401 — demoting to primary "
+                        "client for the rest of this session.  Fix or remove "
+                        "openwebui_fast.api_key to silence this warning."
+                    )
+                    yield AgentEvent(
+                        kind="warning",
+                        content=(
+                            "Planner: openwebui_fast.api_key was rejected (401). "
+                            "Falling back to the primary api_key for this session."
+                        ),
+                        data={"http_status": 401},
+                    )
+                    self._fast_client_demoted = True
+                    self._planner = Planner(self._client)
+                    try:
+                        plan_text = await self._planner.plan(
+                            task=user_input, os_label=os_label,
+                            vision=self._vision_screenshots,
+                            browser_available=browser_avail,
+                            a11y_available=a11y_avail, windows_summary=windows_json,
+                        )
+                    except Exception as e2:
+                        logger.warning("[agent] planner retry also failed: %s", e2)
+                else:
+                    logger.warning("[agent] planner failed: %s", e)
             if plan_text:
                 yield AgentEvent(
                     kind="plan",
@@ -1438,14 +1472,29 @@ class Agent:
             },
         ]
 
-        validator_client = self._fast_client or self._client
+        validator_client = self._client if self._fast_client_demoted else (self._fast_client or self._client)
         try:
             response = await validator_client.chat(messages=validator_messages, tools=None)
             message = validator_client.extract_message(response)
             verdict = validator_client.extract_text(message).strip()
         except Exception as e:
-            logger.warning("[agent.py:_check_command_coherence] Validator call failed: %s", e)
-            return True, args, f"validator error (letting through): {e}"
+            status = getattr(e, "http_status", None)
+            if status == 401 and not self._fast_client_demoted and validator_client is self._fast_client:
+                logger.warning(
+                    "[agent] Fast client returned 401 in validator — demoting to "
+                    "primary client. Fix or remove openwebui_fast.api_key."
+                )
+                self._fast_client_demoted = True
+                try:
+                    response = await self._client.chat(messages=validator_messages, tools=None)
+                    message = self._client.extract_message(response)
+                    verdict = self._client.extract_text(message).strip()
+                except Exception as e2:
+                    logger.warning("[agent.py:_check_command_coherence] Validator retry failed: %s", e2)
+                    return True, args, f"validator error (letting through): {e2}"
+            else:
+                logger.warning("[agent.py:_check_command_coherence] Validator call failed: %s", e)
+                return True, args, f"validator error (letting through): {e}"
 
         # Strip markdown code fences the model might wrap around the JSON.
         verdict = re.sub(r"^```[a-z]*\n?", "", verdict).rstrip("`").strip()

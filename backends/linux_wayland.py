@@ -149,14 +149,30 @@ class WaylandBackend(DesktopBackend):
             return {"error": str(e)}
 
     async def type_text(self, text: str) -> dict:
+        """
+        Type text on Wayland via ydotool.  --key-delay slows the per-key
+        cadence so slow targets don't drop or repeat characters.
+        """
+        if not text:
+            return {"success": True, "length": 0, "method": "noop"}
+        log_text = (text[:60] + "…") if len(text) > 60 else text
+        logger.info("[wayland:type_text] len=%d text=%r", len(text), log_text)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ydotool", "type", "--", text,
+                "ydotool", "type", "--key-delay", "20", "--", text,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(proc.communicate(), timeout=30)
-            return {"success": True, "length": len(text)}
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0:
+                # Older ydotool versions don't accept --key-delay; retry.
+                proc = await asyncio.create_subprocess_exec(
+                    "ydotool", "type", "--", text,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=60)
+            return {"success": True, "length": len(text), "method": "ydotool"}
         except FileNotFoundError:
             return {"error": "ydotool not found — install with: sudo apt install ydotool"}
         except Exception as e:

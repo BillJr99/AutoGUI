@@ -259,25 +259,60 @@ class WindowsBackend(DesktopBackend):
             return await super().click(x, y, button=button, clicks=clicks)
 
     async def type_text(self, text: str) -> dict:
-        """SendInput KEYEVENTF_UNICODE for full Unicode coverage."""
-        if not _SENDINPUT_AVAILABLE or not text:
+        """
+        Type text on Windows.
+
+        Strategy: clipboard paste FIRST (most reliable for any length of
+        text and full Unicode), with the SendInput KEYEVENTF_UNICODE
+        per-character path as a fallback.  Some apps (including the
+        Windows search box and the Start menu's Run dialog) silently drop
+        a few characters when KEYEVENTF_UNICODE events arrive too fast,
+        which is what produces "hello world" → "hello ddddd"-style
+        artefacts.  Clipboard paste is one event regardless of length, so
+        it side-steps that timing problem entirely.
+        """
+        if not text:
+            return {"success": True, "length": 0, "method": "noop"}
+
+        log_text = (text[:60] + "…") if len(text) > 60 else text
+        logger.info("[windows:type_text] len=%d text=%r", len(text), log_text)
+
+        # 1. Clipboard paste path — runs the same code as the base class
+        # which now uses platform-aware modifiers + clipboard restore.
+        try:
+            import pyperclip  # type: ignore
+            base_result = await super().type_text(text)
+            if isinstance(base_result, dict) and base_result.get("success"):
+                return base_result
+        except Exception:
+            pass  # Fall through to SendInput if clipboard fails.
+
+        # 2. SendInput KEYEVENTF_UNICODE fallback with a small per-character
+        # sleep so receiving windows have time to process each event.  The
+        # legacy 0 ms cadence was the cause of the "hello ddddd" artefact.
+        if not _SENDINPUT_AVAILABLE:
             return await super().type_text(text)
+
         loop = asyncio.get_event_loop()
         try:
+            import time as _time
             def _do():
                 ok = True
                 for ch in text:
-                    code = ord(ch)
-                    # Surrogate pairs (chars > U+FFFF) need to be sent as
-                    # two 16-bit code units.  We emit per-codepoint here
-                    # using utf-16 to be safe.
                     units = ch.encode("utf-16-le")
                     for i in range(0, len(units), 2):
                         wScan = int.from_bytes(units[i:i+2], "little")
                         ok &= _send_inputs([
                             _make_key_input(scan=wScan, flags=KEYEVENTF_UNICODE),
+                        ])
+                        # Brief inter-event pause: down event needs to be
+                        # consumed before the corresponding up arrives.
+                        _time.sleep(0.005)
+                        ok &= _send_inputs([
                             _make_key_input(scan=wScan, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
                         ])
+                    # Inter-character pause (most slow targets need this).
+                    _time.sleep(0.015)
                 return ok
 
             ok = await loop.run_in_executor(None, _do)

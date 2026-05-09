@@ -143,20 +143,29 @@ class X11Backend(DesktopBackend):
             return {"error": str(e)}
 
     async def type_text(self, text: str) -> dict:
-        """Use xdotool type for reliable Unicode input on X11."""
+        """
+        Type text on X11.  Uses xdotool with an explicit `--delay` of
+        30 ms (xdotool's default of 12 ms loses or duplicates keys on
+        slow targets — this is the cause of "hello world" being typed
+        as "hello ddddd").  Falls back to the base class (clipboard
+        paste / pyautogui) when xdotool is missing or fails.
+        """
+        if not text:
+            return {"success": True, "length": 0, "method": "noop"}
+        log_text = (text[:60] + "…") if len(text) > 60 else text
+        logger.info("[x11:type_text] len=%d text=%r", len(text), log_text)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "xdotool", "type", "--clearmodifiers", "--", text,
+                "xdotool", "type", "--clearmodifiers", "--delay", "30", "--", text,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
             if proc.returncode != 0:
                 err = stderr.decode(errors="replace").strip()
                 raise RuntimeError(f"xdotool type failed: {err}")
-            return {"success": True, "length": len(text)}
+            return {"success": True, "length": len(text), "method": "xdotool"}
         except FileNotFoundError:
-            # xdotool not installed — fall back to pyautogui
             return await super().type_text(text)
         except Exception as e:
             logger.debug("[x11:type_text] %s", traceback.format_exc())

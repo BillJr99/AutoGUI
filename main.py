@@ -162,10 +162,28 @@ def build_components(cfg: dict):
     fast_client = None
     fast_cfg = cfg.get("openwebui_fast")
     if fast_cfg:
+        # Treat the example placeholder, empty string, or a value identical
+        # to the primary key as "not set" — the user hasn't actually
+        # configured a separate fast key, so reuse the primary client and
+        # avoid 401s on the very first planner / validator call.
+        raw_fast_key = fast_cfg.get("api_key", "")
+        primary_key = ow_cfg.get("api_key", "")
+        is_placeholder = (
+            not raw_fast_key
+            or raw_fast_key.strip() == ""
+            or "your-openwebui-api-key" in raw_fast_key.lower()
+            or "your-key" in raw_fast_key.lower()
+        )
+        effective_key = primary_key if is_placeholder else raw_fast_key
+        if is_placeholder:
+            print(
+                "[main] openwebui_fast.api_key is empty/placeholder; "
+                "using the primary api_key for fast-client calls."
+            )
         try:
             fast_client = OpenWebUIClient(
                 base_url=fast_cfg.get("base_url", ow_cfg.get("base_url", "")),
-                api_key=fast_cfg.get("api_key", ow_cfg.get("api_key", "")),
+                api_key=effective_key,
                 model=fast_cfg.get("model", ow_cfg.get("model", "")),
                 temperature=fast_cfg.get("temperature", 0.0),
                 max_tokens=fast_cfg.get("max_tokens", 1024),
