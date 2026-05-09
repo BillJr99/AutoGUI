@@ -73,6 +73,7 @@ class OpenWebUIClient:
         messages: list[dict],
         tools: list[dict] | None = None,
         stream: bool = False,
+        temperature: float | None = None,
     ) -> dict:
         """
         Send a chat completion request and return the parsed JSON response.
@@ -118,7 +119,9 @@ class OpenWebUIClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": self.temperature,
+            "temperature": (
+                self.temperature if temperature is None else float(temperature)
+            ),
             "max_tokens": self.max_tokens,
             "stream": False,
         }

@@ -169,6 +169,24 @@ class Agent:
         # and by the trace writer for post-hoc inspection.
         self._session_steps: list[dict] = []
 
+        # Best-of-N (Phase 7) configuration + uncertainty trackers.  When
+        # bon.enabled is true and any of the trigger conditions match, the
+        # next action is selected by sampling N completions and asking the
+        # fast/verifier model to pick the best.  All defaults off — this
+        # multiplies token spend on uncertain steps.
+        bon_cfg = self._agent_cfg.get("bon", {}) or {}
+        self._bon_enabled: bool = bool(bon_cfg.get("enabled", False))
+        self._bon_n: int = max(2, int(bon_cfg.get("n", 3)))
+        self._bon_temperature: float = float(bon_cfg.get("temperature", 0.7))
+        self._bon_trigger_on_failure: bool = bool(
+            bon_cfg.get("trigger_on_recent_failure", True)
+        )
+        self._bon_trigger_on_validator: bool = bool(
+            bon_cfg.get("trigger_on_validator_disagreement", True)
+        )
+        self._last_iteration_had_failure: bool = False
+        self._last_validator_verdict: str | None = None
+
         # Trace + skill store wiring (Phase 2).
         trace_dir = self._agent_cfg.get("trace_dir", "logs/traces")
         skills_path = self._agent_cfg.get("skills_path", "~/.autogui/skills.jsonl")
@@ -453,11 +471,24 @@ class Agent:
             logger.info("[agent.py:run] Iteration %d / %d", iteration, self._max_iterations)
 
             # ---- Call the LLM ----------------------------------------
+            # Best-of-N branch when uncertainty triggers fired on the
+            # previous iteration; otherwise greedy single sample.
             try:
-                response = await self._client.chat(
-                    messages=self._history,
-                    tools=self._registry.schemas,
-                )
+                if self._bon_should_trigger():
+                    response, bon_rationale = await self._bon_sample()
+                    yield AgentEvent(
+                        kind="validation",
+                        content=f"BoN: {bon_rationale}",
+                        data={
+                            "bon_rationale": bon_rationale,
+                            "iteration": iteration,
+                        },
+                    )
+                else:
+                    response = await self._client.chat(
+                        messages=self._history,
+                        tools=self._registry.schemas,
+                    )
             except Exception as e:
                 print(f"[agent.py:run] API call failed on iteration {iteration}: {e}")
                 traceback.print_exc()
@@ -565,6 +596,7 @@ class Agent:
             tool_result_messages: list[dict] = []
             vision_messages: list[dict] = []       # appended after tool results
             failed_tools:  list[str]  = []         # track failures for retry directive
+            iteration_validator_verdict: str | None = None  # most recent validator verdict
 
             # ---- Capture pre-action window state for the diff ------------
             # Only relevant when at least one of the upcoming tool calls is a
@@ -639,6 +671,7 @@ class Agent:
                     proceed, args, verdict = await self._check_command_coherence(
                         tool_name, args, user_input
                     )
+                    iteration_validator_verdict = verdict
                     yield AgentEvent(
                         kind="validation",
                         content=f"Coherence [{tool_name}]: {verdict}",
@@ -791,6 +824,13 @@ class Agent:
             self._history.extend(tool_result_messages)
             if vision_messages:
                 self._history.extend(vision_messages)
+
+            # ---- Update BoN uncertainty trackers --------------------------
+            # Persisted across iterations so that BoN triggers on the *next*
+            # decision when this one fired off a failed tool or had a
+            # disputed validator verdict.
+            self._last_iteration_had_failure = bool(failed_tools)
+            self._last_validator_verdict = iteration_validator_verdict
 
             # ---- Error retry directive -----------------------------------
             # If any tools failed, inject a role="user" message AFTER the tool
@@ -1065,6 +1105,159 @@ class Agent:
         """Return True when the model's stop-response sounds like it is giving up."""
         lower = text.lower()
         return any(re.search(pat, lower) for pat in cls._GIVING_UP_PATTERNS)
+
+    # ------------------------------------------------------------------
+    # Best-of-N sampling (Phase 7)
+    # ------------------------------------------------------------------
+
+    def _bon_should_trigger(self) -> bool:
+        if not self._bon_enabled:
+            return False
+        if self._bon_trigger_on_failure and self._last_iteration_had_failure:
+            return True
+        if self._bon_trigger_on_validator and self._last_validator_verdict:
+            v = (self._last_validator_verdict or "").upper()
+            if not v.startswith("APPROVED"):
+                return True
+        return False
+
+    async def _bon_sample(
+        self,
+    ) -> tuple[dict, str]:
+        """
+        Sample N candidate completions from the primary client, then ask the
+        verifier (fast_client when configured, else primary) which is best.
+
+        Returns (chosen_response, rationale).  The chosen response has the
+        same shape as a normal client.chat() return so the caller can keep
+        using extract_message / extract_tool_calls unchanged.
+
+        Falls back to a single greedy call if anything goes wrong — BoN
+        should never make the agent worse than baseline.
+        """
+        history = self._history
+        tools_schema = self._registry.schemas
+
+        # Sample N proposals concurrently with elevated temperature.
+        try:
+            tasks = [
+                self._client.chat(
+                    messages=history,
+                    tools=tools_schema,
+                    temperature=self._bon_temperature,
+                )
+                for _ in range(self._bon_n)
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logger.warning("[agent.py:_bon_sample] gather failed: %s", e)
+            return await self._client.chat(messages=history, tools=tools_schema), "bon-failed-greedy"
+
+        candidates: list[tuple[int, dict, str]] = []
+        for i, resp in enumerate(responses):
+            if isinstance(resp, Exception):
+                continue
+            try:
+                msg = self._client.extract_message(resp)
+                summary = self._summarize_candidate(msg)
+                candidates.append((i, resp, summary))
+            except Exception:
+                continue
+
+        if not candidates:
+            return await self._client.chat(messages=history, tools=tools_schema), "bon-no-candidates-greedy"
+
+        if len(candidates) == 1:
+            return candidates[0][1], "bon-single-candidate"
+
+        # Quick self-consistency check: if a strong majority of candidates
+        # propose the same first tool name + arg signature, pick that without
+        # paying for the verifier round-trip.
+        signatures: dict[str, list[int]] = {}
+        for i, _resp, summary in candidates:
+            signatures.setdefault(summary, []).append(i)
+        if len(candidates) >= 3:
+            best_sig, best_idxs = max(signatures.items(), key=lambda kv: len(kv[1]))
+            if len(best_idxs) >= max(2, (len(candidates) + 1) // 2):
+                idx = best_idxs[0]
+                for i, resp, summary in candidates:
+                    if i == idx:
+                        return resp, f"bon-consensus({len(best_idxs)}/{len(candidates)}): {summary[:120]}"
+
+        # No consensus → ask the verifier model.
+        verifier = self._fast_client or self._client
+        block = "\n\n".join(
+            f"[{i+1}] {summary}" for i, _resp, summary in candidates
+        )
+        verifier_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a verifier picking the single best next action for "
+                    "a desktop automation agent. Consider only correctness, "
+                    "safety, and alignment with the user's task. Answer with "
+                    "ONLY the integer index of the best candidate (1-based)."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "User task / current state (recent history follows):\n"
+                    + self._brief_history_summary() + "\n\n"
+                    + "Candidates:\n" + block + "\n\n"
+                    "Reply with just the index, no explanation."
+                ),
+            },
+        ]
+        try:
+            v_resp = await verifier.chat(messages=verifier_messages, tools=None)
+            v_msg = verifier.extract_message(v_resp)
+            v_text = (verifier.extract_text(v_msg) or "").strip()
+            m = re.search(r"\d+", v_text)
+            if m:
+                pick_1based = int(m.group(0))
+                pick_idx = pick_1based - 1
+                if 0 <= pick_idx < len(candidates):
+                    chosen_summary = candidates[pick_idx][2]
+                    return candidates[pick_idx][1], f"bon-verifier picked {pick_1based}: {chosen_summary[:120]}"
+        except Exception as e:
+            logger.warning("[agent.py:_bon_sample] verifier failed: %s", e)
+
+        # Verifier flaked — fall back to the first candidate.
+        return candidates[0][1], "bon-verifier-failed-fallback-first"
+
+    @staticmethod
+    def _summarize_candidate(message: dict) -> str:
+        """One-line description of an assistant message for verifier prompts."""
+        text = ""
+        if isinstance(message.get("content"), str):
+            text = message["content"][:160]
+        tcs = message.get("tool_calls") or []
+        if tcs:
+            parts = []
+            for tc in tcs[:3]:
+                fn = (tc.get("function") or {})
+                name = fn.get("name", "?")
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str) and len(args) > 100:
+                    args = args[:97] + "..."
+                parts.append(f"{name}({args})")
+            return f"tool_calls: {' | '.join(parts)}" + (f"  text: {text}" if text else "")
+        return f"text: {text}" if text else "(empty)"
+
+    def _brief_history_summary(self) -> str:
+        """Compact recent-history blurb for verifier prompts."""
+        out = []
+        for msg in self._history[-6:]:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content if isinstance(p, dict)
+                )
+            content = (content or "")[:200].replace("\n", " ")
+            out.append(f"{role}: {content}")
+        return "\n".join(out)
 
     async def _check_command_coherence(
         self,

@@ -33,7 +33,15 @@
     "record_trace": true,
     "trace_dir": "logs/traces",
     "suggest_skills": true,
-    "skills_path": "~/.autogui/skills.jsonl"
+    "skills_path": "~/.autogui/skills.jsonl",
+    "bon": {
+      "_comment": "Best-of-N action sampling. Multiplies token cost on uncertain steps.",
+      "enabled": false,
+      "n": 3,
+      "temperature": 0.7,
+      "trigger_on_recent_failure": true,
+      "trigger_on_validator_disagreement": true
+    }
   },
   "tools": {
     "shell_timeout_seconds": 30,
