@@ -1,0 +1,6 @@
+MANDATORY: Describe what you see in this image RIGHT NOW before your next action. Answer these questions:
+1. Which windows/applications are visible?
+2. Is the expected application open and in the expected state?
+3. Is there any error dialog, unexpected window, or wrong content?
+4. Based on what you see, what is the correct next step?
+Do NOT skip straight to a tool call — describe first, then act.

@@ -1,0 +1,1 @@
+[Vision: DISABLED — you cannot see screenshots. Use desktop_list_windows (which includes x/y/width/height bounding boxes) to verify window state and compute click coordinates. Do NOT claim to see or describe screenshot contents.]

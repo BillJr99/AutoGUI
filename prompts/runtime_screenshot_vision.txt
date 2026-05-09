@@ -1,0 +1,1 @@
+Here is the screenshot you just captured. Examine it carefully. Describe what you see, confirm whether the expected application/state is visible, and decide your next action based on what is actually shown — not on assumptions.

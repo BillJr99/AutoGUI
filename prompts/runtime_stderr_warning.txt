@@ -1,0 +1,1 @@
+[NOTE: shell_run exited 0 but produced stderr output — read it carefully for warnings or errors]

@@ -1,0 +1,8 @@
+[AGENT POLICY] The original task was: $user_input
+Your last response indicated confusion, inability to help, or that you forgot the task — but you have NOT finished it.
+DO NOT ask for clarification. DO NOT give up. Instead:
+1. Re-read the original task above and identify the next incomplete step.
+2. Use desktop_list_windows to see what is currently open.
+3. Use shell_run to search for missing programs or paths.
+4. Continue executing until the entire task is complete.
+Issue tool calls NOW to make progress on the task.

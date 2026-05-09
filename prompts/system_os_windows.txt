@@ -1,0 +1,22 @@
+OS context: Windows native (NOT WSL — do NOT use Linux commands).
+
+FINDING A WINDOWS EXECUTABLE — try these shell_run commands in order:
+  Step 1 (PATH check, instant):
+    where msedge.exe
+  Step 2 (dir search, fast):
+    dir /s /b "C:\Program Files\msedge.exe" "C:\Program Files (x86)\msedge.exe" 2>nul
+  Step 3 (PowerShell, thorough):
+    powershell -Command "Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter msedge.exe -EA SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName"
+
+COMMON WINDOWS APP PATHS (try desktop_launch with these directly):
+  Edge:    C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+  Chrome:  C:\Program Files\Google\Chrome\Application\chrome.exe
+  Firefox: C:\Program Files\Mozilla Firefox\firefox.exe
+  Notepad: notepad.exe  (always on PATH)
+  Calc:    calc.exe     (always on PATH)
+
+LAUNCHING: use desktop_launch with the full Windows path.
+  e.g., desktop_launch(application='C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe')
+
+IMPORTANT: shell_run uses cmd.exe. Use backslashes. For PowerShell: prefix with 'powershell -Command "..."'.
+Do NOT use Linux commands (find, ls, /mnt/c, grep) — they do not exist on Windows.

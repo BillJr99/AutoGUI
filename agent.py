@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 from client import OpenWebUIClient
+from prompt_loader import PromptLoader
 from tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -55,87 +56,22 @@ def _proc_version_has_microsoft() -> bool:
         return False
 
 
-def _build_os_instructions() -> str:
-    """Return OS-specific instructions to append to the system prompt."""
+def _build_os_instructions(loader: PromptLoader) -> str:
+    """Return OS-specific instructions by loading the appropriate prompt file."""
     system = _platform.system()
     release = _platform.release().lower()
     is_wsl = system == "Linux" and (
         "microsoft" in release or "wsl" in release or _proc_version_has_microsoft()
     )
-
     if is_wsl:
-        return (
-            "\n\nOS context: WSL (Windows Subsystem for Linux).\n"
-            "Always append .exe to Windows programs (notepad.exe, msedge.exe, etc.).\n"
-            "\n"
-            "FINDING A WINDOWS EXECUTABLE — try these shell_run commands in order:\n"
-            "  Step 1 (PATH check, fast):\n"
-            "    where.exe msedge.exe\n"
-            "  Step 2 (targeted search under Program Files, a few seconds):\n"
-            '    find "/mnt/c/Program Files" "/mnt/c/Program Files (x86)" -name msedge.exe 2>/dev/null | head -5\n'
-            "  Step 3 (PowerShell search, thorough):\n"
-            "    powershell.exe -Command \"Get-ChildItem 'C:\\Program Files','C:\\Program Files (x86)'"
-            " -Recurse -Filter msedge.exe -ErrorAction SilentlyContinue"
-            " | Select-Object -First 5 -ExpandProperty FullName\"\n"
-            "\n"
-            "COMMON WINDOWS APP PATHS (check these with ls before launching):\n"
-            "  Edge:    /mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe\n"
-            "  Chrome:  /mnt/c/Program Files/Google/Chrome/Application/chrome.exe\n"
-            "  Firefox: /mnt/c/Program Files/Mozilla Firefox/firefox.exe\n"
-            "  VS Code: /mnt/c/Users/<user>/AppData/Local/Programs/Microsoft VS Code/Code.exe\n"
-            "\n"
-            "LAUNCHING WITH FULL PATH from WSL: use desktop_launch with the path as the application,\n"
-            "e.g. desktop_launch(application='/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe')\n"
-            "or   desktop_launch(application='C:\\\\Program Files (x86)\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe')\n"
-            "\n"
-            "CRITICAL: NEVER write shell commands or Windows CMD syntax in your text response.\n"
-            "Writing 'find msedge -type f' or 'C:\\Users\\...>where msedge' as TEXT does nothing.\n"
-            "You MUST call shell_run with the command string to actually execute it."
-        )
+        name = "system_os_wsl"
     elif system == "Windows":
-        return (
-            "\n\nOS context: Windows native (NOT WSL — do NOT use Linux commands).\n"
-            "\n"
-            "FINDING A WINDOWS EXECUTABLE — try these shell_run commands in order:\n"
-            "  Step 1 (PATH check, instant):\n"
-            "    where msedge.exe\n"
-            "  Step 2 (dir search, fast):\n"
-            '    dir /s /b "C:\\Program Files\\msedge.exe" "C:\\Program Files (x86)\\msedge.exe" 2>nul\n'
-            "  Step 3 (PowerShell, thorough):\n"
-            "    powershell -Command \"Get-ChildItem 'C:\\Program Files','C:\\Program Files (x86)'"
-            " -Recurse -Filter msedge.exe -EA SilentlyContinue"
-            " | Select-Object -First 5 -ExpandProperty FullName\"\n"
-            "\n"
-            "COMMON WINDOWS APP PATHS (try desktop_launch with these directly):\n"
-            "  Edge:    C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\n"
-            "  Chrome:  C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\n"
-            "  Firefox: C:\\Program Files\\Mozilla Firefox\\firefox.exe\n"
-            "  Notepad: notepad.exe  (always on PATH)\n"
-            "  Calc:    calc.exe     (always on PATH)\n"
-            "\n"
-            "LAUNCHING: use desktop_launch with the full Windows path.\n"
-            "  e.g., desktop_launch(application='C:\\\\Program Files (x86)\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe')\n"
-            "\n"
-            "IMPORTANT: shell_run uses cmd.exe. Use backslashes. "
-            "For PowerShell: prefix with 'powershell -Command \"...\"'.\n"
-            "Do NOT use Linux commands (find, ls, /mnt/c, grep) — they do not exist on Windows."
-        )
+        name = "system_os_windows"
     elif system == "Darwin":
-        return (
-            "\n\nOS context: macOS.\n"
-            "FINDING AN EXECUTABLE: check /usr/local/bin, /opt/homebrew/bin, "
-            "or use 'mdfind -name program' via shell_run.\n"
-            "LAUNCHING: use desktop_launch with the executable path or app bundle:\n"
-            "  e.g., desktop_launch(application='open -a Safari')\n"
-            "  or    desktop_launch(application='/Applications/Firefox.app/Contents/MacOS/firefox')"
-        )
+        name = "system_os_macos"
     else:
-        return (
-            "\n\nOS context: Linux (native).\n"
-            "FINDING AN EXECUTABLE: use 'which program' or "
-            "'find /usr /opt -name program -type f 2>/dev/null | head -5' via shell_run.\n"
-            "LAUNCHING: use desktop_launch with the executable path or name."
-        )
+        name = "system_os_linux"
+    return loader.text(name)
 
 
 # ---------------------------------------------------------------------------
@@ -184,88 +120,19 @@ class Agent:
         self._registry = registry
         self._agent_cfg = cfg.get("agent", {})
         self._max_iterations: int = self._agent_cfg.get("max_iterations", 30)
-        # Append OS-specific instructions so the model knows the runtime environment.
-        self._system_prompt: str = (
-            self._agent_cfg.get("system_prompt", "You are a helpful agent.")
-            + _build_os_instructions()
-        )
-        # Desktop interaction rules injected once regardless of platform.
-        self._system_prompt += (
-            "\n\nDESKTOP INTERACTION RULES:\n"
-            "1. FOCUS BEFORE TYPING: Before calling desktop_type or desktop_hotkey, "
-            "always call desktop_click on the target window first to ensure it has "
-            "keyboard focus. Never assume the correct window is active.\n"
-            "2. VERIFY AFTER LAUNCH: After desktop_launch, call desktop_list_windows to "
-            "confirm the application opened before trying to interact with it.\n"
-            "3. CLICK USING WINDOW BOUNDS: desktop_list_windows returns x, y, width, height "
-            "for every window in screen pixels. Always use these to compute click coordinates. "
-            "Never guess pixel positions. "
-            "To click in the client area: x = window.x + window.width // 2, "
-            "y = window.y + 80 (to land below the title bar). "
-            "Or use window.x + 40, window.y + 80 as a safe client-area offset.\n"
-            "4. NEVER CONFUSE LAUNCH AND CLICK: desktop_launch starts a NEW process. "
-            "If the app is already open, use desktop_click to focus it — do NOT launch again.\n"
-            "5. VERIFY AFTER EVERY STEP: After each desktop action, call desktop_list_windows "
-            "to confirm the expected result before moving to the next step."
-        )
 
-        # Browser interaction rules — keyboard shortcuts are more reliable than
-        # clicking on browser chrome elements whose pixel coordinates vary.
-        self._system_prompt += (
-            "\n\nBROWSER INTERACTION RULES (Edge, Chrome, Firefox, Safari):\n"
-            "CRITICAL: Never guess pixel coordinates for browser UI elements "
-            "(address bar, tab bar, buttons). Use keyboard shortcuts instead — they "
-            "always work regardless of window size or position.\n\n"
-            "OPENING A NEW TAB AND NAVIGATING — mandatory sequence:\n"
-            "  Step 1: desktop_click at window.x + window.width//2, window.y + 80 "
-            "to focus the browser window\n"
-            "  Step 2: desktop_hotkey(['ctrl', 't'])          ← opens a new tab\n"
-            "  Step 3: desktop_hotkey(['ctrl', 'l'])          ← focuses the address bar\n"
-            "  Step 4: desktop_type('https://example.com')    ← types the URL\n"
-            "  Step 5: desktop_hotkey(['enter'])               ← navigates\n"
-            "If the user said 'open a tab', you MUST do Ctrl+T before any URL navigation.\n"
-            "If the user said 'navigate' or 'go to' on an existing tab, skip Ctrl+T.\n\n"
-            "OTHER ESSENTIAL BROWSER HOTKEYS:\n"
-            "  Ctrl+L or F6       — focus address bar (ALWAYS use this, never click the bar)\n"
-            "  Ctrl+T             — new tab\n"
-            "  Ctrl+W             — close current tab\n"
-            "  Ctrl+Tab           — switch to next tab\n"
-            "  Ctrl+Shift+Tab     — switch to previous tab\n"
-            "  Ctrl+<1-9>         — jump to tab N\n"
-            "  Ctrl+R or F5       — reload page\n"
-            "  Ctrl+N             — new window\n\n"
-            "BROWSER STATE CHECKS:\n"
-            "  • After Ctrl+T, verify in desktop_list_windows that the tab count changed\n"
-            "    (the window title often shows '… and N more pages').\n"
-            "  • After typing and pressing Enter, take a screenshot to confirm navigation.\n"
-            "  • If the browser is already open, NEVER launch it again — focus it with "
-            "desktop_click, then use hotkeys."
+        # Load prompt files; fall back to config system_prompt for the base if missing.
+        self._prompts = PromptLoader(cfg.get("prompts_dir", "prompts"))
+        base = self._prompts.text("system_base") or self._agent_cfg.get(
+            "system_prompt", "You are a helpful agent."
         )
-
-        # Mandatory tool output analysis rules.
-        self._system_prompt += (
-            "\n\nMANDATORY TOOL OUTPUT ANALYSIS — follow these for every tool call:\n"
-            "shell_run:\n"
-            "  • Read ALL of stdout AND stderr before deciding what to do next.\n"
-            "  • stderr may contain errors even when exit_code=0 — always check it.\n"
-            "  • If output mentions a log file path, use fs_read to open and read that file.\n"
-            "  • If exit_code is non-zero OR stderr contains 'error'/'failed'/'exception', "
-            "treat the step as failed and fix it before continuing.\n"
-            "desktop_screenshot (vision enabled):\n"
-            "  • You WILL receive the actual image. You MUST describe what you see:\n"
-            "    which windows are open, what text or UI elements are visible, "
-            "whether the expected app/state is present, and any error dialogs.\n"
-            "  • If the screen does NOT show what you expected, treat it as a failure and "
-            "diagnose before proceeding.\n"
-            "  • Never skip the description. 'I took a screenshot' is not an analysis.\n"
-            "fs_read:\n"
-            "  • Read the FULL content returned.\n"
-            "  • For log files, scan for: ERROR, WARNING, FAILED, Exception, Traceback.\n"
-            "  • Report what you found before deciding the next step.\n"
-            "General:\n"
-            "  • Never assume a step succeeded without reading its output.\n"
-            "  • If a result contains 'error', stop and fix it — do not continue to the next step."
-        )
+        self._system_prompt: str = "\n\n".join(filter(None, [
+            base,
+            _build_os_instructions(self._prompts),
+            self._prompts.text("system_desktop_rules"),
+            self._prompts.text("system_browser_rules"),
+            self._prompts.text("system_tool_analysis"),
+        ]))
 
         # Seconds to wait before dispatching each tool call (0 = immediate).
         self._confirm_delay: int = int(cfg.get("safety", {}).get("command_confirm_delay_seconds", 0))
@@ -314,18 +181,9 @@ class Agent:
         # Inject the current vision state so the model always knows whether
         # it will receive images — important when the user toggles mid-session.
         if self._vision_screenshots:
-            initial_suffix = (
-                "\n[Vision: ENABLED — screenshots are delivered to you as images. "
-                "After every desktop action, a screenshot is auto-taken and shown to you. "
-                "Examine each image carefully before proceeding.]"
-            )
+            initial_suffix = "\n" + self._prompts.text("runtime_vision_enabled")
         else:
-            initial_suffix = (
-                "\n[Vision: DISABLED — you cannot see screenshots. "
-                "Use desktop_list_windows (which includes x/y/width/height bounding boxes) "
-                "to verify window state and compute click coordinates. "
-                "Do NOT claim to see or describe screenshot contents.]"
-            )
+            initial_suffix = "\n" + self._prompts.text("runtime_vision_disabled")
 
         if "desktop_list_windows" in available_tools:
             try:
@@ -414,20 +272,9 @@ class Agent:
                 if text_content and self._text_implies_skipped_actions(text_content, self._vision_screenshots):
                     self._history.append({
                         "role": "user",
-                        "content": (
-                            "[AGENT POLICY — CRITICAL] Your last response described a "
-                            "planned action in TEXT but issued no tool call for it.\n"
-                            "IMPORTANT: All tool calls in previous iterations of this "
-                            "session DID execute and succeed — those actions are done. "
-                            "Only the action you wrote as text (not as a tool call) was "
-                            "skipped. DO NOT re-run or re-launch anything already completed.\n"
-                            f"Task still in progress: {user_input!r}\n"
-                            "HOW TOOL CALLS WORK: Tool calls are a separate structured "
-                            "response — writing an action in text does nothing and does not "
-                            "undo previous tool calls. "
-                            "Your NEXT response must be a tool_call for the NEXT "
-                            "incomplete step. Do not describe what you will do — just call "
-                            "the tool."
+                        "content": self._prompts.render(
+                            "runtime_narration_correction",
+                            user_input=repr(user_input),
                         ),
                     })
                     logger.warning(
@@ -440,17 +287,9 @@ class Agent:
                 if text_content and self._text_implies_giving_up(text_content):
                     self._history.append({
                         "role": "user",
-                        "content": (
-                            f"[AGENT POLICY] The original task was: {user_input!r}\n"
-                            "Your last response indicated confusion, inability to help, "
-                            "or that you forgot the task — but you have NOT finished it.\n"
-                            "DO NOT ask for clarification. DO NOT give up. Instead:\n"
-                            "1. Re-read the original task above and identify the next "
-                            "incomplete step.\n"
-                            "2. Use desktop_list_windows to see what is currently open.\n"
-                            "3. Use shell_run to search for missing programs or paths.\n"
-                            "4. Continue executing until the entire task is complete.\n"
-                            "Issue tool calls NOW to make progress on the task."
+                        "content": self._prompts.render(
+                            "runtime_give_up",
+                            user_input=repr(user_input),
                         ),
                     })
                     logger.warning(
@@ -593,14 +432,7 @@ class Agent:
                                     "content": [
                                         {
                                             "type": "text",
-                                            "text": (
-                                                "Here is the screenshot you just captured. "
-                                                "Examine it carefully. "
-                                                "Describe what you see, confirm whether the "
-                                                "expected application/state is visible, and "
-                                                "decide your next action based on what is "
-                                                "actually shown — not on assumptions."
-                                            ),
+                                            "text": self._prompts.text("runtime_screenshot_vision"),
                                         },
                                         {
                                             "type": "image_url",
@@ -625,10 +457,7 @@ class Agent:
                         r = json.loads(result_json)
                         if r.get("content"):
                             history_content = (
-                                "[fs_read result — READ AND ANALYZE THE CONTENT BELOW "
-                                "before deciding your next action. "
-                                "For log files: look for ERROR, WARNING, FAILED, Exception, "
-                                "Traceback. Report what you find.]\n"
+                                self._prompts.text("runtime_fs_read_annotation") + "\n"
                                 + history_content
                             )
                     except Exception:
@@ -643,8 +472,7 @@ class Agent:
                         stderr_text = r.get("stderr", "").strip()
                         if stderr_text:
                             history_content = (
-                                "[NOTE: shell_run exited 0 but produced stderr output — "
-                                "read it carefully for warnings or errors]\n"
+                                self._prompts.text("runtime_stderr_warning") + "\n"
                                 + history_content
                             )
                     except Exception:
@@ -695,20 +523,10 @@ class Agent:
             if failed_tools:
                 self._history.append({
                     "role": "user",
-                    "content": (
-                        f"[RETRY REQUIRED] {len(failed_tools)} tool call(s) just failed: "
-                        f"{', '.join(failed_tools)}.\n"
-                        "Read the [TOOL FAILED] error(s) above carefully.\n"
-                        "DO NOT proceed to any subsequent step.\n"
-                        "Diagnose the failure, then retry ONLY that failed tool "
-                        "with corrected arguments. Do not repeat any steps that already "
-                        "succeeded.\n"
-                        "Common fixes:\n"
-                        "  • Wrong path → use shell_run to locate the file first\n"
-                        "  • Wrong argument name → check tool schema\n"
-                        "  • App not found → search with 'where.exe <name>' (Windows/WSL) "
-                        "or 'which <name>' (Linux)\n"
-                        "Issue the corrected tool call NOW."
+                    "content": self._prompts.render(
+                        "runtime_error_retry",
+                        count=len(failed_tools),
+                        tools=", ".join(failed_tools),
                     ),
                 })
                 logger.warning(
@@ -737,12 +555,7 @@ class Agent:
                         # in the new window before attempting to type anything.
                         launch_reminder = ""
                         if "desktop_launch" in desktop_actions_taken:
-                            launch_reminder = (
-                                " REQUIRED NEXT STEP: call desktop_click inside the new "
-                                "window to give it keyboard focus BEFORE desktop_type. "
-                                "Use x=window.x+window.width//2, y=window.y+80 from the "
-                                "bounding box above to land in the client area."
-                            )
+                            launch_reminder = " " + self._prompts.text("runtime_launch_reminder")
                         self._history.append({
                             "role": "user",
                             "content": (
@@ -783,13 +596,7 @@ class Agent:
                                         "text": (
                                             f"[Auto-verify screenshot after "
                                             f"{', '.join(sorted(desktop_actions_taken))}]\n"
-                                            "MANDATORY: Describe what you see in this image RIGHT NOW "
-                                            "before your next action. Answer these questions:\n"
-                                            "1. Which windows/applications are visible?\n"
-                                            "2. Is the expected application open and in the expected state?\n"
-                                            "3. Is there any error dialog, unexpected window, or wrong content?\n"
-                                            "4. Based on what you see, what is the correct next step?\n"
-                                            "Do NOT skip straight to a tool call — describe first, then act."
+                                            + self._prompts.text("runtime_screenshot_verify")
                                         ),
                                     },
                                     {
@@ -980,44 +787,16 @@ class Agent:
         validator_messages = [
             {
                 "role": "system",
-                "content": (
-                    f"You are a command validator for a desktop automation agent on {os_label}.\n"
-                    "Your job: check that proposed shell commands and app launches are "
-                    "syntactically correct, use the right executable, and are not redundant.\n\n"
-                    "ALWAYS APPROVE (these are preparation steps, never duplicates):\n"
-                    "  • Search/locate commands: find, where, where.exe, which, ls, dir, "
-                    "Get-ChildItem, mdfind, locate\n"
-                    "  • PATH lookup: 'where.exe notepad.exe', 'which python', etc.\n"
-                    "  • Any command whose purpose is to find a file or executable\n\n"
-                    "CHECK these issues and CORRECT or REJECT accordingly:\n"
-                    "  1. SYNTAX — Is the command well-formed? "
-                    "(e.g. 'cmd - python main.py' is broken syntax; should be 'python main.py')\n"
-                    "  2. CORRECT EXECUTABLE — Right program for the task? "
-                    "If the user asked for 'notepad', the binary must be notepad.exe, "
-                    "not notepad++.exe or another editor. "
-                    "If the user asked for Edge, it must be msedge.exe, not chrome.exe.\n"
-                    "  3. PATH VALIDITY — If a full path is given, does it look plausible "
-                    "for this OS? WSL paths start with /mnt/c/..., Windows with C:\\...\n"
-                    "  4. DUPLICATION — If an identical or equivalent action already succeeded "
-                    "recently, flag it so the agent doesn't repeat it pointlessly.\n\n"
-                    "REPLY FORMAT — output EXACTLY one line, no explanation:\n"
-                    "  APPROVED\n"
-                    "  CORRECTED: <json>   "
-                    "  where <json> = corrected args, e.g. "
-                    '{\"command\": \"notepad.exe\"} or '
-                    '{\"application\": \"notepad.exe\", \"args\": []}\n'
-                    "  REJECTED: <one-line reason>   "
-                    "  only for commands that are clearly wrong AND not a search command\n\n"
-                    "Default to APPROVED when uncertain. Never reject a search command."
-                ),
+                "content": self._prompts.render("validator_system", os_label=os_label),
             },
             {
                 "role": "user",
-                "content": (
-                    f"Task: {user_input}\n"
-                    f"Proposed {tool_name}: {cmd_display}\n\n"
-                    f"{recent_block}\n\n"
-                    "Validate the proposed command."
+                "content": self._prompts.render(
+                    "validator_user",
+                    user_input=user_input,
+                    tool_name=tool_name,
+                    cmd_display=cmd_display,
+                    recent_block=recent_block,
                 ),
             },
         ]

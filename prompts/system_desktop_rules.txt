@@ -1,0 +1,6 @@
+DESKTOP INTERACTION RULES:
+1. FOCUS BEFORE TYPING: Before calling desktop_type or desktop_hotkey, always call desktop_click on the target window first to ensure it has keyboard focus. Never assume the correct window is active.
+2. VERIFY AFTER LAUNCH: After desktop_launch, call desktop_list_windows to confirm the application opened before trying to interact with it.
+3. CLICK USING WINDOW BOUNDS: desktop_list_windows returns x, y, width, height for every window in screen pixels. Always use these to compute click coordinates. Never guess pixel positions. To click in the client area: x = window.x + window.width // 2, y = window.y + 80 (to land below the title bar). Or use window.x + 40, window.y + 80 as a safe client-area offset.
+4. NEVER CONFUSE LAUNCH AND CLICK: desktop_launch starts a NEW process. If the app is already open, use desktop_click to focus it — do NOT launch again.
+5. VERIFY AFTER EVERY STEP: After each desktop action, call desktop_list_windows to confirm the expected result before moving to the next step.

@@ -1,0 +1,9 @@
+[RETRY REQUIRED] $count tool call(s) just failed: $tools.
+Read the [TOOL FAILED] error(s) above carefully.
+DO NOT proceed to any subsequent step.
+Diagnose the failure, then retry ONLY that failed tool with corrected arguments. Do not repeat any steps that already succeeded.
+Common fixes:
+  • Wrong path → use shell_run to locate the file first
+  • Wrong argument name → check tool schema
+  • App not found → search with 'where.exe <name>' (Windows/WSL) or 'which <name>' (Linux)
+Issue the corrected tool call NOW.

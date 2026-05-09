@@ -1,0 +1,4 @@
+[AGENT POLICY — CRITICAL] Your last response described a planned action in TEXT but issued no tool call for it.
+IMPORTANT: All tool calls in previous iterations of this session DID execute and succeed — those actions are done. Only the action you wrote as text (not as a tool call) was skipped. DO NOT re-run or re-launch anything already completed.
+Task still in progress: $user_input
+HOW TOOL CALLS WORK: Tool calls are a separate structured response — writing an action in text does nothing and does not undo previous tool calls. Your NEXT response must be a tool_call for the NEXT incomplete step. Do not describe what you will do — just call the tool.

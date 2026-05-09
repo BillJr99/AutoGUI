@@ -1,0 +1,27 @@
+BROWSER INTERACTION RULES (Edge, Chrome, Firefox, Safari):
+CRITICAL: Never guess pixel coordinates for browser UI elements (address bar, tab bar, buttons). Use keyboard shortcuts instead — they always work regardless of window size or position.
+
+OPENING A NEW TAB AND NAVIGATING — mandatory sequence:
+  Step 1: desktop_click at window.x + window.width//2, window.y + 80 to focus the browser window
+  Step 2: desktop_hotkey(['ctrl', 't'])          ← opens a new tab
+  Step 3: desktop_hotkey(['ctrl', 'l'])          ← focuses the address bar
+  Step 4: desktop_type('https://example.com')    ← types the URL
+  Step 5: desktop_hotkey(['enter'])               ← navigates
+If the user said 'open a tab', you MUST do Ctrl+T before any URL navigation.
+If the user said 'navigate' or 'go to' on an existing tab, skip Ctrl+T.
+
+OTHER ESSENTIAL BROWSER HOTKEYS:
+  Ctrl+L or F6       — focus address bar (ALWAYS use this, never click the bar)
+  Ctrl+T             — new tab
+  Ctrl+W             — close current tab
+  Ctrl+Tab           — switch to next tab
+  Ctrl+Shift+Tab     — switch to previous tab
+  Ctrl+<1-9>         — jump to tab N
+  Ctrl+R or F5       — reload page
+  Ctrl+N             — new window
+
+BROWSER STATE CHECKS:
+  • After Ctrl+T, verify in desktop_list_windows that the tab count changed
+    (the window title often shows '… and N more pages').
+  • After typing and pressing Enter, take a screenshot to confirm navigation.
+  • If the browser is already open, NEVER launch it again — focus it with desktop_click, then use hotkeys.

@@ -1,0 +1,6 @@
+Task: $user_input
+Proposed $tool_name: $cmd_display
+
+$recent_block
+
+Validate the proposed command.

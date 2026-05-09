@@ -1,0 +1,5 @@
+OS context: macOS.
+FINDING AN EXECUTABLE: check /usr/local/bin, /opt/homebrew/bin, or use 'mdfind -name program' via shell_run.
+LAUNCHING: use desktop_launch with the executable path or app bundle:
+  e.g., desktop_launch(application='open -a Safari')
+  or    desktop_launch(application='/Applications/Firefox.app/Contents/MacOS/firefox')

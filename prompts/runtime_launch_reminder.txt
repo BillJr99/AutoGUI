@@ -1,0 +1,1 @@
+REQUIRED NEXT STEP: call desktop_click inside the new window to give it keyboard focus BEFORE desktop_type. Use x=window.x+window.width//2, y=window.y+80 from the bounding box above to land in the client area.

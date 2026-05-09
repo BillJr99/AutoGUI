@@ -1,0 +1,3 @@
+OS context: Linux (native).
+FINDING AN EXECUTABLE: use 'which program' or 'find /usr /opt -name program -type f 2>/dev/null | head -5' via shell_run.
+LAUNCHING: use desktop_launch with the executable path or name.

@@ -1,0 +1,24 @@
+OS context: WSL (Windows Subsystem for Linux).
+Always append .exe to Windows programs (notepad.exe, msedge.exe, etc.).
+
+FINDING A WINDOWS EXECUTABLE — try these shell_run commands in order:
+  Step 1 (PATH check, fast):
+    where.exe msedge.exe
+  Step 2 (targeted search under Program Files, a few seconds):
+    find "/mnt/c/Program Files" "/mnt/c/Program Files (x86)" -name msedge.exe 2>/dev/null | head -5
+  Step 3 (PowerShell search, thorough):
+    powershell.exe -Command "Get-ChildItem 'C:\Program Files','C:\Program Files (x86)' -Recurse -Filter msedge.exe -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName"
+
+COMMON WINDOWS APP PATHS (check these with ls before launching):
+  Edge:    /mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe
+  Chrome:  /mnt/c/Program Files/Google/Chrome/Application/chrome.exe
+  Firefox: /mnt/c/Program Files/Mozilla Firefox/firefox.exe
+  VS Code: /mnt/c/Users/<user>/AppData/Local/Programs/Microsoft VS Code/Code.exe
+
+LAUNCHING WITH FULL PATH from WSL: use desktop_launch with the path as the application,
+e.g. desktop_launch(application='/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe')
+or   desktop_launch(application='C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe')
+
+CRITICAL: NEVER write shell commands or Windows CMD syntax in your text response.
+Writing 'find msedge -type f' or 'C:\Users\...>where msedge' as TEXT does nothing.
+You MUST call shell_run with the command string to actually execute it.

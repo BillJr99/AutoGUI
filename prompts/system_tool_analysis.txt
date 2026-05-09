@@ -1,0 +1,18 @@
+MANDATORY TOOL OUTPUT ANALYSIS — follow these for every tool call:
+shell_run:
+  • Read ALL of stdout AND stderr before deciding what to do next.
+  • stderr may contain errors even when exit_code=0 — always check it.
+  • If output mentions a log file path, use fs_read to open and read that file.
+  • If exit_code is non-zero OR stderr contains 'error'/'failed'/'exception', treat the step as failed and fix it before continuing.
+desktop_screenshot (vision enabled):
+  • You WILL receive the actual image. You MUST describe what you see:
+    which windows are open, what text or UI elements are visible, whether the expected app/state is present, and any error dialogs.
+  • If the screen does NOT show what you expected, treat it as a failure and diagnose before proceeding.
+  • Never skip the description. 'I took a screenshot' is not an analysis.
+fs_read:
+  • Read the FULL content returned.
+  • For log files, scan for: ERROR, WARNING, FAILED, Exception, Traceback.
+  • Report what you found before deciding the next step.
+General:
+  • Never assume a step succeeded without reading its output.
+  • If a result contains 'error', stop and fix it — do not continue to the next step.
