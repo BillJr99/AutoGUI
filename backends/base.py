@@ -320,11 +320,12 @@ class DesktopBackend:
             return {
                 "error": (
                     "OCR fallback requires pytesseract + the tesseract binary. "
-                    "Either set tools.auto_install_tesseract=true in config.json "
-                    "and restart so AutoGUI installs them for you, or install "
-                    "manually (see README → Set-of-Mark and click-by-text). "
-                    "Alternatively, on Windows/macOS use desktop_find_element "
-                    "for accessibility-tree lookup, which doesn't need OCR."
+                    "Run `scripts/install-dependencies.sh` (or "
+                    "`scripts/install-dependencies.cmd` on Windows) to install, "
+                    "or set `install_dependencies: true` in config.json to have "
+                    "AutoGUI run that script at startup. Alternatively use "
+                    "desktop_find_element for accessibility-tree lookup, which "
+                    "doesn't need OCR."
                 )
             }
 

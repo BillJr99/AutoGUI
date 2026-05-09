@@ -50,8 +50,10 @@ export async function findText(
       occurrence: 0,
       totalMatches: 0,
       error:
-        "Tesseract is not installed. Set autoInstallTesseract=true in config.json " +
-        "or install manually (`brew/apt/winget` install tesseract).",
+        "Tesseract is not installed. Run `bash scripts/install-dependencies.sh` " +
+        "(or `scripts\\install-dependencies.cmd` on Windows), or set " +
+        "`installDependencies: true` in pi-extension/config.json to have AutoGUI " +
+        "run that script at session start.",
     };
   }
 

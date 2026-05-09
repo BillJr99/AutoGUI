@@ -31,7 +31,7 @@ is configured to use and exposes desktop tools plus `/autogui`.
 | **Desktop (pixel)** | Screenshot, click, double-click, type text, hotkeys, scroll, launch apps, list windows |
 | **Desktop (a11y-first)** | `desktop_click_element(name, …)` clicks real UI controls via UIAutomation (Windows), AT-SPI (Linux), and AppleScript (macOS) — no pixel guessing |
 | **Set-of-Mark grounding** | Numbered overlay on detected elements; the model clicks by id (`desktop_click_mark`) instead of pixel coords |
-| **Click-by-text** | OCR-anchored click (`desktop_click_text`) with optional auto-install of Tesseract |
+| **Click-by-text** | OCR-anchored click (`desktop_click_text`); install Tesseract via `scripts/install-dependencies.*` |
 | **Browser (Playwright)** | First-class Chromium driver: real DOM/ARIA selectors, `browser_click`, `browser_fill`, `browser_eval` — opt-in via `allowed_browser` |
 | **Native input (Windows)** | `click`/`type_text`/`hotkey` go through `user32.SendInput` directly (real INPUT events, correct DPI, full Unicode) |
 | **Best-of-N sampling** | On uncertain steps (recent failure or non-APPROVED validator), sample N candidates and pick via self-consistency or a verifier model |
@@ -174,56 +174,59 @@ pip install uiautomation pywin32
 pip install pyobjc-framework-Quartz pyobjc-framework-AppKit
 ```
 
-### OCR (click-by-text fallback)
+### Optional dependencies — install scripts
 
-`desktop_click_text` and `desktop_find_text` use the accessibility tree on
-Windows/macOS. On Linux/X11/Wayland, or as a fallback when an element
-isn't exposed in the a11y tree, they use OCR via Tesseract. Setting up
-OCR is **optional** — without it the tools still work, they just return
-a "please install" message instead of a click.
+Optional features (Tesseract for click-by-text, Playwright + Chromium for
+the browser tools, Linux AT-SPI for `desktop_click_element`, ImageMagick
+for Set-of-Mark overlays + failure GIFs, plus a few platform-specific pip
+packages) are installed by **one script per OS** under `scripts/`:
 
-**Auto-install (recommended).** Set the config flag and AutoGUI handles
-the rest at startup:
+| OS                   | Script                                            |
+|----------------------|---------------------------------------------------|
+| Linux / macOS / WSL  | `bash scripts/install-dependencies.sh`            |
+| Windows              | `scripts\install-dependencies.cmd` (cmd shim)     |
+| Windows (PowerShell) | `powershell -ExecutionPolicy Bypass -File scripts\install-dependencies.ps1` |
 
-```jsonc
-{
-  "tools": {
-    "auto_install_tesseract": true
-  }
-}
+Each script:
+- detects its OS, package manager (apt/dnf/pacman/zypper/brew/winget), and display server (X11 vs Wayland on Linux);
+- skips dependencies that are already installed (idempotent);
+- echoes every command before running it (loud by design);
+- installs the Python deps from `requirements.txt`, plus the optional ones (`pyperclip`, `pytesseract`, `playwright`, `pyobjc-framework-Quartz` on macOS, `uiautomation` + `pywin32` on Windows);
+- runs `python -m playwright install chromium`;
+- if `pi-extension/` exists, also runs `npm install` and `npx playwright install chromium` inside it.
+
+Either run the script manually before launch, or set this config flag and
+AutoGUI will invoke it once at startup before initialising the registry:
+
+```json
+{ "install_dependencies": true }
 ```
 
-On first launch with the flag enabled, AutoGUI runs the platform-native
-installer, then `pip install pytesseract`:
+The flag is at the top level of `config.json` (not under `agent`/`tools`).
+Default is `false` so unmodified setups don't install anything.
 
-| Platform        | Command issued                                                   |
-|-----------------|------------------------------------------------------------------|
-| Linux (Debian)  | `sudo apt-get install -y tesseract-ocr`                          |
-| Linux (Fedora)  | `sudo dnf install -y tesseract`                                  |
-| Linux (Arch)    | `sudo pacman -S --noconfirm tesseract`                           |
-| Linux (SUSE)    | `sudo zypper install -y tesseract-ocr`                           |
-| WSL             | uses the Linux side's `apt-get` (binary lives inside WSL)        |
-| macOS           | `brew install tesseract` (Homebrew must be installed first)      |
-| Windows         | `winget install --id=UB-Mannheim.TesseractOCR --silent`          |
-
-Each step is logged to stdout (`[tesseract_install] $ …`) so you can
-see exactly what's running. Auto-install attempts at most once per
-process; if the install fails, the message tells you why and you can
-fix it manually.
-
-**Manual install** if you'd rather not enable the flag:
+**Manual single-package install** if you only want one of the optional
+deps:
 
 ```bash
-# Linux / WSL
-sudo apt install tesseract-ocr && pip install pytesseract
-
-# macOS
-brew install tesseract && pip install pytesseract
-
-# Windows (PowerShell as admin)
-winget install UB-Mannheim.TesseractOCR
+# Tesseract (for desktop_click_text / desktop_find_text)
+sudo apt install tesseract-ocr   # Debian/Ubuntu/WSL
+sudo dnf install tesseract       # Fedora
+brew install tesseract           # macOS
+winget install UB-Mannheim.TesseractOCR   # Windows
 pip install pytesseract
-# Then add C:\Program Files\Tesseract-OCR to PATH if winget didn't.
+
+# Playwright + Chromium (for browser_* tools)
+pip install playwright
+python -m playwright install chromium
+
+# Linux a11y for desktop_click_element
+sudo apt install python3-pyatspi gir1.2-atspi-2.0
+
+# ImageMagick (for Set-of-Mark overlay + failure GIFs)
+sudo apt install imagemagick     # Linux
+brew install imagemagick         # macOS
+winget install ImageMagick.ImageMagick   # Windows
 ```
 
 ### Planner (vs. dry-run — they're different things)
@@ -297,37 +300,12 @@ family — a Playwright-driven Chromium that the agent can navigate,
 inspect, and interact with via real DOM/ARIA selectors instead of
 pixel coordinates.
 
-The first time you start AutoGUI with browser tools enabled it will
-detect that Playwright + Chromium are missing and install them for
-you. Loud by design — every command prints to stdout so you can see
-what gets installed and where. Set `tools.auto_install_playwright:
-false` to opt out and install manually.
-
-**What auto-install runs** (`tesseract_install.py` and
-`playwright_install.py` are the source of truth). Run any of these
-yourself if you want to do it by hand:
-
-```bash
-# Playwright + Chromium (auto-install does these in order)
-pip install playwright
-python -m playwright install chromium
-
-# Tesseract — manual install
-# Linux (Debian/Ubuntu)
-sudo apt-get update && sudo apt-get install -y tesseract-ocr
-# Linux (Fedora)
-sudo dnf install -y tesseract
-# Linux (Arch)
-sudo pacman -S --noconfirm tesseract
-# Linux (openSUSE)
-sudo zypper install -y tesseract-ocr
-# macOS
-brew install tesseract
-# Windows (PowerShell as admin)
-winget install --id=UB-Mannheim.TesseractOCR --silent --accept-package-agreements --accept-source-agreements
-# Then in every case
-pip install pytesseract
-```
+Playwright + Chromium are installed by `scripts/install-dependencies.*`
+(see "Optional dependencies — install scripts" above). Either run the
+script once manually, or set `install_dependencies: true` at the top
+of `config.json` to have AutoGUI run it at startup. Until they're
+present, the `browser_*` tools register but return a clear error
+pointing back at the install script.
 
 Selectors follow Playwright syntax:
 - CSS: `button.primary`, `#login-form input[name="email"]`
@@ -648,6 +626,7 @@ No configuration is needed.
     "api_key":  "...",                    //   model). Omit this whole block to reuse
     "model":    "llama3.1:8b"             //   the primary client for everything.
   },
+  "install_dependencies": false,          // True = run scripts/install-dependencies.* at startup
   "agent": {
     "max_iterations": 30,                 // Hard stop after N agentic loop iterations
     "confirm_destructive": true,         // Block shell commands matching destructive regex patterns
@@ -679,8 +658,6 @@ No configuration is needed.
     "screenshot_dir": "screenshots",      // Directory for saved screenshots
     "max_screenshot_width": 1280,         // Resize screenshots wider than this (px)
     "perception_cache_ttl_seconds": 0.5,  // Reuse the last screenshot for this long
-    "auto_install_tesseract": false,      // True = run the platform installer on startup
-    "auto_install_playwright": true,      // Install Playwright + Chromium when allowed_browser=true (default true)
     "allowed_shell": true,               // Enable shell_run tool
     "allowed_filesystem": true,          // Enable fs_read / fs_write / fs_list
     "allowed_desktop": true,             // Enable all desktop/* tools

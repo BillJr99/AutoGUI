@@ -3,7 +3,6 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import type { BrowserBackend } from "./browser_backend.js";
 import { PerceptionCache } from "./cache.js";
 import type { ExtensionConfig } from "./config.js";
-import { ensureTesseract } from "./dependencies.js";
 import { ScreenRecorder } from "./screen_record.js";
 import type { SkillStep, SkillStore } from "./skills.js";
 import { annotateScreenshot } from "./som.js";
@@ -343,7 +342,7 @@ export function createDesktopTools(
     defineTool({
       name: "desktop_click_text",
       label: "Click Text",
-      description: "Find a visible text label on screen via OCR (Tesseract) and click its centre. Most reliable for unlabelled or pixel-clicked targets when no a11y-tree handle is exposed. Requires Tesseract — set autoInstallTesseract=true to install automatically.",
+      description: "Find a visible text label on screen via OCR (Tesseract) and click its centre. Most reliable for unlabelled or pixel-clicked targets when no a11y-tree handle is exposed. Requires Tesseract — run `bash scripts/install-dependencies.sh` (or set `installDependencies: true` in config.json).",
       promptSnippet: "desktop_click_text: click an element by its visible text.",
       promptGuidelines: [
         "Prefer desktop_click_element first (no OCR needed); use desktop_click_text only when a11y lookup isn't available.",
@@ -354,11 +353,12 @@ export function createDesktopTools(
       }),
       executionMode: "sequential",
       execute: wrap("desktop_click_text", async (params, signal) => {
-        const ready = await ensureTesseract(cfg.autoInstallTesseract, logger);
-        if (!ready.ready) return textResult(ready.message ?? "Tesseract not available.", { error: ready.message });
+        // findText reports tesseract-missing errors itself; no separate
+        // pre-check needed.  Install pipeline lives in scripts/.
         const backend = await getBackend();
         const shot = await backend.screenshot({ saveDir }, signal);
         const found = await findText(shot.path, params.text, params.occurrence ?? 0, signal);
+        if (found.error) return textResult(found.error, { error: found.error });
         if (!found.found || !found.match) {
           return textResult(`No visible text matching ${JSON.stringify(params.text)} found via OCR.`, { found: false, totalMatches: found.totalMatches, error: found.error });
         }
@@ -381,13 +381,13 @@ export function createDesktopTools(
       }),
       executionMode: "sequential",
       execute: wrap("desktop_find_text", async (params, signal) => {
-        const ready = await ensureTesseract(cfg.autoInstallTesseract, logger);
-        if (!ready.ready) return textResult(ready.message ?? "Tesseract not available.", { error: ready.message });
         const backend = await getBackend();
         const shot = await backend.screenshot({ saveDir }, signal);
         const found = await findText(shot.path, params.text, params.occurrence ?? 0, signal);
         return textResult(
-          found.found && found.match ? `Found ${JSON.stringify(found.match.text)} at (${found.match.x},${found.match.y}).` : `No matches.`,
+          found.found && found.match
+            ? `Found ${JSON.stringify(found.match.text)} at (${found.match.x},${found.match.y}).`
+            : (found.error ?? "No matches."),
           { found: found.found, match: found.match, occurrence: found.occurrence, totalMatches: found.totalMatches, error: found.error },
         );
       }),

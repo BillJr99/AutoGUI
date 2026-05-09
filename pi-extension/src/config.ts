@@ -22,9 +22,8 @@ export interface ExtensionConfig {
   recordTrace: boolean;
   /** Directory for trace JSONL files. */
   traceDir: string;
-  /** Best-effort dependency installs (printed loudly when triggered). */
-  autoInstallTesseract: boolean;
-  autoInstallPlaywright: boolean;
+  /** Run scripts/install-dependencies.* once at session start. */
+  installDependencies: boolean;
   /** Short-lived cache so the auto-verify cycle doesn't double-grab. */
   perceptionCacheTtlMs: number;
   /** Browser tools are gated behind this flag. */
@@ -56,8 +55,7 @@ const DEFAULTS: ExtensionConfig = {
   skillsPath: join(homedir(), ".autogui", "skills.jsonl"),
   recordTrace: true,
   traceDir: join(homedir(), ".autogui", "traces"),
-  autoInstallTesseract: false,
-  autoInstallPlaywright: true,
+  installDependencies: false,
   perceptionCacheTtlMs: 500,
   allowedBrowser: false,
   browser: {

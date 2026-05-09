@@ -44,8 +44,10 @@ export class BrowserBackend {
         pw = await import(mod as string);
       } catch {
         throw new Error(
-          "Playwright is not installed. Either set autoInstallPlaywright=true " +
-          "in config.json (default) or run `npm install playwright && npx playwright install chromium`.",
+          "Playwright is not installed. Run `bash scripts/install-dependencies.sh` " +
+          "(or `scripts\\install-dependencies.cmd` on Windows), or set " +
+          "`installDependencies: true` in pi-extension/config.json to have AutoGUI " +
+          "run that script at session start.",
         );
       }
       this.playwright = pw;

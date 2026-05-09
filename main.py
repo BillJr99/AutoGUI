@@ -146,10 +146,25 @@ def build_components(cfg: dict):
     the coherence validator).  The main client is still used for every
     user-facing tool-calling turn.
 
+    When `install_dependencies` is true at the top level of the config,
+    the appropriate `scripts/install-dependencies.*` script is invoked
+    BEFORE the registry is built so any deps it provides (e.g. tesseract,
+    playwright, pyatspi) are available when tools register.
+
     Returns
     -------
     tuple[OpenWebUIClient, ToolRegistry, Agent]
     """
+    if cfg.get("install_dependencies", False):
+        try:
+            from install_runner import run_installer
+            from pathlib import Path as _Path
+            rc = run_installer(_Path(__file__).resolve().parent)
+            if rc != 0:
+                print(f"[main] install-dependencies script returned exit code {rc} — continuing anyway.")
+        except Exception as e:
+            print(f"[main] install-dependencies invocation failed: {e}")
+
     ow_cfg = cfg.get("openwebui", {})
     client = OpenWebUIClient(
         base_url=ow_cfg.get("base_url", "http://localhost:3000"),

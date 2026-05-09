@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { BrowserBackend } from "./browser_backend.js";
 import { PerceptionCache } from "./cache.js";
 import { loadConfig, type ExtensionConfig } from "./config.js";
-import { ensurePlaywright, ensureTesseract } from "./dependencies.js";
+import { runInstaller } from "./install_runner.js";
 import { createLogger } from "./logger.js";
 import { createBackend } from "./platform.js";
 import { commandExists, execFile, shellQuote } from "./process.js";
@@ -108,18 +108,25 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
       // Block writes by emptying path — simpler to just create one anyway since
       // writes are best-effort and skip on error.
     }
-    if (cfg.allowedBrowser) {
-      const status = await ensurePlaywright(cfg.autoInstallPlaywright, logger);
-      if (status.ready) {
-        browser = new BrowserBackend({
-          headless: cfg.browser.headless,
-          screenshotDir: cfg.browser.screenshotDir,
-          userDataDir: cfg.browser.userDataDir,
-          viewport: cfg.browser.viewport,
-        });
-      } else {
-        await logger.log("init.browser.not_ready", { message: status.message });
+    // Optional one-shot dependency install — invokes the same scripts/
+    // shell scripts the user can run by hand.  Runs BEFORE BrowserBackend
+    // construction so Playwright + Chromium can be installed first.
+    if (cfg.installDependencies) {
+      const result = await runInstaller(logger);
+      if (!result.ok) {
+        await logger.log("init.install_runner.failed", { result });
       }
+    }
+    if (cfg.allowedBrowser) {
+      browser = new BrowserBackend({
+        headless: cfg.browser.headless,
+        screenshotDir: cfg.browser.screenshotDir,
+        userDataDir: cfg.browser.userDataDir,
+        viewport: cfg.browser.viewport,
+      });
+      // BrowserBackend lazily imports playwright on first use; if it's
+      // missing the user gets a clear "please install" error pointing
+      // at scripts/install-dependencies.*.
     }
     if (cfg.screenRecord.enabled) {
       recorder = new ScreenRecorder(cfg.screenRecord, getBackend, logger);
@@ -287,26 +294,10 @@ ${autoGuiTask}`;
         const c = await getConfig();
         const backend = await getBackend();
         const status = await backend.status(ctx.signal);
-        ctx.ui.notify(JSON.stringify({ ...status, capabilities: backend.capabilities, config: { allowedBrowser: c.allowedBrowser, dryRun: c.dryRun, plannerEnabled: c.plannerEnabled, autoInstallTesseract: c.autoInstallTesseract, autoInstallPlaywright: c.autoInstallPlaywright } }, null, 2), "info");
+        ctx.ui.notify(JSON.stringify({ ...status, capabilities: backend.capabilities, config: { allowedBrowser: c.allowedBrowser, dryRun: c.dryRun, plannerEnabled: c.plannerEnabled, installDependencies: c.installDependencies } }, null, 2), "info");
       } catch (error) {
         ctx.ui.notify(`AutoGUI status failed: ${String(error)}`, "error");
       }
-    },
-  });
-
-  pi.registerCommand("autogui-install-ocr", {
-    description: "Install Tesseract OCR for desktop_click_text / desktop_find_text",
-    handler: async (_args, ctx) => {
-      const status = await ensureTesseract(true, logger);
-      ctx.ui.notify(status.ready ? "Tesseract OCR ready." : (status.message ?? "Install failed; see logs."), status.ready ? "info" : "error");
-    },
-  });
-
-  pi.registerCommand("autogui-install-browser", {
-    description: "Install Playwright + Chromium for browser_* tools",
-    handler: async (_args, ctx) => {
-      const status = await ensurePlaywright(true, logger);
-      ctx.ui.notify(status.ready ? "Playwright + Chromium ready. Set tools.allowedBrowser=true in config.json to register the browser_* tools." : (status.message ?? "Install failed; see logs."), status.ready ? "info" : "error");
     },
   });
 

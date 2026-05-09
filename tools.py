@@ -305,36 +305,15 @@ class ToolRegistry:
                 print(f"[tools.py:ToolRegistry.__init__] Backend init failed: {e}")
                 traceback.print_exc()
 
-        # Optional eager OCR install — runs once at startup when the user
-        # has explicitly opted in via tools.auto_install_tesseract.  Loud
-        # by design (prints every command) so the user sees what's happening.
-        if self._tools_cfg.get("auto_install_tesseract", False):
-            try:
-                from tesseract_install import ensure
-                snap = ensure(auto_install=True)
-                if snap.get("ready"):
-                    logger.info("[tools.py] OCR ready: %s", snap.get("tesseract_binary"))
-                else:
-                    logger.warning("[tools.py] OCR install: %s", snap.get("message"))
-            except Exception as e:
-                logger.warning("[tools.py] tesseract_install failed: %s", e)
-
-        # Same pattern for Playwright — only when browser tools are enabled.
-        # auto_install_playwright defaults to True when allowed_browser=true:
-        # if you've committed to browser automation, you almost certainly want
-        # the deps installed.  Set the flag explicitly to false to opt out.
+        # Browser backend wiring.  Dependencies (Playwright + Chromium)
+        # are NOT installed by the registry — that's the job of
+        # `scripts/install-dependencies.*`, run either by hand or
+        # automatically via the top-level `install_dependencies` config
+        # flag in build_components.  If browser tools are enabled but
+        # the deps are missing, the BrowserBackend simply returns a
+        # helpful "please install" error on first call.
         self._browser_backend = None
         if self._tools_cfg.get("allowed_browser", False):
-            if self._tools_cfg.get("auto_install_playwright", True):
-                try:
-                    from playwright_install import ensure as ensure_pw
-                    snap = ensure_pw(auto_install=True)
-                    if not snap.get("ready"):
-                        logger.warning("[tools.py] Playwright install: %s", snap.get("message"))
-                    else:
-                        logger.info("[tools.py] Playwright + Chromium ready.")
-                except Exception as e:
-                    logger.warning("[tools.py] playwright_install failed: %s", e)
             try:
                 from browser_backend import BrowserBackend
                 browser_cfg = cfg.get("browser", {}) or {}

@@ -9,8 +9,6 @@ This extension is decoupled from OpenWebUI. It does not create a model client, m
 - `/autogui <task>`: sends a prepared desktop-automation prompt into Pi's normal agent loop.
 - `/autogui-abort`: aborts the current AutoGUI/Pi agent operation.
 - `/autogui-validate <task>`: spawns a separate read-only Pi validator in tmux.
-- `/autogui-install-ocr`: installs Tesseract OCR for `desktop_click_text`/`desktop_find_text`.
-- `/autogui-install-browser`: installs Playwright + Chromium for the `browser_*` tool family.
 - `/desktop-status`: reports the detected backend, capabilities, and config snapshot.
 - Desktop tools (all platforms):
   - `desktop_screenshot`, `desktop_screenshot_marked`
@@ -61,21 +59,22 @@ The extension reads optional JSON from one of:
 
 Every key has a sensible default — leave the file out and everything works. See `config.json.example` for the full schema. Highlights:
 
-- `allowedBrowser`: false → set true to register the `browser_*` tools (Playwright auto-installs).
-- `autoInstallTesseract` / `autoInstallPlaywright`: enable optional one-shot installs at first use.
+- `installDependencies`: when true, the extension runs the same `scripts/install-dependencies.*` shell script as the mainline, once at session start. Default false.
+- `allowedBrowser`: set true to register the `browser_*` tools (requires Playwright + Chromium).
 - `dryRun` / `allowedApps` / `blockedWindowTitles`: safety gates.
 - `plannerEnabled`: planner-first protocol in the system prompt.
 - `screenRecord.*`: rolling screen buffer for failure post-mortem.
 
-Optional system dependencies for graceful-degrade features:
+Optional system dependencies for graceful-degrade features (all
+installed by `scripts/install-dependencies.*`):
 
-| Feature                          | Dep                                                                 |
-|----------------------------------|---------------------------------------------------------------------|
-| `desktop_screenshot_marked` overlay | ImageMagick (`magick` or `convert`)                              |
-| `desktop_click_text`/`desktop_find_text` | Tesseract — auto-installable                              |
-| `desktop_click_element` on Linux | `python3` + `python3-pyatspi` + `gir1.2-atspi-2.0`                  |
-| `browser_*` tools                | Playwright + Chromium — auto-installable                            |
-| Failure GIF                      | ImageMagick (manifest written if missing)                           |
+| Feature                          | Dep                                                              |
+|----------------------------------|------------------------------------------------------------------|
+| `desktop_screenshot_marked` overlay | ImageMagick (`magick` or `convert`)                            |
+| `desktop_click_text`/`desktop_find_text` | Tesseract                                              |
+| `desktop_click_element` on Linux | `python3` + `python3-pyatspi` + `gir1.2-atspi-2.0`              |
+| `browser_*` tools                | Playwright + Chromium                                            |
+| Failure GIF                      | ImageMagick (manifest written if missing)                        |
 
 ## Install Dependencies
 
@@ -88,58 +87,54 @@ npm run typecheck
 
 The extension targets the installed Pi package name `@earendil-works/pi-coding-agent`.
 
-### Optional system dependencies (`/autogui-install-*` commands)
+### Optional system dependencies (single install script)
 
-Two slash-commands install optional features for you. You can also run the underlying shell commands yourself if you'd rather skip the in-Pi installer.
-
-**`/autogui-install-ocr`** — installs Tesseract for `desktop_click_text` / `desktop_find_text`. Internally picks the right command for your platform. Manual equivalents:
+All the optional system tools (Tesseract, ImageMagick, Playwright + Chromium, AT-SPI bindings on Linux, Python deps for the mainline, Node deps for this extension) are installed by **one script per OS** that lives at the project root under `scripts/`:
 
 ```bash
-# Linux (Debian/Ubuntu) and WSL
-sudo apt-get update && sudo apt-get install -y tesseract-ocr
+# Linux / macOS / WSL
+bash scripts/install-dependencies.sh
 
-# Linux (Fedora)
-sudo dnf install -y tesseract
+# Windows (cmd shim)
+scripts\install-dependencies.cmd
 
-# Linux (Arch)
-sudo pacman -S --noconfirm tesseract
-
-# Linux (openSUSE)
-sudo zypper install -y tesseract-ocr
-
-# macOS (requires Homebrew first; see https://brew.sh)
-brew install tesseract
-
-# Windows (PowerShell as admin)
-winget install --id=UB-Mannheim.TesseractOCR --silent --accept-package-agreements --accept-source-agreements
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File scripts\install-dependencies.ps1
 ```
 
-After the binary is on PATH, OCR is ready — the pi-extension talks to `tesseract` via CLI, no Python wrapper needed. (The mainline AutoGUI Python agent additionally needs `pip install pytesseract`; the pi-extension does not.)
+The script is idempotent — every dep is checked first and skipped if it's already installed — and loud, echoing every command before running it.
 
-**`/autogui-install-browser`** — installs Playwright + Chromium for the `browser_*` tool family. Manual equivalents (run in `pi-extension/`):
+You can also have AutoGUI run the script automatically at session start by setting the config flag (default false):
 
-```bash
-npm install playwright
-npx --yes playwright install chromium
+```json
+{ "installDependencies": true }
 ```
 
-After this, set `allowedBrowser: true` in `pi-extension/config.json` (or `~/.autogui/pi-extension.json`) and restart Pi to register the `browser_*` tools.
+After running, set `allowedBrowser: true` to register the `browser_*` tools (Playwright + Chromium are now installed inside `pi-extension/node_modules/`).
 
-**Linux accessibility (`desktop_click_element`)** is *not* covered by an `/autogui-install` command because installation needs `apt`-installed gobject bindings, not just a binary. Manual install:
-
-```bash
-sudo apt install -y python3 python3-pyatspi gir1.2-atspi-2.0
-```
-
-Some apps need to be launched with `GTK_MODULES=gail:atk-bridge`, or the desktop session needs accessibility enabled, before they expose an AT-SPI tree. Without the helper, `desktop_click_element` returns the install instructions and the agent falls through the click ladder to `desktop_click_text` / `desktop_click_mark`.
-
-**ImageMagick** (used for the Set-of-Mark overlay on `desktop_screenshot_marked` and the failure-recording GIF assembly):
+**What each tool needs if you'd rather install one piece by hand:**
 
 ```bash
-sudo apt install -y imagemagick      # Linux
-brew install imagemagick             # macOS
+# Tesseract (for desktop_click_text / desktop_find_text)
+sudo apt install tesseract-ocr   # Linux / WSL
+brew install tesseract           # macOS
+winget install UB-Mannheim.TesseractOCR   # Windows
+
+# ImageMagick (for SoM overlay + failure GIFs)
+sudo apt install imagemagick     # Linux
+brew install imagemagick         # macOS
 winget install ImageMagick.ImageMagick   # Windows
+
+# Linux a11y for desktop_click_element
+sudo apt install python3 python3-pyatspi gir1.2-atspi-2.0
+
+# Playwright + Chromium for browser_* tools (run inside pi-extension/)
+cd pi-extension
+npm install playwright
+npx playwright install chromium
 ```
+
+When something is missing the corresponding tool returns a clear error pointing back at the install script — the agent can then walk down the click ladder to the next-best option (`desktop_click_element` → `desktop_click_text` → `desktop_click_mark` → `desktop_click(x, y)`).
 
 When ImageMagick is missing, marks are still emitted as a list (you can call `desktop_click_mark(id)` even without the visual overlay), and failure recordings are written as a manifest file listing the captured PNG frames instead of a single GIF.
 

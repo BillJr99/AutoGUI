@@ -17,6 +17,8 @@
     "timeout_seconds": 60
   },
   "prompts_dir": "prompts",
+  "_install_comment": "Set install_dependencies=true to run scripts/install-dependencies.* at startup (system + Python + Playwright + pi-extension Node deps).",
+  "install_dependencies": false,
   "agent": {
     "max_iterations": 30,
     "confirm_destructive": true,
@@ -51,8 +53,6 @@
     "screenshot_dir": "screenshots",
     "max_screenshot_width": 1280,
     "perception_cache_ttl_seconds": 0.5,
-    "auto_install_tesseract": false,
-    "auto_install_playwright": true,
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,
