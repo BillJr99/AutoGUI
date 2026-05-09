@@ -1,15 +1,22 @@
-# OpenWebUI Desktop Agent
+# AutoGUI Desktop Agent
 
-A Python CLI/TUI agent that connects any [OpenWebUI](https://openwebui.com/) instance
-to your desktop.  The agent drives a ReAct-style loop (Reason → Act → Observe → repeat)
-and can run shell commands, read/write files, take screenshots, click, type, launch
-programs, and inspect accessibility trees — all via function-calling with any model
-available in your OpenWebUI instance.
+AutoGUI provides desktop automation in two forms:
 
-Architecturally it follows [UFO](https://github.com/microsoft/UFO) and
+1. A standalone Python CLI/TUI agent that connects any [OpenWebUI](https://openwebui.com/) instance to your desktop.
+2. A native TypeScript Pi Coding Agent extension in `pi-extension/` that lets Pi own the agent workflow while AutoGUI supplies desktop tools.
+
+The standalone agent drives a ReAct-style loop (Reason → Act → Observe → repeat)
+and can run shell commands, read/write files, take screenshots, click, type,
+launch programs, and inspect accessibility trees — all via function-calling with
+any model available in your OpenWebUI instance.
+
+The standalone Python agent architecture follows [UFO](https://github.com/microsoft/UFO) and
 [open-interpreter](https://github.com/OpenInterpreter/open-interpreter) but is vendor-neutral:
 any model that supports OpenAI-compatible tool calling and is registered in your OpenWebUI
 works out of the box.
+
+The Pi extension is decoupled from OpenWebUI. It uses whatever model/provider Pi
+is configured to use and exposes desktop tools plus `/autogui`.
 
 ---
 
@@ -182,6 +189,40 @@ Prints connection status, configured model, and registered tool list.
 ---
 
 ## Usage
+
+### Pi extension
+
+The native Pi extension lives in `pi-extension/` and is implemented entirely in
+TypeScript. It does not use OpenWebUI or the standalone Python agent loop.
+
+```bash
+cd pi-extension
+npm install
+npm run typecheck
+pi -e ./src/index.ts
+```
+
+Inside Pi:
+
+```text
+/autogui Open a harmless app and describe what you see
+```
+
+For a read-only second pass, `/autogui-validate <task>` spawns a separate Pi
+validator in a tmux session with only screenshot and window-listing tools active.
+
+See `pi-extension/README.md` for the full extension details.
+
+### Runtime directories
+
+The standalone Python agent creates runtime directories as needed:
+
+- `logs/` is created before `logs/agent.log` is opened.
+- The parent directory for `logs/history.jsonl` is created when TUI history is saved.
+- `screenshots/` is created by the active screenshot backend before saving a screenshot.
+
+The Pi extension creates `pi-extension/runtime/screenshots/` recursively before
+saving screenshots. These runtime paths are ignored by git.
 
 ### Interactive TUI
 

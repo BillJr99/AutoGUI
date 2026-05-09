@@ -30,6 +30,10 @@ ENV/
 config.json
 logs/
 screenshots/
+pi-extension/node_modules/
+pi-extension/runtime/
+pi-extension/.agents/
+pi-extension/.codex/
 
 # OS metadata
 .DS_Store
