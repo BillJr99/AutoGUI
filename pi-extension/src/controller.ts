@@ -57,7 +57,18 @@ export function newPlan(): Plan {
 }
 
 export function planFromDict(data: Record<string, unknown>): Plan {
-  const stepsData = (data["steps"] as Array<Record<string, unknown>>) ?? [];
+  // The model (or a corrupted progress record) might hand us a `steps`
+  // value that isn't an array — an object, null, a string.  Guard with
+  // Array.isArray so a malformed payload degrades to an empty plan
+  // instead of throwing on `.map`.  Also drop any non-object entries
+  // so a stray string in the array doesn't crash `sd["id"]` access.
+  const rawSteps = data["steps"];
+  const stepsData: Array<Record<string, unknown>> = Array.isArray(rawSteps)
+    ? (rawSteps as unknown[]).filter(
+        (sd): sd is Record<string, unknown> =>
+          !!sd && typeof sd === "object" && !Array.isArray(sd),
+      )
+    : [];
   const steps: PlanStep[] = stepsData.map((sd) => {
     // Only treat the value as a predicate when it's a non-empty object
     // with a recognisable kind.  An empty `{}` is truthy in JS, so

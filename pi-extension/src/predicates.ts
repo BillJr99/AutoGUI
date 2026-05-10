@@ -24,6 +24,13 @@ function isRegularFile(path: string): boolean {
   }
 }
 
+function shellQuote(s: string): string {
+  // POSIX shell single-quote escape: surround with single quotes and
+  // replace any embedded ' with '\'' (close-quote, escaped-quote,
+  // re-open-quote).  Mirrors Python's shlex.quote for non-empty input.
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 export const PREDICATE_KINDS = [
   "window_title_contains",
   "window_active_app",
@@ -212,9 +219,25 @@ export async function checkPredicate(
       if (!helpers.runShell) return { ok: false, kind: predicate.kind, detail: "shell unavailable" };
       const needle = predicate.value ?? "";
       if (!needle) return { ok: false, kind: predicate.kind, detail: "empty value" };
-      const cmd = process.platform === "win32"
-        ? `tasklist /FI "IMAGENAME eq ${needle}*"`
-        : `pgrep -lf ${JSON.stringify(needle)}`;
+      // The needle reaches /bin/sh -c (or cmd /C) verbatim.  JSON.stringify
+      // is a JS string literal, NOT shell-safe quoting — it leaves single
+      // quotes / $() / backticks untouched and so allowed both broken
+      // matching and command injection.  Single-quote escape on POSIX,
+      // and on Windows reject obvious shell metacharacters since
+      // tasklist's /FI takes a double-quoted string with no portable
+      // escape for embedded double quotes.
+      let cmd: string;
+      if (process.platform === "win32") {
+        if (/["&|<>%^]/.test(needle)) {
+          return {
+            ok: false, kind: predicate.kind,
+            detail: `refusing to query process: needle ${JSON.stringify(needle)} contains shell metacharacters`,
+          };
+        }
+        cmd = `tasklist /FI "IMAGENAME eq ${needle}*"`;
+      } else {
+        cmd = `pgrep -lf ${shellQuote(needle)}`;
+      }
       try {
         const r = await helpers.runShell(cmd);
         const found = r.stdout.toLowerCase().includes(needle.toLowerCase());

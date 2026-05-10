@@ -42,6 +42,23 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _coerce_str_list(value: Any) -> list[str]:
+    """Normalise loose model output into a list of strings.
+
+    The model can return a list directly (the happy path), a single
+    string (we promote to a 1-element list), or something falsy (we
+    return []).  We deliberately do NOT call ``list(value)`` on a
+    string because that yields one entry per character, which would
+    corrupt fields like ``tools_hint=["desktop_launch"]`` into
+    ``["d","e","s","k",...]``.
+    """
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
 class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -136,7 +153,16 @@ class Plan:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Plan":
-        steps_data = data.get("steps") or []
+        # The planner / a corrupted progress snapshot might hand us a
+        # `steps` value that isn't a list of dicts (an object keyed by
+        # id, a string, None, a list with primitives mixed in).  Guard
+        # the shape so the typed-plan path degrades to an empty plan
+        # instead of throwing — losing a plan is recoverable; aborting
+        # the whole controller on bad input is not.
+        raw_steps = data.get("steps")
+        if not isinstance(raw_steps, list):
+            raw_steps = []
+        steps_data = [sd for sd in raw_steps if isinstance(sd, dict)]
         steps = []
         for sd in steps_data:
             try:
@@ -146,21 +172,28 @@ class Plan:
             pred = sd.get("predicate")
             if not isinstance(pred, dict):
                 pred = {}
+            # tools_hint/depends_on/artifacts: the model occasionally
+            # returns a single string instead of a list.  list("foo")
+            # would split it into ['f','o','o'] which corrupts the
+            # plan; treat non-list values as either an empty list or a
+            # one-element list depending on whether they're truthy.
             steps.append(PlanStep(
                 id=str(sd.get("id", "")),
                 goal=str(sd.get("goal", "")),
                 expected=str(sd.get("expected", "")),
                 predicate=dict(pred),
-                tools_hint=list(sd.get("tools_hint") or []),
-                depends_on=list(sd.get("depends_on") or []),
-                risks=[str(r) for r in (sd.get("risks") or [])],
+                tools_hint=_coerce_str_list(sd.get("tools_hint")),
+                depends_on=_coerce_str_list(sd.get("depends_on")),
+                risks=_coerce_str_list(sd.get("risks")),
                 status=status,
                 attempts=int(sd.get("attempts", 0)),
                 last_error=str(sd.get("last_error", "")),
-                artifacts=list(sd.get("artifacts") or []),
+                artifacts=_coerce_str_list(sd.get("artifacts")),
                 notes=str(sd.get("notes", "")),
             ))
         preflight_raw = data.get("preflight") or []
+        if not isinstance(preflight_raw, list):
+            preflight_raw = []
         preflight = [p for p in preflight_raw if isinstance(p, dict)]
         return cls(
             steps=steps,

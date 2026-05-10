@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -309,10 +310,21 @@ async def _check_process(p: dict, registry) -> PredicateResult:
     if "shell_run" not in set(registry.list_tools()):
         return PredicateResult(False, p["kind"], "shell unavailable; cannot list processes")
     import platform as _p
-    cmd = (
-        f'tasklist /FI "IMAGENAME eq {needle}*"' if _p.system() == "Windows"
-        else f'pgrep -lf {needle!r}'
-    )
+    # The needle reaches /bin/sh -c (or cmd /C) verbatim, so anything
+    # like single-quotes / $() / backticks would have broken matching
+    # and risked shell injection.  Use shlex.quote on POSIX (correct
+    # single-quote handling) and reject metacharacter-bearing needles
+    # on Windows where tasklist's /FI takes a quoted string and there
+    # is no portable single-quote-escaping equivalent.
+    if _p.system() == "Windows":
+        if any(ch in needle for ch in '"&|<>%^'):
+            return PredicateResult(
+                False, p["kind"],
+                f"refusing to query process: needle {needle!r} contains shell metacharacters",
+            )
+        cmd = f'tasklist /FI "IMAGENAME eq {needle}*"'
+    else:
+        cmd = f"pgrep -lf {shlex.quote(needle)}"
     raw = await registry.dispatch("shell_run", {"command": cmd})
     try:
         result = json.loads(raw)
