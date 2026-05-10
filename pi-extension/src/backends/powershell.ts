@@ -522,11 +522,22 @@ if ($argsJson -and $argsJson -ne '[]') {
   if ($parsed -is [array]) { $argList = @($parsed | ForEach-Object { [string]$_ }) }
   elseif ($null -ne $parsed) { $argList = @([string]$parsed) }
 }
+# Convert WSL-style paths (/mnt/c/Windows/System32/notepad.exe) to native
+# Windows paths (C:\\Windows\\System32\\notepad.exe).  The model
+# frequently obtains paths via 'where.exe' or 'which' under WSL, which
+# returns the /mnt/<drive>/... form.  Windows PowerShell can't resolve
+# those, so Get-Command and Start-Process both fail with "system cannot
+# find the file specified".
+if ($app -match '^/mnt/([a-zA-Z])(/.*)$') {
+  $app = ($matches[1].ToUpper() + ':' + ($matches[2] -replace '/','\'))
+}
 # Resolve a bare name (e.g. "notepad") to its full executable path via PATH.
 $resolved = $app
 $cmd = Get-Command $app -ErrorAction SilentlyContinue -CommandType Application
 if ($cmd) { $resolved = $cmd.Source }
-# Attempt 1: direct Start-Process.
+# Attempt 1: direct Start-Process.  Defaults to ShellExecute on Windows
+# when no -NoNewWindow / -RedirectStandard* flag is set, which is what
+# we want for GUI launches.
 $launched = $false
 $directError = ''
 try {
@@ -534,12 +545,19 @@ try {
   else                       { Start-Process -FilePath $resolved }
   $launched = $true
 } catch { $directError = $_.Exception.Message }
-# Attempt 2: UseShellExecute lets Windows find the app via App Paths registry,
-# file associations, and Start Menu entries — handles display names like "Notepad".
+# Attempt 2: drop to .NET ProcessStartInfo with UseShellExecute=$true so
+# Windows resolves the app via the App Paths registry / file
+# associations / Start Menu entries (handles display names like
+# "Notepad" without an .exe).  -UseShellExecute is NOT a valid
+# Start-Process parameter, despite the misleading symmetry — it's a
+# property of System.Diagnostics.ProcessStartInfo only.
 if (-not $launched) {
   try {
-    if ($argList.Count -gt 0) { Start-Process -FilePath $app -ArgumentList $argList -UseShellExecute:$true }
-    else                       { Start-Process -FilePath $app -UseShellExecute:$true }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $app
+    $psi.UseShellExecute = $true
+    if ($argList.Count -gt 0) { $psi.Arguments = ($argList -join ' ') }
+    [void][System.Diagnostics.Process]::Start($psi)
     $launched = $true
   } catch {
     throw "Cannot launch '$app': direct=$directError; shell=$($_.Exception.Message)"
