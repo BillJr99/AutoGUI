@@ -60,10 +60,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ── Node.js 20.x ──────────────────────────────────────────────────────────
 # Debian bookworm ships Node 18; @earendil-works/pi-coding-agent requires
 # >=20.6.  Add the NodeSource APT repo with its signed key explicitly so
-# the build inputs are auditable and deterministic (no curl|bash).
+# the trust chain is auditable (avoids curl|bash).  Note: nodejs is not
+# version-pinned here, so patch releases may vary across builds; pin to
+# a specific version (e.g. nodejs=20.x.y-1nodesource1) if you need
+# fully reproducible images.
 RUN mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && chmod 644 /etc/apt/keyrings/nodesource.gpg \
     && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
         > /etc/apt/sources.list.d/nodesource.list \
     && apt-get update \
