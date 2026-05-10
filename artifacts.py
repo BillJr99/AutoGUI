@@ -105,10 +105,25 @@ class ArtifactStore:
                 except json.JSONDecodeError:
                     logger.warning("[artifacts] skipping malformed index line")
                     continue
+                if not isinstance(record, dict):
+                    logger.warning("[artifacts] skipping non-object index line")
+                    continue
                 aid = record.get("id")
                 if not aid:
                     continue
-                self._artifacts[aid] = Artifact(**record)
+                # Guard the dataclass construction: a forward-version
+                # record with extra keys raises TypeError, and any other
+                # schema mismatch can raise ValueError.  Skip the bad
+                # line rather than aborting the whole load — startup
+                # robustness matters more than perfect history.
+                try:
+                    self._artifacts[aid] = Artifact(**record)
+                except (TypeError, ValueError) as e:
+                    logger.warning(
+                        "[artifacts] skipping incompatible index record %s: %s",
+                        aid, e,
+                    )
+                    continue
         except OSError as e:
             logger.warning("[artifacts] could not load index: %s", e)
 

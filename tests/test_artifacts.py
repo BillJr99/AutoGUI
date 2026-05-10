@@ -46,3 +46,35 @@ def test_summary_includes_source_and_kind(tmp_path):
 def test_unknown_id_returns_none(tmp_path):
     store = ArtifactStore(str(tmp_path))
     assert store.get_body("artifact://nope") is None
+
+
+def test_load_skips_incompatible_index_records(tmp_path):
+    """Forward-version / corrupted index lines must not crash startup —
+    the loader should skip the bad line and load every recoverable one."""
+    import json
+    # Pre-populate index.jsonl with a mix of: valid, malformed JSON,
+    # non-object JSON, and a forward-version record carrying an
+    # unexpected field that breaks the dataclass.
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    index = tmp_path / "index.jsonl"
+    valid = {
+        "id": "artifact://aaaaaaaa", "kind": "fs_read", "source": "ok.txt",
+        "summary": "ok", "bytes_len": 2, "created": 1.0, "meta": {},
+        "body_path": "", "body_inline": "ok",
+    }
+    forward = dict(valid)
+    forward["id"] = "artifact://bbbbbbbb"
+    forward["future_field"] = "extra"   # raises TypeError on Artifact(**)
+    not_object = "[\"this is\", \"a list, not a record\"]"
+    lines = [
+        json.dumps(valid),
+        "{not valid json",
+        not_object,
+        json.dumps(forward),
+    ]
+    index.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Should not raise; should load the one valid record and skip the rest.
+    store = ArtifactStore(str(tmp_path))
+    assert store.has("artifact://aaaaaaaa")
+    assert not store.has("artifact://bbbbbbbb")

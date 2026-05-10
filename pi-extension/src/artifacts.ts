@@ -95,11 +95,26 @@ export class ArtifactStore {
       art.bodyInline = text;
     } else {
       const bodyPath = join(this.dir, `${h}.txt`);
-      await writeFile(bodyPath, text, "utf8");
-      art.bodyPath = bodyPath;
+      // Best-effort body write.  A read-only / full filesystem
+      // shouldn't fail the whole tool call that captured this
+      // observation — fall back to inline-truncated like the Python
+      // mirror, so callers still get an id and a usable preview.
+      try {
+        await writeFile(bodyPath, text, "utf8");
+        art.bodyPath = bodyPath;
+      } catch {
+        art.bodyInline = text.slice(0, INLINE_BODY_LIMIT);
+      }
     }
     this.artifacts.set(id, art);
-    await appendFile(this.indexPath, JSON.stringify(art) + "\n", "utf8");
+    // Best-effort index append: if the disk is hostile we still keep the
+    // in-memory record so get_artifact / list_artifacts work for the
+    // rest of the session.  Crash-recovery is the only thing we lose.
+    try {
+      await appendFile(this.indexPath, JSON.stringify(art) + "\n", "utf8");
+    } catch {
+      // swallow — degrades to in-memory-only for this session
+    }
     return id;
   }
 

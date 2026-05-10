@@ -89,11 +89,24 @@ export class ProgressStore {
       status: "running",
     };
     await this.atomicWrite(this.pathFor(taskId), record);
-    await appendFile(
-      this.indexPath,
-      JSON.stringify({ task_id: record.taskId, user_input: userInput.slice(0, 160), updated: record.updated, status: record.status }) + "\n",
-      "utf8",
-    );
+    // Index append is best-effort, mirroring atomicWrite() and the
+    // Python ProgressStore.  Indexing is non-critical (resume uses
+    // the per-task json files), so a transient FS error must not
+    // abort the user's /autogui task.
+    try {
+      await appendFile(
+        this.indexPath,
+        JSON.stringify({
+          task_id: record.taskId,
+          user_input: userInput.slice(0, 160),
+          updated: record.updated,
+          status: record.status,
+        }) + "\n",
+        "utf8",
+      );
+    } catch {
+      // swallow — per-task json file is the source of truth
+    }
     return record;
   }
 
@@ -128,17 +141,24 @@ export class ProgressStore {
     // Match openTask()'s index-line shape (and the Python mirror) — the
     // index is the canonical "list of every task ever seen", so dropping
     // user_input here would make the schema inconsistent for any
-    // consumer that relies on it for resume / listing.
-    await appendFile(
-      this.indexPath,
-      JSON.stringify({
-        task_id: rec.taskId,
-        user_input: rec.userInput.slice(0, 160),
-        updated: rec.updated,
-        status,
-      }) + "\n",
-      "utf8",
-    );
+    // consumer that relies on it for resume / listing.  Best-effort
+    // append: finalize() runs at task end, so a successful run must
+    // never surface as an extension error just because the index
+    // sidecar couldn't be appended to.
+    try {
+      await appendFile(
+        this.indexPath,
+        JSON.stringify({
+          task_id: rec.taskId,
+          user_input: rec.userInput.slice(0, 160),
+          updated: rec.updated,
+          status,
+        }) + "\n",
+        "utf8",
+      );
+    } catch {
+      // swallow — per-task json record is already on disk
+    }
   }
 
   async listResumable(): Promise<TaskProgress[]> {
