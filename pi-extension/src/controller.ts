@@ -59,10 +59,18 @@ export function newPlan(): Plan {
 export function planFromDict(data: Record<string, unknown>): Plan {
   const stepsData = (data["steps"] as Array<Record<string, unknown>>) ?? [];
   const steps: PlanStep[] = stepsData.map((sd) => {
+    // Only treat the value as a predicate when it's a non-empty object
+    // with a recognisable kind.  An empty `{}` is truthy in JS, so
+    // accepting it would trigger spurious renderForPrompt output and
+    // a spurious check_predicate request from the model.
     const rawPred = sd["predicate"];
-    const predicate = (rawPred && typeof rawPred === "object" && !Array.isArray(rawPred))
-      ? (rawPred as PlanPredicate)
-      : undefined;
+    let predicate: PlanPredicate | undefined;
+    if (
+      rawPred && typeof rawPred === "object" && !Array.isArray(rawPred)
+      && Object.keys(rawPred).length > 0
+    ) {
+      predicate = rawPred as PlanPredicate;
+    }
     const risks = Array.isArray(sd["risks"])
       ? (sd["risks"] as unknown[]).map((r) => String(r))
       : [];
@@ -114,7 +122,12 @@ export function planToDict(plan: Plan): Record<string, unknown> {
       // Only emit `predicate` when present so a step without one doesn't
       // pollute the wire payload with a null.  Mirrors the Python
       // controller.py behaviour.
-      if (s.predicate) out.predicate = s.predicate;
+      // Only emit `predicate` when it has meaningful content; an
+      // empty object would be truthy here but pollute the wire payload
+      // and (worse) make the TS reader treat the step as predicated.
+      if (s.predicate && Object.keys(s.predicate).length > 0) {
+        out.predicate = s.predicate;
+      }
       return out;
     }),
     created: plan.created,
@@ -151,7 +164,9 @@ export function renderForPrompt(plan: Plan): string {
     const head = `${marker[s.status]} ${i + 1}. (${s.id}) ${s.goal}`;
     const extras: string[] = [];
     if (s.expected) extras.push(`expected: ${s.expected}`);
-    if (s.predicate) extras.push(`predicate: ${JSON.stringify(s.predicate)}`);
+    if (s.predicate && Object.keys(s.predicate).length > 0) {
+      extras.push(`predicate: ${JSON.stringify(s.predicate)}`);
+    }
     if (s.toolsHint.length) extras.push(`tools: ${s.toolsHint.join(", ")}`);
     if (s.dependsOn.length) extras.push(`depends: ${s.dependsOn.join(", ")}`);
     if (s.risks.length) extras.push(`risks: ${s.risks.slice(0, 3).join("; ")}`);

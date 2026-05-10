@@ -77,7 +77,7 @@ ${artifactsOn ? "- For pure read-only lookups, prefer get_artifact / list_artifa
 - Adapt the plan if the screen state diverges from what a step expects.
 - For trivial single-step tasks, the plan may be a single line.
 
-` : "")}${artifactsOn ? `Large observations (file bodies, page text, command stdout > 4KB) are auto-stored as artifacts.  The tool result will contain a preview plus an `+"`artifact_id`"+` you can fetch later with get_artifact.  Use list_artifacts before re-reading a file you already read.
+` : "")}${artifactsOn ? `Large observations (file bodies, page text, command stdout > 4KB) are auto-stored as artifacts.  The tool result will contain a preview plus an \`artifact_id\` you can fetch later with get_artifact.  Use list_artifacts before re-reading a file you already read.
 
 ` : ""}${progressOn ? `This task has a persistent progress record. Re-running the same task text will resume — call plan_get on session start to see what was already done.
 

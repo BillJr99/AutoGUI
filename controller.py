@@ -56,7 +56,13 @@ class PlanStep:
     id: str
     goal: str
     expected: str = ""               # human-readable post-condition
-    predicate: dict = field(default_factory=dict)   # typed predicate (predicates.py)
+    # ``predicate`` is OPTIONAL — many steps don't need a typed
+    # post-condition.  An empty dict means "no predicate"; we keep
+    # the in-memory default an empty dict for ergonomics but drop the
+    # key from to_public()/from_dict so on-disk and wire payloads
+    # don't carry a spurious ``predicate: {}`` (which is truthy in JS
+    # and would trigger spurious rendering on the TS side).
+    predicate: dict = field(default_factory=dict)
     tools_hint: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)   # pre-mortem risk notes
@@ -69,6 +75,10 @@ class PlanStep:
     def to_public(self) -> dict[str, Any]:
         d = asdict(self)
         d["status"] = self.status.value
+        # Empty predicate / risks / etc. are noise on the wire; predicate
+        # in particular is ambiguous on the TS side where {} is truthy.
+        if not d.get("predicate"):
+            d.pop("predicate", None)
         return d
 
 

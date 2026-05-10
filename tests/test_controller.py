@@ -132,3 +132,19 @@ def test_to_dict_round_trip_preserves_predicate_and_risks():
     assert plan2.steps[0].predicate["path"] == "/tmp/x"
     assert plan2.steps[0].risks == ["one", "two"]
     assert plan2.preflight == [{"kind": "app", "target": "vim"}]
+
+
+def test_to_public_drops_empty_predicate():
+    """Steps without a predicate must NOT serialize {predicate: {}};
+    that's noise on the wire and is truthy on the TS side, where it
+    would cause spurious renderForPrompt output and unnecessary
+    check_predicate calls from the model."""
+    step = PlanStep(id="s1", goal="g")  # default predicate is {}
+    serialized = step.to_public()
+    assert "predicate" not in serialized
+
+    step_with = PlanStep(
+        id="s2", goal="g",
+        predicate={"kind": "file_exists", "path": "/tmp/x"},
+    )
+    assert step_with.to_public()["predicate"] == {"kind": "file_exists", "path": "/tmp/x"}
