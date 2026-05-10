@@ -166,26 +166,25 @@ class WSLBackend(DesktopBackend):
         try:
             proc = await asyncio.create_subprocess_exec(
                 "powershell.exe",
-                # -OutputFormat Text keeps the error / warning / info
-                # streams as plain UTF-8 text instead of CLIXML-encoded
-                # PowerShell objects.  Without this any non-success
-                # stream comes back wrapped in
-                # "#< CLIXML\r\n<Objs ...>" which is unreadable to the
-                # user and useless for diagnosing screenshot failures.
-                "-NoProfile", "-NonInteractive", "-OutputFormat", "Text",
-                "-EncodedCommand", encoded,
+                # NOTE: do NOT add -OutputFormat Text here.  Main branch
+                # (which the user confirmed worked) uses just
+                # -NoProfile -NonInteractive -EncodedCommand, and
+                # adding -OutputFormat Text in fbf58bd silently broke
+                # screenshots — PowerShell echoed the source script
+                # back as stderr instead of executing it.  The
+                # _decode_clixml helper below handles any CLIXML that
+                # PowerShell DOES emit on stderr without needing the
+                # -OutputFormat flag.
+                "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             stdout_text = stdout.decode("utf-8", errors="replace").strip()
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
-            # Belt-and-suspenders: even with -OutputFormat Text some
-            # PowerShell setups (older 5.1 builds, certain pipeline
-            # configurations) still emit CLIXML on stderr.  Strip the
-            # XML envelope and pull the actual <S S="Error"> message
-            # text so the user sees a real diagnostic instead of an
-            # XML blob.
+            # Decode CLIXML if PowerShell serialized non-success
+            # streams that way (older 5.1 builds with certain
+            # pipeline shapes).  No-op for plain-text stderr.
             if stderr_text.startswith("#< CLIXML"):
                 stderr_text = _decode_clixml(stderr_text)
             return (
@@ -218,21 +217,23 @@ class WSLBackend(DesktopBackend):
         try:
             from PIL import Image
 
-            # Restored to the simple bare-expression style that worked
-            # before the try/catch wrapper from 18fa3fa accidentally
-            # broke parsing under the user's WSL PowerShell (the
-            # combination of -EncodedCommand + try {...} catch {...}
-            # at the script's top level made PowerShell echo the
-            # source back as stderr instead of executing it).  The
-            # capture body now just uses bare expressions for output
-            # (PowerShell auto-emits expression results to the success
-            # stream) and lets PowerShell's default error handler send
-            # any failure to stderr — which our _decode_clixml helper
-            # cleans up downstream.  $ErrorActionPreference='Stop' is
-            # kept so silent failures still raise.
+            # Script body restored byte-for-byte to the version on main
+            # (which the user confirmed worked).  Specifically:
+            #   - NO $ErrorActionPreference='Stop'.  Add-Type emits a
+            #     non-terminating warning when the assembly is already
+            #     loaded, and 'Stop' promoted that warning to a fatal
+            #     error which made the entire script abort before
+            #     producing output (this was the empty-base64 +
+            #     "stderr=script content" symptom the user kept hitting).
+            #   - Write-Host for the metadata line, NOT a bare string.
+            #     Bare strings hit the success stream too, but
+            #     Write-Host has reliably worked across every WSL
+            #     PowerShell variant the user tested on main.
+            #   - NO try/catch wrapper.  PowerShell's default behaviour
+            #     prints a real exception to stderr; our _decode_clixml
+            #     helper cleans up the CLIXML envelope downstream.
             if region:
                 script = (
-                    "$ErrorActionPreference = 'Stop'\n"
                     "Add-Type -AssemblyName System.Drawing\n"
                     "$bmp = New-Object System.Drawing.Bitmap __W__, __H__\n"
                     "$g   = [System.Drawing.Graphics]::FromImage($bmp)\n"
@@ -241,15 +242,14 @@ class WSLBackend(DesktopBackend):
                     "$ms  = New-Object System.IO.MemoryStream\n"
                     "$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)\n"
                     "$bmp.Dispose()\n"
-                    "'monitors=1 w=__W__ h=__H__'\n"
-                    "[Convert]::ToBase64String($ms.ToArray())\n"
+                    "Write-Host 'monitors=1 w=__W__ h=__H__'\n"
+                    "[Convert]::ToBase64String($ms.ToArray())"
                 ).replace("__X__", str(region["x"])) \
                  .replace("__Y__", str(region["y"])) \
                  .replace("__W__", str(region["width"])) \
                  .replace("__H__", str(region["height"]))
             else:
                 script = (
-                    "$ErrorActionPreference = 'Stop'\n"
                     "Add-Type -AssemblyName System.Windows.Forms\n"
                     "Add-Type -AssemblyName System.Drawing\n"
                     "$scr    = [System.Windows.Forms.Screen]::AllScreens\n"
@@ -267,8 +267,8 @@ class WSLBackend(DesktopBackend):
                     "$ms     = New-Object System.IO.MemoryStream\n"
                     "$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)\n"
                     "$bmp.Dispose()\n"
-                    "\"monitors=$n w=$w h=$h\"\n"
-                    "[Convert]::ToBase64String($ms.ToArray())\n"
+                    "Write-Host \"monitors=$n w=$w h=$h\"\n"
+                    "[Convert]::ToBase64String($ms.ToArray())"
                 )
 
             returncode, stdout, stderr = await self._ps(script, timeout=30)
