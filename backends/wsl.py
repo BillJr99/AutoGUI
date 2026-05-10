@@ -20,6 +20,7 @@ Requirements
 
 import asyncio
 import base64
+import binascii
 import io
 import json
 import logging
@@ -202,9 +203,24 @@ class WSLBackend(DesktopBackend):
             if returncode != 0 or not stdout:
                 return {"error": f"Screenshot failed (code {returncode}). stderr={stderr!r}"}
 
+            # Find the metadata line (PowerShell sometimes prepends
+            # blank lines or progress junk before "monitors=...") and
+            # treat everything after it as the base64 payload.  Falling
+            # back to "first line is meta, rest is b64" as before only
+            # works when stdout is exactly two lines; CRLF/CR splitting,
+            # PSReadLine output, or Write-Host buffering can break that.
             lines = stdout.splitlines()
-            meta_line = lines[0] if lines else ""
-            b64_data  = "".join(lines[1:]) if len(lines) > 1 else stdout
+            meta_idx = next(
+                (i for i, ln in enumerate(lines) if ln.lstrip().startswith("monitors=")),
+                -1,
+            )
+            if meta_idx >= 0:
+                meta_line = lines[meta_idx]
+                b64_data = "".join(ln.strip() for ln in lines[meta_idx + 1:])
+            else:
+                # No metadata found — treat the whole stdout as base64.
+                meta_line = ""
+                b64_data = "".join(ln.strip() for ln in lines)
 
             # Parse metadata if present
             monitors = 1
@@ -215,8 +231,37 @@ class WSLBackend(DesktopBackend):
                     except ValueError:
                         pass
 
-            img_bytes = base64.b64decode(b64_data)
-            img = Image.open(io.BytesIO(img_bytes))
+            if not b64_data:
+                # Empty base64 means PowerShell ran but emitted nothing
+                # parseable as image data.  Image.open would later raise
+                # ``cannot identify image file`` — surface a clearer
+                # diagnostic instead so the user knows where it went wrong.
+                return {
+                    "error": (
+                        "Screenshot failed: empty base64 payload from PowerShell. "
+                        f"stdout_head={stdout[:200]!r} stderr_head={stderr[:200]!r}"
+                    ),
+                }
+            try:
+                img_bytes = base64.b64decode(b64_data)
+            except (ValueError, binascii.Error) as e:
+                return {
+                    "error": (
+                        f"Screenshot failed: base64 decode error ({e}). "
+                        f"b64_head={b64_data[:120]!r}"
+                    ),
+                }
+            try:
+                img = Image.open(io.BytesIO(img_bytes))
+                img.load()  # force the decode now so any UnidentifiedImageError surfaces here
+            except Exception as e:
+                return {
+                    "error": (
+                        f"Screenshot failed: PIL could not decode "
+                        f"{len(img_bytes)} bytes ({type(e).__name__}: {e}). "
+                        f"First 16 bytes (hex): {img_bytes[:16].hex()}"
+                    ),
+                }
 
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
