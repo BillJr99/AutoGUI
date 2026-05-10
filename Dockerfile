@@ -3,11 +3,13 @@
 # Build:
 #   docker build -t autogui .
 #
-# Run (interactive TUI, self-contained image):
+# Run (interactive bash shell, self-contained image):
 #   docker run -it --rm \
 #     -e DISPLAY=$DISPLAY \
 #     -v /tmp/.X11-unix:/tmp/.X11-unix \
 #     autogui
+#
+# Then inside the container run `python main.py` or `pi` as needed.
 #
 # Run (mount your local clone so edits take effect without rebuilding):
 #   docker run -it --rm \
@@ -75,6 +77,12 @@ COPY . .
 # outside /app, so it survives volume mounts.
 RUN bash scripts/install-dependencies.sh
 
+# ── Pi Coding Agent ───────────────────────────────────────────────────────
+# Install the Pi Coding Agent CLI globally so `pi` is available on PATH.
+# Uses @earendil-works/pi-coding-agent (the current package, not the legacy
+# unscoped pi-coding-agent which is deprecated).
+RUN npm install -g @earendil-works/pi-coding-agent
+
 # ── Volume ────────────────────────────────────────────────────────────────
 # /app is the working directory read by main.py.  Mount your local clone
 # here to develop without rebuilding:
@@ -86,4 +94,4 @@ RUN bash scripts/install-dependencies.sh
 VOLUME ["/app"]
 
 # ── Entry point ────────────────────────────────────────────────────────────
-CMD ["python", "main.py"]
+CMD ["bash"]
