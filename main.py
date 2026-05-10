@@ -659,27 +659,77 @@ Examples
 
 
 def _suppress_windows_proactor_resource_warnings() -> None:
-    """Silence the noisy "I/O operation on closed pipe" /
-    "unclosed transport" ResourceWarnings that the Python 3.13 Windows
+    """Silence the noisy ``ValueError: I/O operation on closed pipe``
+    + ``unclosed transport`` exceptions that Python 3.13's Windows
     ProactorEventLoop emits at process exit when subprocesses we spawned
     (PowerShell helpers for desktop_launch, screenshot, etc.) get torn
     down by the GC after the loop has already closed.
 
-    The transports ARE closed cleanly at runtime — this is a known
-    cosmetic race in CPython's __del__ that fires during interpreter
-    shutdown.  The warnings flood the user's terminal on Ctrl+C and add
-    no diagnostic value, so suppress them.  Only fires on Windows; on
-    Linux/macOS asyncio uses the SelectorEventLoop which doesn't have
-    this issue.
+    The transports ARE closed cleanly at runtime — this is a CPython
+    cosmetic bug:
+      _ProactorBasePipeTransport.__del__ -> _warn(f"... {self!r}", ...)
+      where __repr__ calls self._sock.fileno() which raises
+      ValueError on the already-closed pipe.  The exception escapes
+      __del__ and Python prints it via sys.unraisablehook, NOT
+      through the warnings module — which is why a previous attempt
+      that only installed warnings.filterwarnings("ignore", ...) for
+      the ResourceWarning category did nothing.
+
+    Install a custom unraisablehook that swallows JUST these specific
+    failures (ValueError from the proactor transport classes during
+    teardown, and the ResourceWarning that would have followed) while
+    leaving every other unraisable exception visible — those are real
+    bugs we want to see.
+
+    Only fires on Windows; on Linux/macOS asyncio uses the
+    SelectorEventLoop which doesn't have this issue.
     """
     if sys.platform != "win32":
         return
-    import warnings
-    warnings.filterwarnings(
-        "ignore",
-        message=r"unclosed transport.*",
-        category=ResourceWarning,
+
+    _previous_hook = sys.unraisablehook
+    _NOISY_OBJ_NAMES = (
+        "_ProactorBasePipeTransport.__del__",
+        "BaseSubprocessTransport.__del__",
+        "_ProactorReadPipeTransport.__del__",
+        "_ProactorWritePipeTransport.__del__",
+        "_ProactorSocketTransport.__del__",
     )
+
+    def _hook(args: "sys.UnraisableHookArgs") -> None:  # type: ignore[name-defined]
+        # The unraisable's `object` is the bound __del__ method whose
+        # repr is e.g. "<function _ProactorBasePipeTransport.__del__
+        # at 0x...>".  Match by string so we don't have to import the
+        # private asyncio classes (which are platform-specific).
+        try:
+            obj_repr = repr(args.object)
+        except Exception:
+            obj_repr = ""
+        is_noisy_source = any(name in obj_repr for name in _NOISY_OBJ_NAMES)
+
+        # Also catch the exact "unclosed transport" ResourceWarning if
+        # it ever does reach this hook directly.
+        is_unclosed_transport_warning = (
+            isinstance(args.exc_value, ResourceWarning)
+            and "unclosed transport" in str(args.exc_value)
+        )
+
+        # And the ValueError raised when __repr__ tries to read fileno
+        # on the already-closed pipe.
+        is_closed_pipe_error = (
+            isinstance(args.exc_value, ValueError)
+            and "closed pipe" in str(args.exc_value)
+        )
+
+        if is_noisy_source and (is_unclosed_transport_warning or is_closed_pipe_error):
+            return  # silently swallow
+
+        # Anything else is a real unraisable exception — defer to the
+        # previous hook (usually CPython's default which prints to
+        # stderr) so we don't accidentally hide a bug.
+        _previous_hook(args)
+
+    sys.unraisablehook = _hook
 
 
 def main():
