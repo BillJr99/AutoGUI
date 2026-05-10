@@ -120,8 +120,10 @@ class WaylandBackend(DesktopBackend):
                 "base64_png": b64,
             }
         except FileNotFoundError:
+            logger.warning("[wayland:screenshot] grim not found on PATH")
             return {"error": "grim not found — install with: sudo apt install grim"}
         except Exception as e:
+            logger.warning("[wayland:screenshot] capture failed: %s", e)
             logger.debug("[wayland:screenshot] %s", traceback.format_exc())
             return {"error": str(e)}
 

@@ -412,6 +412,11 @@ class AgentTUI(App):
         # don't paint over the TUI layout.  Installed on mount, removed
         # on unmount.  See _install_log_handler for details.
         self._log_handler: logging.Handler | None = None
+        # stderr/stdout StreamHandlers that were attached to the root
+        # logger before mount; we detach them on install (so they don't
+        # paint the terminal) and re-attach them on uninstall so the
+        # process's logging state is restored when the TUI exits.
+        self._displaced_handlers: list[logging.Handler] = []
 
     # ------------------------------------------------------------------
     # Composition
@@ -702,28 +707,49 @@ class AgentTUI(App):
         if self._log_handler is not None:
             return
         root = logging.getLogger()
-        # Drop any stderr StreamHandler main.py installed — those write
-        # ``[WARNING] …`` lines straight to the terminal which paints
-        # over the Textual layout.  The file handler stays so logs are
-        # still persisted to disk.
+        # Drop any stderr/stdout StreamHandler main.py installed — those
+        # write ``[WARNING] …`` lines straight to the terminal which
+        # paints over the Textual layout.  The file handler stays so
+        # logs are still persisted to disk.  Each removed handler is
+        # remembered so _uninstall_log_handler can restore them.
         for h in list(root.handlers):
             if isinstance(h, logging.StreamHandler) and not isinstance(
                 h, logging.FileHandler,
             ) and h.stream in (sys.stderr, sys.stdout):
                 root.removeHandler(h)
+                self._displaced_handlers.append(h)
         handler = _TUILogHandler(self)
         root.addHandler(handler)
         self._log_handler = handler
 
     def _uninstall_log_handler(self) -> None:
-        """Detach the TUI log handler.  Called from action_quit so root
-        logger state is clean if the agent is reused outside a TUI."""
+        """Detach the TUI log handler and re-attach any stderr/stdout
+        handlers we displaced during install.  Called from action_quit
+        AND on_unmount so the process's root-logger state is restored
+        regardless of how the TUI exits."""
+        root = logging.getLogger()
         if self._log_handler is not None:
             try:
-                logging.getLogger().removeHandler(self._log_handler)
+                root.removeHandler(self._log_handler)
             except Exception:
                 pass
             self._log_handler = None
+        for h in self._displaced_handlers:
+            try:
+                # Don't re-attach a handler that's somehow already on
+                # the root (e.g. a third party also added it back).
+                if h not in root.handlers:
+                    root.addHandler(h)
+            except Exception:
+                pass
+        self._displaced_handlers.clear()
+
+    def on_unmount(self) -> None:
+        """Textual lifecycle hook — fires for every shutdown path
+        (Ctrl+C, action_quit, parent app exit, exception during teardown).
+        Belt-and-suspenders cleanup so we never leave the process with
+        a TUI log handler that points at a destroyed RichLog widget."""
+        self._uninstall_log_handler()
 
     # ------------------------------------------------------------------
     # Reactive watchers and helpers

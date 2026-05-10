@@ -72,6 +72,7 @@ class MacOSBackend(DesktopBackend):
                 "base64_png": b64,
             }
         except Exception as e:
+            logger.warning("[macos:screenshot] capture failed: %s", e)
             logger.debug("[macos:screenshot] %s", traceback.format_exc())
             return {"error": str(e)}
 

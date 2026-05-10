@@ -243,6 +243,13 @@ class WSLBackend(DesktopBackend):
             }
 
         except Exception as e:
+            # WARNING (not DEBUG) so the failure is visible in the user's
+            # log + TUI bridge.  WSL screenshots fail in practice when
+            # PowerShell times out or the System.Drawing assemblies are
+            # unavailable; hiding it at DEBUG made the root cause
+            # invisible and produced misleading "Auto-screenshot saved
+            # (vision off): ? (None×None)" messages downstream.
+            logger.warning("[wsl:screenshot] capture failed: %s", e)
             logger.debug("[wsl:screenshot] %s", traceback.format_exc())
             return {"error": str(e)}
 
