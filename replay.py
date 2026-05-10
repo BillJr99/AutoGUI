@@ -143,18 +143,38 @@ async def _check_drift(step: dict, registry) -> str:
 
     expected_hash = anchor.get("screen_phash_b64")
     if expected_hash and "desktop_screenshot" in registry.list_tools():
+        # The default fallback for visual_diff.diff() with a missing hash
+        # is fraction_changed=0.0, which would silently report "no drift"
+        # on systems without PIL or where the screenshot returned no
+        # base64_png.  Track whether each side is actually available so
+        # we can surface "screen hash unavailable" as a distinct note
+        # instead of letting the user assume the screen looked identical.
         try:
             from visual_diff import diff as _vdiff, hash_b64 as _vhash
+            import base64 as _b64
+            try:
+                expected = _b64.b64decode(expected_hash)
+            except Exception:
+                expected = None
             raw = await registry.dispatch("desktop_screenshot", {})
             shot = json.loads(raw)
-            curr = _vhash(shot.get("base64_png", ""))
-            import base64 as _b64
-            expected = _b64.b64decode(expected_hash) if expected_hash else None
-            d = _vdiff(expected, curr)
-            if d.fraction_changed > 0.5:
-                notes.append(f"screen perceptual hash differs ({d.fraction_changed:.0%})")
-        except Exception:
-            pass
+            png_b64 = shot.get("base64_png", "")
+            curr = _vhash(png_b64) if png_b64 else None
+            if expected is None or curr is None:
+                missing = []
+                if expected is None:
+                    missing.append("anchor")
+                if curr is None:
+                    missing.append("current")
+                notes.append(
+                    f"screen hash unavailable ({'/'.join(missing)} hash missing)"
+                )
+            else:
+                d = _vdiff(expected, curr)
+                if d.fraction_changed > 0.5:
+                    notes.append(f"screen perceptual hash differs ({d.fraction_changed:.0%})")
+        except Exception as e:
+            notes.append(f"screen hash check failed: {type(e).__name__}")
     return "; ".join(notes)
 
 
