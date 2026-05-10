@@ -24,6 +24,51 @@ export interface TaskProgress {
   status: "running" | "done" | "failed" | "abandoned";
 }
 
+/** Serialise a TaskProgress to the Python on-disk schema (snake_case keys).
+ *  ``progress.py``'s ``TaskProgress`` dataclass + ``asdict()`` produces
+ *  snake_case, and the README/header advertise that both runtimes can
+ *  share a progress directory.  Cross-runtime resume requires us to
+ *  match Python on the wire. */
+function progressToPython(rec: TaskProgress): Record<string, unknown> {
+  return {
+    task_id: rec.taskId,
+    user_input: rec.userInput,
+    created: rec.created,
+    updated: rec.updated,
+    completed_step_ids: rec.completedStepIds,
+    failed_step_ids: rec.failedStepIds,
+    plan_snapshot: rec.planSnapshot,
+    checkpoint_data: rec.checkpointData,
+    status: rec.status,
+  };
+}
+
+/** Parse from disk.  Accept the Python schema as authoritative AND the
+ *  legacy camelCase shape that older extension builds wrote, so existing
+ *  in-flight tasks still resume after the upgrade. */
+function progressFromDisk(parsed: unknown): TaskProgress | undefined {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const o = parsed as Record<string, unknown>;
+  const pick = <T,>(snake: string, camel: string, fallback: T): T => {
+    const v = o[snake] !== undefined ? o[snake] : o[camel];
+    return (v ?? fallback) as T;
+  };
+  const taskId = pick("task_id", "taskId", "");
+  if (!taskId) return undefined;
+  const status = pick("status", "status", "running") as TaskProgress["status"];
+  return {
+    taskId,
+    userInput: pick("user_input", "userInput", ""),
+    created: pick("created", "created", Date.now() / 1000),
+    updated: pick("updated", "updated", Date.now() / 1000),
+    completedStepIds: pick("completed_step_ids", "completedStepIds", []),
+    failedStepIds: pick("failed_step_ids", "failedStepIds", []),
+    planSnapshot: pick("plan_snapshot", "planSnapshot", {}),
+    checkpointData: pick("checkpoint_data", "checkpointData", {}),
+    status,
+  };
+}
+
 export class ProgressStore {
   private readonly dir: string;
   private readonly indexPath: string;
@@ -49,7 +94,7 @@ export class ProgressStore {
   private async atomicWrite(path: string, data: TaskProgress): Promise<void> {
     const tmp = path + ".tmp";
     try {
-      await writeFile(tmp, JSON.stringify(data, null, 2), "utf8");
+      await writeFile(tmp, JSON.stringify(progressToPython(data), null, 2), "utf8");
       await rename(tmp, path);
     } catch {
       // best-effort write
@@ -62,7 +107,7 @@ export class ProgressStore {
     if (!existsSync(p)) return undefined;
     try {
       const text = await readFile(p, "utf8");
-      return JSON.parse(text) as TaskProgress;
+      return progressFromDisk(JSON.parse(text));
     } catch {
       return undefined;
     }
@@ -170,8 +215,8 @@ export class ProgressStore {
         if (!f.endsWith(".json") || f === "index.jsonl") continue;
         try {
           const text = await readFile(join(this.dir, f), "utf8");
-          const rec = JSON.parse(text) as TaskProgress;
-          if (rec.status === "running") entries.push(rec);
+          const rec = progressFromDisk(JSON.parse(text));
+          if (rec && rec.status === "running") entries.push(rec);
         } catch {
           // skip
         }

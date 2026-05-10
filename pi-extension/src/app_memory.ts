@@ -41,6 +41,44 @@ function emptyRecord(app: string): AppRecord {
   };
 }
 
+/** Serialise an AppRecord to the Python on-disk schema (snake_case keys).
+ *  ``app_memory.py`` uses snake_case, and the README/header advertise that
+ *  both runtimes can share a memory directory — so the wire format MUST
+ *  match the Python mirror or cross-runtime resume falls over. */
+function recordToPython(rec: AppRecord): Record<string, unknown> {
+  return {
+    app: rec.app,
+    failure_counts: rec.failureCounts,
+    success_counts: rec.successCounts,
+    last_failures: rec.lastFailures,
+    notes: rec.notes,
+    updated: rec.updated,
+  };
+}
+
+/** Parse from disk.  Accept the Python schema as the authoritative format
+ *  AND the legacy camelCase shape that older extension builds wrote, so
+ *  records produced before this migration still load. */
+function recordFromDisk(parsed: unknown, app: string): AppRecord {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return emptyRecord(app);
+  }
+  const o = parsed as Record<string, unknown>;
+  const pick = <T,>(snake: string, camel: string, fallback: T): T => {
+    const v = o[snake] !== undefined ? o[snake] : o[camel];
+    return (v ?? fallback) as T;
+  };
+  const rec: AppRecord = {
+    app: typeof o["app"] === "string" && o["app"] ? (o["app"] as string) : normalizeApp(app),
+    failureCounts: pick("failure_counts", "failureCounts", {}),
+    successCounts: pick("success_counts", "successCounts", {}),
+    lastFailures: pick("last_failures", "lastFailures", []),
+    notes: pick("notes", "notes", []),
+    updated: typeof o["updated"] === "number" ? (o["updated"] as number) : Date.now() / 1000,
+  };
+  return rec;
+}
+
 export class AppMemory {
   /**
    * ``allowWrites`` gates the mutators (recordFailure / recordSuccess /
@@ -70,7 +108,7 @@ export class AppMemory {
     if (!existsSync(p)) return emptyRecord(app);
     try {
       const text = await readFile(p, "utf8");
-      return JSON.parse(text) as AppRecord;
+      return recordFromDisk(JSON.parse(text), app);
     } catch {
       return emptyRecord(app);
     }
@@ -85,7 +123,7 @@ export class AppMemory {
     const p = this.pathFor(rec.app);
     const tmp = p + ".tmp";
     try {
-      await writeFile(tmp, JSON.stringify(rec, null, 2), "utf8");
+      await writeFile(tmp, JSON.stringify(recordToPython(rec), null, 2), "utf8");
       await rename(tmp, p);
       await appendFile(
         join(this.dir, "index.jsonl"),
