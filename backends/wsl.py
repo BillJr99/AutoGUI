@@ -160,8 +160,32 @@ class WSLBackend(DesktopBackend):
         try:
             from PIL import Image
 
+            # $ErrorActionPreference='Stop' makes PowerShell THROW on
+            # any error in the pipeline so it lands in stderr instead
+            # of silently producing empty stdout (which then made
+            # base64.b64decode return zero bytes and PIL raise the
+            # opaque "cannot identify image file" error the user kept
+            # hitting).  Wrapping in try { ... } catch { Write-Error
+            # ... } with `-join "`r`n"` for the inner exception messages
+            # gets us the actual System.Drawing / Add-Type failure
+            # text on the WSL side instead of a silent empty payload.
+            # Write-Output is used for both the metadata line and the
+            # base64 payload so they reliably reach the success stream
+            # (Write-Host goes through the host's information stream
+            # which is dropped by some powershell.exe invocations).
+            preamble = (
+                "$ErrorActionPreference = 'Stop'\n"
+                "try {\n"
+            )
+            postamble = (
+                "} catch {\n"
+                "  $msg = ($_.Exception.GetType().FullName + ': ' + $_.Exception.Message)\n"
+                "  Write-Error $msg\n"
+                "  exit 2\n"
+                "}\n"
+            )
             if region:
-                script = (
+                body = (
                     "Add-Type -AssemblyName System.Drawing\n"
                     "$bmp = New-Object System.Drawing.Bitmap __W__, __H__\n"
                     "$g   = [System.Drawing.Graphics]::FromImage($bmp)\n"
@@ -170,14 +194,14 @@ class WSLBackend(DesktopBackend):
                     "$ms  = New-Object System.IO.MemoryStream\n"
                     "$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)\n"
                     "$bmp.Dispose()\n"
-                    "Write-Host 'monitors=1 w=__W__ h=__H__'\n"
-                    "[Convert]::ToBase64String($ms.ToArray())"
+                    "Write-Output 'monitors=1 w=__W__ h=__H__'\n"
+                    "Write-Output ([Convert]::ToBase64String($ms.ToArray()))\n"
                 ).replace("__X__", str(region["x"])) \
                  .replace("__Y__", str(region["y"])) \
                  .replace("__W__", str(region["width"])) \
                  .replace("__H__", str(region["height"]))
             else:
-                script = (
+                body = (
                     "Add-Type -AssemblyName System.Windows.Forms\n"
                     "Add-Type -AssemblyName System.Drawing\n"
                     "$scr    = [System.Windows.Forms.Screen]::AllScreens\n"
@@ -195,9 +219,10 @@ class WSLBackend(DesktopBackend):
                     "$ms     = New-Object System.IO.MemoryStream\n"
                     "$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)\n"
                     "$bmp.Dispose()\n"
-                    "Write-Host \"monitors=$n w=$w h=$h\"\n"
-                    "[Convert]::ToBase64String($ms.ToArray())"
+                    "Write-Output \"monitors=$n w=$w h=$h\"\n"
+                    "Write-Output ([Convert]::ToBase64String($ms.ToArray()))\n"
                 )
+            script = preamble + body + postamble
 
             returncode, stdout, stderr = await self._ps(script, timeout=30)
             if returncode != 0 or not stdout:
