@@ -14,9 +14,13 @@ Why a perceptual hash instead of pixel diff?
 We use a 16x16 mean-luma "difference hash" — Hamming distance is a robust
 similarity metric and keeps the hash small enough to log per-step.
 
-No external image library required: PIL is already a transitive
-requirement of pyautogui, but if it's missing we fall back to a content-
-hash diff and degrade gracefully.
+PIL is a transitive requirement of pyautogui.  When it's available
+hash_b64 returns a perceptual hash of the decoded image; when it's
+missing we return None and ``diff()`` reports "hash unavailable" (a
+DiffResult with fraction_changed=0 and likely_no_change=False) so
+callers know the visual check was skipped, NOT that the screen is
+unchanged.  Callers like the controller's drift-check then surface
+the unavailability rather than silently treating it as "no drift".
 """
 
 from __future__ import annotations

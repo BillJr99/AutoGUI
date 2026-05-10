@@ -15,8 +15,12 @@ Checks supported
   tool          — a tool name is registered with the registry
   command       — a shell command exits 0
 
-Specs are inferred from a plan's tools_hint + risks fields, plus an
-explicit ``preflight`` array on the plan itself.  Callers can also
+Specs are inferred from three sources on the plan: an explicit
+``preflight`` array on the plan itself, each step's ``tools_hint``
+list (proposed tool name → tool check), and predicate paths on
+``file_exists`` / ``file_contains`` post-conditions (path → file
+check).  ``risks`` is a free-form pre-mortem field surfaced to the
+planner; it is NOT consumed by inference.  Callers can also
 construct a list manually and call ``run_preflight`` directly.
 """
 

@@ -8,8 +8,9 @@ the full agent loop bloats the main history with observations the user
 will never care about.
 
 The ``Subagent`` runs a one-shot LLM call with a tightly scoped tool
-allow-list (defaults to fs_read + fs_list, no desktop or shell), feeds
-it any pre-fetched artifacts the parent already has, and returns a
+allow-list (defaults to fs_read + fs_list + browser_get_text — all
+read-only; no desktop click/keystroke or shell execution), feeds it
+any pre-fetched artifacts the parent already has, and returns a
 short structured answer.
 
 It is deliberately a thin wrapper over the existing ``OpenWebUIClient``
