@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile, appendFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 const INLINE_BODY_LIMIT = 4096;
 
@@ -165,4 +165,3 @@ export async function pathExists(p: string): Promise<boolean> {
   }
 }
 
-void dirname;  // keep import used (for future helpers); silences linter

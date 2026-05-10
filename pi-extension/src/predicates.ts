@@ -11,6 +11,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
+import type { DesktopBackend } from "./types.js";
 
 function isRegularFile(path: string): boolean {
   // Match Python predicates._check_file_presence: directories must NOT
@@ -22,8 +23,6 @@ function isRegularFile(path: string): boolean {
     return false;
   }
 }
-import { dirname } from "node:path";
-import type { DesktopBackend } from "./types.js";
 
 export const PREDICATE_KINDS = [
   "window_title_contains",
@@ -243,6 +242,3 @@ export async function checkPredicate(
     }
   }
 }
-
-void dirname;
-void statSync;

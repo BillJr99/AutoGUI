@@ -78,8 +78,14 @@ def test_structured_images_produce_nontrivial_distance():
 
 
 def test_hash_b64_handles_invalid_input():
+    """Empty / malformed base64 must always degrade to None — callers
+    rely on that to skip the visual-diff verifier without exception."""
     assert hash_b64("") is None
-    assert hash_b64("not-base64!!") is None or isinstance(hash_b64("not-base64!!"), bytes)
+    # `"not-base64!!"` either fails base64 decoding (binascii.Error,
+    # caught and returned as None) or decodes to non-PNG bytes that PIL
+    # rejects (also returned as None).  Either way the contract is None,
+    # so pin that exact result rather than hedging on the result type.
+    assert hash_b64("not-base64!!") is None
 
 
 def test_diff_handles_missing_hashes():
