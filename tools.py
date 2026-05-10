@@ -934,6 +934,54 @@ class ToolRegistry:
                 lambda: bb_.close(),
             )
 
+        # ── desktop_wait_for ──────────────────────────────────────────
+        # Available whenever a desktop backend exists, regardless of
+        # which other tools the agent gates.  The polling cost is low —
+        # listing windows and consulting the a11y tree at 0.5 s cadence.
+        if desk_ok:
+            from wait_for import wait_for as _wait_for_impl
+            backend_ref = self._backend
+
+            async def _desktop_wait_for(
+                window_title: str = "",
+                element_name: str = "",
+                text: str = "",
+                window_id: str = "",
+                timeout: float = 15.0,
+            ) -> dict:
+                return await _wait_for_impl(
+                    backend=backend_ref,
+                    window_title=str(window_title or ""),
+                    element_name=str(element_name or ""),
+                    text=str(text or ""),
+                    window_id=str(window_id or ""),
+                    timeout=float(timeout) if timeout else 15.0,
+                )
+
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_wait_for",
+                    "description": (
+                        "Block until a target becomes observable on the desktop, "
+                        "or the timeout elapses.  Use this after desktop_launch / "
+                        "browser_navigate / any action that triggers a slow UI "
+                        "transition, instead of immediately clicking on something "
+                        "that might not be drawn yet.  Provide ONE of: "
+                        "window_title (substring), element_name (a11y name), "
+                        "text (visible label via OCR), window_id."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "window_title": {"type": "string"},
+                        "element_name": {"type": "string"},
+                        "text": {"type": "string"},
+                        "window_id": {"type": "string"},
+                        "timeout": {"type": "number",
+                                    "description": "Seconds to wait (default 15)."},
+                    }},
+                }},
+                _desktop_wait_for,
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

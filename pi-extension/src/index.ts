@@ -1,9 +1,12 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ArtifactStore } from "./artifacts.js";
 import { BrowserBackend } from "./browser_backend.js";
 import { PerceptionCache } from "./cache.js";
 import { loadConfig, type ExtensionConfig } from "./config.js";
+import type { Plan } from "./controller.js";
+import { ProgressStore, type TaskProgress } from "./progress.js";
 import { runInstaller } from "./install_runner.js";
 import { createLogger } from "./logger.js";
 import { createBackend } from "./platform.js";
@@ -30,16 +33,39 @@ function buildAutoGuiPrompt(cfg: ExtensionConfig, backend: DesktopBackend | unde
   const browserOn = cfg.allowedBrowser;
   const a11yOn = backend?.capabilities?.findElement === true;
   const planner = cfg.plannerEnabled;
+  const controllerOn = cfg.controllerEnabled;
+  const artifactsOn = !!cfg.artifactsDir;
+  const progressOn = !!cfg.progressDir;
   return `You are using the AutoGUI desktop automation extension.
 
 Goal: complete the user's desktop task using Pi's normal agent workflow and the registered desktop_*${browserOn ? "/browser_*" : ""} tools.
 
-${planner ? `Planning protocol:
+${controllerOn ? `Typed-plan protocol (REQUIRED):
+- Your FIRST tool call must be plan_set with a JSON plan whose schema is:
+    { "steps": [
+        { "id": "s1", "goal": "...", "expected": "<observable post-condition>",
+          "tools_hint": ["browser_navigate"], "depends_on": [] },
+        ...
+    ] }
+- 3 to 8 steps; each maps to ONE observable post-condition.
+- After each step finishes, call plan_update_step(id, status="done") so progress is persisted.
+- If a step is blocked, call plan_update_step(id, status="blocked", notes="why"), then revise the plan with another plan_set call.
+- Use plan_get when you need to see current statuses.
+- For long-running tasks, call checkpoint(label, data) after non-trivial milestones so a crash / abort can resume from the marker.
+- Use desktop_wait_for after desktop_launch / browser_navigate / any action that triggers a slow UI transition. Never click a window that may not be drawn yet.
+- For pure read-only lookups (\"which file mentions X\", \"summarise this stdout\"), prefer get_artifact / list_artifacts to keep history small.
+- Classify any persistent failure with classify_failure to decide between retry / wait / replan / escalate.
+
+` : (planner ? `Planning protocol:
 - BEFORE taking any state-changing action, your FIRST assistant message must be a numbered plan of 3 to 8 high-level steps that will accomplish the task.
 - Steps describe goals ("open Edge", "navigate to weather page"), not specific clicks.
 - Then execute the plan step by step. After each step, verify with desktop_screenshot, desktop_list_windows, or desktop_active_window.
 - Adapt the plan if the screen state diverges from what a step expects.
 - For trivial single-step tasks, the plan may be a single line.
+
+` : "")}${artifactsOn ? `Large observations (file bodies, page text, command stdout > 4KB) are auto-stored as artifacts.  The tool result will contain a preview plus an `+"`artifact_id`"+` you can fetch later with get_artifact.  Use list_artifacts before re-reading a file you already read.
+
+` : ""}${progressOn ? `This task has a persistent progress record. Re-running the same task text will resume — call plan_get on session start to see what was already done.
 
 ` : ""}Click ladder — pick the strongest available method for each click:
 1. ${browserOn ? "browser_click for any element on a web page (most reliable for web).\n2. " : ""}desktop_click_element for any native UI control with a visible name/label (uses the OS accessibility API; survives DPI scaling, window moves, async redraws). ${a11yOn ? "" : "(Limited support on the current backend.)\n"}
@@ -76,6 +102,10 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   // Per-session state for skills + Set-of-Mark + trace.
   const sessionSteps: SkillStep[] = [];
   const lastMarks: { value: Mark[] } = { value: [] };
+  // Mutable holders so tools.ts can read/write the current plan +
+  // progress record over the lifetime of an /autogui task.
+  const planSlot: { value: Plan | undefined } = { value: undefined };
+  const progressSlot: { value: TaskProgress | undefined } = { value: undefined };
 
   const getConfig = async () => {
     cfgPromise ??= loadConfig(extensionRoot);
@@ -96,12 +126,20 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   let recorder: ScreenRecorder | undefined;
   let browser: BrowserBackend | undefined;
   let cfg: ExtensionConfig | undefined;
+  let artifactStore: ArtifactStore | undefined;
+  let progressStore: ProgressStore | undefined;
 
   const init = (async () => {
     cfg = await getConfig();
     omitScreenshotImages = !cfg.visionEnabled;
     cache.configure(cfg.perceptionCacheTtlMs);
     skillStore = new SkillStore(cfg.skillsPath);
+    if (cfg.artifactsDir) {
+      artifactStore = new ArtifactStore(cfg.artifactsDir);
+    }
+    if (cfg.progressDir) {
+      progressStore = new ProgressStore(cfg.progressDir);
+    }
     if (cfg.recordTrace) {
       trace = new TraceWriter(cfg.traceDir);
       void trace.writeMeta({ event: "session_start" });
@@ -226,6 +264,10 @@ ${autoGuiTask}`;
       browser,
       sessionSteps,
       lastMarks,
+      artifactStore,
+      progressStore,
+      plan: planSlot,
+      progressRecord: progressSlot,
     });
     for (const tool of tools) {
       pi.registerTool(tool);
@@ -254,6 +296,16 @@ ${autoGuiTask}`;
       // Reset per-task session state so skill_save snapshots only this task.
       sessionSteps.length = 0;
       lastMarks.value = [];
+      planSlot.value = undefined;
+      // Open (or resume) a progress record for this task so progress
+      // markers + plan snapshots survive crashes and aborts.
+      if (progressStore) {
+        try {
+          progressSlot.value = await progressStore.openTask(task);
+        } catch {
+          progressSlot.value = undefined;
+        }
+      }
 
       const c = await getConfig();
       let backend: DesktopBackend | undefined;

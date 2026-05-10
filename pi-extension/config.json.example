@@ -29,6 +29,15 @@
   "_planner_section": "When plannerEnabled is true (default), /autogui injects instructions telling the model to produce a numbered plan as its FIRST assistant message before executing.",
   "plannerEnabled": true,
 
+  "_controller_section": "When controllerEnabled is true, the typed-plan protocol replaces the free-text plan: the model issues plan_set with a JSON plan, marks each step done via plan_update_step, and uses checkpoint() for long-running tasks. Defaults to false to preserve legacy behaviour.",
+  "controllerEnabled": false,
+
+  "_artifacts_section": "Content-addressed artifact store (file bodies, page text, command stdout > 4KB) so large observations don't bloat history. Default directory is pi-extension/runtime/artifacts. Set artifactsDir to an empty string to disable.",
+  "artifactsDir": "",
+
+  "_progress_section": "Persistent task progress markers under pi-extension/runtime/progress. Re-running the same task text resumes where the previous attempt stopped. Set progressDir to an empty string to disable.",
+  "progressDir": "",
+
   "_vision_section": "When visionEnabled is true (default), desktop_screenshot results include the inline PNG image so the model can see the screen. Set false to return only the file path (useful if the provider struggles with image payloads).",
   "visionEnabled": true,
 

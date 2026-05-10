@@ -14,6 +14,14 @@ extra LLM call rather than a second long-running session.
 
 Cost: +1 chat call per task.  Benefit: fewer wasted iterations
 and noticeably more coherent multi-step traces in practice.
+
+Two planner modes
+-----------------
+``Planner.plan`` returns the legacy free-text numbered plan (used when
+the typed controller is disabled).  ``Planner.plan_typed`` asks for a
+JSON document that maps onto ``controller.Plan`` and falls back to the
+free-text path on parse failure so an old/non-JSON-friendly model still
+yields a working plan.
 """
 
 from __future__ import annotations
@@ -41,6 +49,45 @@ _PLANNER_SYSTEM = (
     "      desktop_click(x,y)  only as a last resort.\n"
     "  * If the task is trivial (one tool call), output a single-line plan.\n"
     "  * If the task is ambiguous, state the assumption you'll make in step 1."
+)
+
+
+_TYPED_PLANNER_SYSTEM = (
+    "You are a desktop automation planner producing a structured plan.\n"
+    "Output a single JSON object — no prose, no code fences, no commentary.\n\n"
+    "Schema:\n"
+    "  {\n"
+    "    \"steps\": [\n"
+    "      {\n"
+    "        \"id\": \"s1\",                  // short stable id\n"
+    "        \"goal\": \"...\",                // one-line goal statement\n"
+    "        \"expected\": \"...\",            // post-condition the executor can verify\n"
+    "        \"tools_hint\": [\"browser_navigate\"],  // optional\n"
+    "        \"depends_on\": []              // ids of steps that must complete first\n"
+    "      }, ...\n"
+    "    ]\n"
+    "  }\n\n"
+    "Rules:\n"
+    "  * 3 to 8 steps; each maps to ONE observable post-condition.\n"
+    "  * `expected` must be checkable (a window title, a page URL, a file existing,\n"
+    "    a piece of text being on screen).\n"
+    "  * Use ids like s1, s2, s3 unless logical grouping makes another scheme clearer.\n"
+    "  * Prefer browser_* for web tasks, desktop_click_element for labelled native\n"
+    "    UI, desktop_click_text / desktop_click_mark for unlabelled, desktop_click as\n"
+    "    a last resort.\n"
+    "  * Do NOT call tools.  Output is JSON only."
+)
+
+
+_TYPED_PLANNER_USER = (
+    "TASK\n----\n{task}\n\n"
+    "ENVIRONMENT\n-----------\n"
+    "OS: {os_label}\n"
+    "Vision-capable: {vision}\n"
+    "Browser tools available: {browser_available}\n"
+    "Accessibility (a11y) clicking available: {a11y_available}\n\n"
+    "DESKTOP STATE\n-------------\n{windows}\n\n"
+    "Produce the typed plan JSON now."
 )
 
 
@@ -100,4 +147,57 @@ class Planner:
 
         # Strip markdown code fences the model might wrap around the plan.
         text = re.sub(r"^```[a-z]*\n?", "", text).rstrip("`").strip()
+        return text
+
+    async def plan_typed(
+        self,
+        task: str,
+        os_label: str = "",
+        vision: bool = False,
+        browser_available: bool = False,
+        a11y_available: bool = False,
+        windows_summary: str = "",
+    ) -> str:
+        """
+        Ask the planner for a JSON-typed plan; falls back to the legacy
+        free-text path on any failure so the controller can still run.
+
+        Returns the raw model output (caller passes it through
+        ``controller.parse_plan``).
+        """
+        if not task or not task.strip():
+            return ""
+
+        user_msg = _TYPED_PLANNER_USER.format(
+            task=task.strip(),
+            os_label=os_label or "unknown",
+            vision="yes" if vision else "no",
+            browser_available="yes" if browser_available else "no",
+            a11y_available="yes" if a11y_available else "no",
+            windows=(windows_summary or "(unavailable)")[:1500],
+        )
+        try:
+            response = await self._client.chat(
+                messages=[
+                    {"role": "system", "content": _TYPED_PLANNER_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+                tools=None,
+            )
+            message = self._client.extract_message(response)
+            text = (self._client.extract_text(message) or "").strip()
+        except Exception as e:
+            logger.warning("[planner] typed plan call failed: %s", e)
+            return await self.plan(
+                task=task, os_label=os_label, vision=vision,
+                browser_available=browser_available,
+                a11y_available=a11y_available,
+                windows_summary=windows_summary,
+            )
+
+        text = re.sub(r"^```[a-z]*\n?", "", text).rstrip("`").strip()
+        if text.startswith("{") or text.startswith("["):
+            return text
+        # The model ignored the JSON instruction; fall back so we still
+        # get a usable (numbered-list) plan.
         return text

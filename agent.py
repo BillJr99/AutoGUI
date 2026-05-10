@@ -37,11 +37,25 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
+from artifacts import ArtifactStore
 from client import OpenWebUIClient
+from controller import (
+    Plan,
+    PlanStep,
+    StepStatus,
+    StepVerdict,
+    build_step_prompt,
+    merge_revised_plan,
+    parse_plan,
+    parse_step_outcome,
+)
+from failures import FailureClass, RecoveryAction, classify, escalate_action
 from planner import Planner
+from progress import ProgressStore
 from prompt_loader import PromptLoader
 from screen_record import ScreenRecorder
 from skills import SkillStore
+from subagent import Subagent
 from tools import ToolRegistry
 from trace import TraceWriter
 
@@ -138,12 +152,21 @@ class Agent:
         base = self._prompts.text("system_base") or self._agent_cfg.get(
             "system_prompt", "You are a helpful agent."
         )
+        # Controller protocol is appended to the system prompt only when
+        # the controller is enabled — otherwise the legacy "free-form
+        # assistant" guidance applies and the STEP_DONE markers would be
+        # noise.
+        controller_protocol = ""
+        if (self._agent_cfg.get("controller", {}) or {}).get("enabled", False):
+            controller_protocol = self._prompts.text("controller_step_protocol")
+
         self._system_prompt: str = "\n\n".join(filter(None, [
             base,
             _build_os_instructions(self._prompts),
             self._prompts.text("system_desktop_rules"),
             self._prompts.text("system_browser_rules"),
             self._prompts.text("system_tool_analysis"),
+            controller_protocol,
         ]))
 
         # Seconds to wait before dispatching each tool call (0 = immediate).
@@ -230,6 +253,60 @@ class Agent:
             except Exception as e:
                 logger.warning("[agent] Planner init failed: %s", e)
                 self._planner = None
+
+        # ---- Controller / artifact / progress / subagent (Phase 13) -----
+        # The controller decomposes a task into typed plan steps and runs
+        # the executor loop step-by-step with scoped per-step prompts.
+        # Artifact store gives observations stable IDs so big bodies stay
+        # out of history.  Progress store survives crashes/aborts and lets
+        # the user resume.  Subagent answers read-only questions without
+        # bloating the main conversation.
+        controller_cfg = self._agent_cfg.get("controller", {}) or {}
+        self._controller_enabled: bool = bool(controller_cfg.get("enabled", False))
+        self._step_max_iterations: int = max(1, int(controller_cfg.get("step_max_iterations", 8)))
+        self._step_max_retries: int = max(0, int(controller_cfg.get("step_max_retries", 2)))
+        self._auto_resume: bool = bool(controller_cfg.get("auto_resume", True))
+        self._replan_on_block: bool = bool(controller_cfg.get("replan_on_block", True))
+
+        artifact_cfg = self._agent_cfg.get("artifacts", {}) or {}
+        self._artifacts: ArtifactStore | None = None
+        try:
+            self._artifacts = ArtifactStore(artifact_cfg.get("dir", "logs/artifacts"))
+        except Exception as e:
+            logger.warning("[agent] ArtifactStore init failed: %s", e)
+            self._artifacts = None
+
+        progress_cfg = self._agent_cfg.get("progress", {}) or {}
+        self._progress: ProgressStore | None = None
+        try:
+            self._progress = ProgressStore(progress_cfg.get("dir", "logs/progress"))
+        except Exception as e:
+            logger.warning("[agent] ProgressStore init failed: %s", e)
+            self._progress = None
+
+        subagent_cfg = self._agent_cfg.get("subagent", {}) or {}
+        self._subagent_enabled: bool = bool(subagent_cfg.get("enabled", True))
+        self._subagent_max_calls: int = max(1, int(subagent_cfg.get("max_tool_calls", 4)))
+        self._subagent: Subagent | None = None
+        if self._subagent_enabled:
+            try:
+                self._subagent = Subagent(
+                    self._client, self._registry,
+                    max_tool_calls=self._subagent_max_calls,
+                    artifact_store=self._artifacts,
+                )
+            except Exception as e:
+                logger.warning("[agent] Subagent init failed: %s", e)
+                self._subagent = None
+
+        # Per-task plan + state (populated by run()).
+        self._plan: Plan | None = None
+        self._task_progress = None
+        self._step_retry_counts: dict[str, int] = {}
+
+        # Register the artifact / plan / checkpoint / subagent meta-tools
+        # so the model can interact with the new stores explicitly.
+        self._register_meta_tools()
 
         # Rolling screen buffer (Phase 11).  When a tool fails, the buffer
         # is flushed to an animated GIF so the user can see exactly how
@@ -382,6 +459,227 @@ class Agent:
         )
 
     # ------------------------------------------------------------------
+    # Meta-tools: artifact, plan, checkpoint, ask
+    # ------------------------------------------------------------------
+
+    def _register_meta_tools(self):
+        """Add get_artifact / list_artifacts / plan_get / plan_update_step /
+        checkpoint / ask_subagent to the registry.  Always registered when
+        the supporting stores exist, so the model can opt to use them."""
+        registry = self._registry
+        agent = self
+
+        if self._artifacts is not None:
+            async def _get_artifact(id: str) -> dict:
+                aid = str(id or "")
+                if not aid.startswith("artifact://"):
+                    aid = "artifact://" + aid.lstrip("/")
+                art = agent._artifacts.get(aid)
+                if art is None:
+                    return {"error": f"unknown artifact id: {id}"}
+                body = agent._artifacts.get_body(aid) or ""
+                return {
+                    "id": aid,
+                    "kind": art.kind,
+                    "source": art.source,
+                    "summary": art.summary,
+                    "bytes": art.bytes_len,
+                    "content": body,
+                }
+
+            async def _list_artifacts(kind: str = "", limit: int = 10) -> dict:
+                items = agent._artifacts.list_recent(kind=kind or None, limit=int(limit) or 10)
+                return {
+                    "count": len(items),
+                    "artifacts": [
+                        {"id": a.id, "kind": a.kind, "source": a.source,
+                         "summary": a.summary, "bytes": a.bytes_len}
+                        for a in items
+                    ],
+                }
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "get_artifact",
+                    "description": (
+                        "Fetch the body of a previously stored artifact (file content, "
+                        "command output, OCR snippet) by id.  Use this when the agent "
+                        "context only shows an artifact summary and you need the full text."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "id": {"type": "string", "description": "artifact://<id> or just the id."},
+                    }, "required": ["id"]},
+                }},
+                _get_artifact,
+            )
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "list_artifacts",
+                    "description": (
+                        "List recent artifacts captured during this task.  Use to find "
+                        "a previously-read file before re-reading it from disk."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "kind": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    }},
+                }},
+                _list_artifacts,
+            )
+
+        async def _plan_get() -> dict:
+            if agent._plan is None:
+                return {"plan": None, "note": "No structured plan in this session."}
+            return {
+                "plan": agent._plan.to_dict(),
+                "progress": agent._plan.progress_summary(),
+            }
+
+        async def _plan_update_step(
+            id: str,
+            status: str = "",
+            notes: str = "",
+        ) -> dict:
+            if agent._plan is None:
+                return {"error": "No structured plan in this session."}
+            step = agent._plan.by_id(str(id))
+            if step is None:
+                return {"error": f"no step with id {id!r}"}
+            if status:
+                try:
+                    step.status = StepStatus(status)
+                except ValueError:
+                    return {"error": f"invalid status {status!r}"}
+            if notes:
+                step.notes = (step.notes + "\n" + notes).strip() if step.notes else notes
+            agent._persist_progress()
+            return {"step": step.to_public()}
+
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "plan_get",
+                "description": (
+                    "Return the current typed plan (steps, ids, statuses).  Use to "
+                    "remind yourself which step the controller expects you to work on."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            }},
+            _plan_get,
+        )
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "plan_update_step",
+                "description": (
+                    "Manually mark a plan step done/skipped/blocked, or attach notes.  "
+                    "The controller marks STEP_DONE / STEP_BLOCKED automatically; use "
+                    "this only to skip an obsolete step or annotate progress."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "id": {"type": "string"},
+                    "status": {"type": "string", "enum": [
+                        "pending", "running", "done", "failed", "skipped", "blocked",
+                    ]},
+                    "notes": {"type": "string"},
+                }, "required": ["id"]},
+            }},
+            _plan_update_step,
+        )
+
+        if self._progress is not None:
+            async def _checkpoint(label: str = "", data: dict | str = "") -> dict:
+                if agent._task_progress is None:
+                    return {"note": "no active task progress record"}
+                payload: dict = {}
+                if isinstance(data, dict):
+                    payload = dict(data)
+                elif isinstance(data, str) and data:
+                    payload = {"note": data}
+                if label:
+                    payload["label"] = label
+                agent._progress.update_checkpoint(agent._task_progress, payload)
+                return {"saved": True, "checkpoint": payload}
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "checkpoint",
+                    "description": (
+                        "Persist a free-form progress marker so the task can resume "
+                        "after a crash or abort.  Use after non-trivial milestones "
+                        "(\"finished tab 3 of 7\", \"wrote intermediate output\")."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "label": {"type": "string"},
+                        "data": {"type": "object"},
+                    }},
+                }},
+                _checkpoint,
+            )
+
+        if self._subagent is not None:
+            async def _ask_subagent(
+                question: str,
+                artifact_ids=None,
+            ) -> dict:
+                fetched: list[tuple[str, str]] = []
+                if isinstance(artifact_ids, list) and agent._artifacts is not None:
+                    for aid in artifact_ids[:6]:
+                        body = agent._artifacts.get_body(str(aid))
+                        if body:
+                            art = agent._artifacts.get(str(aid))
+                            label = art.summary if art else str(aid)
+                            fetched.append((label[:80], body))
+                result = await agent._subagent.ask(
+                    str(question),
+                    fetched_artifacts=fetched or None,
+                )
+                return {
+                    "answer": result.answer,
+                    "artifact_ids": result.artifact_ids,
+                    "tool_calls_made": result.tool_calls_made,
+                }
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "ask_subagent",
+                    "description": (
+                        "Delegate a read-only lookup question to a focused subagent so "
+                        "the answer doesn't bloat the main conversation history.  Good "
+                        "for \"which of these N files mentions X\", \"summarise this JSON\", "
+                        "and similar pure-read tasks.  The subagent has no desktop or shell "
+                        "access — only fs_read / fs_list / browser_get_text."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "question": {"type": "string"},
+                        "artifact_ids": {"type": "array", "items": {"type": "string"},
+                                         "description": "Optional pre-fetched artifact ids."},
+                    }, "required": ["question"]},
+                }},
+                _ask_subagent,
+            )
+
+    def _persist_progress(self):
+        """Snapshot the live plan into the progress store (no-op if disabled)."""
+        if self._progress is None or self._task_progress is None or self._plan is None:
+            return
+        try:
+            self._progress.update_plan_snapshot(self._task_progress, self._plan.to_dict())
+        except Exception as e:
+            logger.debug("[agent] progress snapshot failed: %s", e)
+
+    def _resume_plan_state(self) -> None:
+        """Apply persisted completed_step_ids onto the freshly parsed plan."""
+        if self._plan is None or self._task_progress is None:
+            return
+        for sid in self._task_progress.completed_step_ids:
+            step = self._plan.by_id(sid)
+            if step is not None and step.status == StepStatus.PENDING:
+                step.status = StepStatus.DONE
+        for sid in self._task_progress.failed_step_ids:
+            step = self._plan.by_id(sid)
+            if step is not None and step.status == StepStatus.PENDING:
+                step.status = StepStatus.FAILED
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
@@ -391,8 +689,16 @@ class Agent:
         writer and the optional event_sink before passing it to the caller,
         so observability / replay logging can be added without modifying
         each yield site individually.
+
+        Routes to the controller-driven loop when ``agent.controller.enabled``
+        is true; otherwise runs the legacy single-loop executor.
         """
-        async for event in self._run_inner(user_input):
+        if self._controller_enabled and self._planner is not None:
+            inner = self._run_with_controller(user_input)
+        else:
+            inner = self._run_inner(user_input)
+
+        async for event in inner:
             if self._trace is not None:
                 try:
                     self._trace.write_event(event)
@@ -404,6 +710,423 @@ class Agent:
                 except Exception:
                     pass
             yield event
+
+    # ------------------------------------------------------------------
+    # Controller-driven path
+    # ------------------------------------------------------------------
+
+    async def _run_with_controller(self, user_input: str) -> AsyncIterator[AgentEvent]:
+        """
+        Plan -> step-by-step execution.
+
+        For each PENDING step the controller composes a scoped prompt
+        (see controller.build_step_prompt), drives the executor loop in a
+        per-step history, and observes the step's STEP_DONE / STEP_BLOCKED
+        marker plus any tool failures.  Plan progress is persisted after
+        every step.
+        """
+        available_tools = set(self._registry.list_tools())
+        windows_json = ""
+        if "desktop_list_windows" in available_tools:
+            try:
+                windows_json = await self._registry.dispatch("desktop_list_windows", {})
+            except Exception:
+                pass
+
+        # --- Plan acquisition: typed first, free-text fallback ----------
+        os_label = _platform.system()
+        browser_avail = any(t.startswith("browser_") for t in available_tools)
+        a11y_avail = "desktop_click_element" in available_tools
+        plan_text = ""
+        try:
+            plan_text = await self._planner.plan_typed(
+                task=user_input,
+                os_label=os_label,
+                vision=self._vision_screenshots,
+                browser_available=browser_avail,
+                a11y_available=a11y_avail,
+                windows_summary=windows_json,
+            )
+        except Exception as e:
+            logger.warning("[agent] typed planner failed: %s", e)
+        plan = parse_plan(plan_text)
+        if not plan.steps:
+            yield AgentEvent(
+                kind="error",
+                content="Planner produced no steps; falling back to legacy loop.",
+                data={"raw": plan_text[:200]},
+            )
+            async for event in self._run_inner(user_input):
+                yield event
+            return
+
+        self._plan = plan
+        if self._progress is not None:
+            self._task_progress = self._progress.open_task(user_input)
+            if self._auto_resume:
+                self._resume_plan_state()
+            self._persist_progress()
+
+        yield AgentEvent(
+            kind="plan",
+            content=plan.render_for_prompt(),
+            data={"plan": plan.to_dict()},
+        )
+
+        # --- Step loop ---------------------------------------------------
+        global_iter = 0
+        while True:
+            step = plan.next_runnable()
+            if step is None:
+                break
+
+            # Check the global iteration ceiling so a runaway plan can't
+            # exceed the same overall budget the legacy loop enforces.
+            if global_iter >= self._max_iterations:
+                yield AgentEvent(
+                    kind="error",
+                    content=f"Global iteration ceiling ({self._max_iterations}) reached; "
+                            "remaining plan steps abandoned.",
+                    data={"plan": plan.to_dict()},
+                )
+                break
+
+            step.status = StepStatus.RUNNING
+            step.attempts += 1
+            self._step_retry_counts[step.id] = self._step_retry_counts.get(step.id, 0)
+            self._persist_progress()
+            yield AgentEvent(
+                kind="step_start",
+                content=f"→ ({step.id}) {step.goal}",
+                data={"step": step.to_public(), "attempts": step.attempts},
+            )
+
+            verdict, reason, used_iters, failure = await self._run_step(
+                user_input=user_input,
+                step=step,
+                event_yield=None,  # we re-yield via the queue below
+            )
+            global_iter += used_iters
+
+            # Process the verdict.
+            if verdict == StepVerdict.DONE:
+                step.status = StepStatus.DONE
+                step.last_error = ""
+                if self._task_progress is not None:
+                    self._progress.mark_done(self._task_progress, step.id)
+                self._persist_progress()
+                yield AgentEvent(
+                    kind="step_done",
+                    content=f"✓ ({step.id}) {reason[:160]}",
+                    data={"step": step.to_public(), "iterations": used_iters},
+                )
+                continue
+
+            # Failed / blocked / exhausted — classify and decide.
+            self._step_retry_counts[step.id] += 1
+            retry_count = self._step_retry_counts[step.id]
+            verdict_failure = failure or classify(
+                tool_name="(none)",
+                error_message=reason,
+                predicate_failed=verdict == StepVerdict.BLOCKED,
+            )
+            action = escalate_action(
+                verdict_failure,
+                retry_count=retry_count,
+                max_retries=self._step_max_retries,
+            )
+
+            yield AgentEvent(
+                kind="step_failure",
+                content=f"✗ ({step.id}) {verdict.value}: {reason[:160]} → {action.value}",
+                data={
+                    "step": step.to_public(),
+                    "verdict": verdict.value,
+                    "reason": reason,
+                    "failure_class": verdict_failure.cls.value,
+                    "recovery_action": action.value,
+                    "retry_count": retry_count,
+                },
+            )
+
+            if action == RecoveryAction.WAIT_AND_RETRY and verdict_failure.wait_seconds > 0:
+                await asyncio.sleep(verdict_failure.wait_seconds)
+                step.status = StepStatus.PENDING  # try again next iteration
+                step.last_error = reason[:200]
+                self._persist_progress()
+                continue
+
+            if action == RecoveryAction.RETRY:
+                step.status = StepStatus.PENDING
+                step.last_error = reason[:200]
+                self._persist_progress()
+                continue
+
+            if action == RecoveryAction.REPLAN and self._replan_on_block:
+                # Mark this step blocked; ask the planner to revise.
+                step.status = StepStatus.BLOCKED
+                step.last_error = reason[:200]
+                self._persist_progress()
+                revised = await self._replan(user_input, plan, blocked_step=step)
+                if revised is not None and revised.steps:
+                    plan = merge_revised_plan(plan, revised)
+                    self._plan = plan
+                    self._persist_progress()
+                    yield AgentEvent(
+                        kind="plan_revised",
+                        content=plan.render_for_prompt(),
+                        data={"plan": plan.to_dict(), "revision": plan.revision},
+                    )
+                    continue
+                # Replan failed — fall through to escalation.
+
+            # ESCALATE / ABORT or replan-disabled.
+            step.status = StepStatus.FAILED
+            step.last_error = reason[:200]
+            if self._task_progress is not None:
+                self._progress.mark_failed(self._task_progress, step.id)
+            self._persist_progress()
+            yield AgentEvent(
+                kind="step_escalate",
+                content=f"Step ({step.id}) needs user attention: {reason[:160]}",
+                data={
+                    "step": step.to_public(),
+                    "failure_class": verdict_failure.cls.value,
+                    "recovery_action": action.value,
+                },
+            )
+            break
+
+        # --- Final summary ----------------------------------------------
+        all_done = all(s.status == StepStatus.DONE for s in plan.steps)
+        final_status = "done" if all_done else "failed"
+        if self._task_progress is not None:
+            self._progress.finalize(self._task_progress, status=final_status)
+        yield AgentEvent(
+            kind="done",
+            content=f"Controller {final_status} — {plan.progress_summary()}",
+            data={
+                "plan": plan.to_dict(),
+                "iterations": global_iter,
+                "status": final_status,
+            },
+        )
+
+    async def _replan(
+        self, user_input: str, plan: Plan, *, blocked_step: PlanStep
+    ) -> Plan | None:
+        """Ask the planner for a revised plan that takes the failure into account."""
+        if self._planner is None:
+            return None
+        context = (
+            f"PREVIOUS PLAN STATUS\n--------------------\n{plan.render_for_prompt()}\n\n"
+            f"BLOCKED STEP\n------------\nid: {blocked_step.id}\n"
+            f"goal: {blocked_step.goal}\nreason: {blocked_step.last_error}"
+        )
+        try:
+            revised_text = await self._planner.plan_typed(
+                task=user_input + "\n\n" + context,
+                os_label=_platform.system(),
+                vision=self._vision_screenshots,
+            )
+        except Exception as e:
+            logger.warning("[agent] replan failed: %s", e)
+            return None
+        return parse_plan(revised_text)
+
+    async def _run_step(
+        self,
+        *,
+        user_input: str,
+        step: PlanStep,
+        event_yield,
+    ) -> tuple[StepVerdict, str, int, Any]:
+        """
+        Drive a scoped per-step executor loop.
+
+        Returns ``(verdict, reason, iterations_used, failure_verdict_or_None)``.
+        Per-step history is constructed fresh from the system prompt + the
+        scoped step prompt — it does NOT touch ``self._history``, so steps
+        don't contaminate each other's context.
+        """
+        # Build artifact summary for the step prompt (one-line per artifact,
+        # capped) so the executor knows what's already in the artifact store.
+        artifact_summary = ""
+        if self._artifacts is not None:
+            recent = self._artifacts.list_recent(limit=8)
+            if recent:
+                artifact_summary = "\n".join(
+                    f"  {a.id}  [{a.kind}] {a.summary[:100]}" for a in recent
+                )
+        completed_summary = ""
+        if self._plan is not None:
+            done_steps = [s for s in self._plan.steps if s.status == StepStatus.DONE]
+            if done_steps:
+                completed_summary = "\n".join(
+                    f"  ({s.id}) {s.goal}" for s in done_steps[-6:]
+                )
+
+        step_prompt = build_step_prompt(
+            user_input=user_input,
+            plan=self._plan,
+            step=step,
+            artifact_index_summary=artifact_summary,
+            completed_actions_summary=completed_summary,
+        )
+
+        local_history: list[dict] = [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": step_prompt},
+        ]
+
+        last_text = ""
+        last_failure = None
+        iterations = 0
+
+        while iterations < self._step_max_iterations:
+            iterations += 1
+            try:
+                response = await self._client.chat(
+                    messages=local_history,
+                    tools=self._registry.schemas,
+                )
+            except Exception as e:
+                last_text = f"chat call failed: {e}"
+                last_failure = classify(tool_name="(chat)", error_message=str(e))
+                break
+
+            try:
+                message = self._client.extract_message(response)
+            except Exception as e:
+                last_text = f"extract_message failed: {e}"
+                last_failure = classify(tool_name="(extract)", error_message=str(e))
+                break
+
+            local_history.append(message)
+            text = self._client.extract_text(message) or ""
+            tool_calls = self._client.extract_tool_calls(message) or []
+            if text:
+                last_text = text
+
+            if not tool_calls:
+                # Final assistant message — parse the marker.
+                verdict, reason = parse_step_outcome(text)
+                return verdict, reason or text[:200], iterations, last_failure
+
+            # Dispatch each tool call.
+            step_failure_seen = False
+            for tc in tool_calls:
+                tool_name = tc.get("function", {}).get("name", "")
+                call_id = tc.get("id", "")
+                try:
+                    args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result_json = await self._registry.dispatch(tool_name, args)
+
+                # Maybe store large results as artifacts to keep history small.
+                history_content = self._maybe_store_artifact(tool_name, args, result_json)
+
+                # Track session step for skill_save (only on success).
+                if not self._result_is_error(result_json) and tool_name not in (
+                    "skill_save", "skill_list", "skill_run",
+                    "desktop_screenshot", "desktop_screenshot_marked",
+                    "desktop_list_windows", "desktop_get_active_window",
+                    "fs_read", "fs_list", "get_artifact", "list_artifacts",
+                    "plan_get", "plan_update_step", "checkpoint", "ask_subagent",
+                ):
+                    self._session_steps.append({"tool": tool_name, "args": dict(args)})
+
+                if self._result_is_error(result_json):
+                    step_failure_seen = True
+                    try:
+                        result_obj = json.loads(result_json)
+                        err_msg = result_obj.get("error") or result_obj.get("stderr") or ""
+                    except json.JSONDecodeError:
+                        result_obj = {}
+                        err_msg = result_json[:200]
+                    last_failure = classify(
+                        tool_name=tool_name,
+                        error_message=err_msg,
+                        result=result_obj,
+                    )
+                    history_content = (
+                        "[TOOL FAILED: " + tool_name + "] "
+                        f"(class={last_failure.cls.value} action={last_failure.action.value})\n"
+                        + history_content
+                    )
+
+                local_history.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": history_content,
+                })
+
+            if step_failure_seen:
+                local_history.append({
+                    "role": "user",
+                    "content": (
+                        "[CONTROLLER] At least one tool failed in this iteration. "
+                        "Diagnose the failure, choose a different approach, and try "
+                        "again — do not give up after one failed attempt. When the "
+                        "step's expected outcome is satisfied, finish with "
+                        "STEP_DONE: <one-line proof>. If you cannot proceed, finish "
+                        "with STEP_BLOCKED: <reason>."
+                    ),
+                })
+
+        # Iteration ceiling reached without a marker.
+        return StepVerdict.EXHAUSTED, last_text[:200] or "step iteration ceiling reached", iterations, last_failure
+
+    def _maybe_store_artifact(self, tool_name: str, args: dict, result_json: str) -> str:
+        """
+        For tools whose results are large bodies (fs_read, browser_get_text,
+        desktop_get_window_text), store the body as an artifact and return a
+        slimmed-down history payload.  Other results pass through unchanged.
+        """
+        if self._artifacts is None:
+            return result_json
+        try:
+            result = json.loads(result_json)
+        except json.JSONDecodeError:
+            return result_json
+        if "error" in result:
+            return result_json
+
+        body_field, source = None, ""
+        if tool_name == "fs_read":
+            body_field = "content"
+            source = str(args.get("path", ""))
+        elif tool_name == "desktop_get_window_text":
+            body_field = "text"
+        elif tool_name == "browser_get_text":
+            body_field = "text"
+            source = str(args.get("selector", "") or "page")
+        elif tool_name == "shell_run":
+            # Stdout only when it's large enough to bloat history.
+            stdout = result.get("stdout") or ""
+            if isinstance(stdout, str) and len(stdout) > 4096:
+                aid = self._artifacts.put(
+                    stdout, kind="shell_stdout",
+                    source=str(args.get("command", ""))[:120],
+                )
+                preview = stdout[:400] + "\n...\n[stored as " + aid + "]"
+                result["stdout"] = preview
+                result["stdout_artifact_id"] = aid
+                return json.dumps(result, default=str)
+            return result_json
+
+        if body_field is not None:
+            body = result.get(body_field)
+            if isinstance(body, str) and len(body) > 4096:
+                aid = self._artifacts.put(
+                    body, kind=tool_name, source=source,
+                )
+                preview = body[:600] + "\n...\n[truncated; full content stored as " + aid + "]"
+                result[body_field] = preview
+                result[body_field + "_artifact_id"] = aid
+                return json.dumps(result, default=str)
+        return result_json
 
     async def _run_inner(self, user_input: str) -> AsyncIterator[AgentEvent]:
         """

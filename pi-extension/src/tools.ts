@@ -1,8 +1,19 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ArtifactStore } from "./artifacts.js";
 import type { BrowserBackend } from "./browser_backend.js";
 import { PerceptionCache } from "./cache.js";
 import type { ExtensionConfig } from "./config.js";
+import {
+  type Plan,
+  StepStatus,
+  parsePlan,
+  planToDict,
+  progressSummary,
+  renderForPrompt,
+} from "./controller.js";
+import { classifyFailure } from "./failures.js";
+import type { ProgressStore, TaskProgress } from "./progress.js";
 import { ScreenRecorder } from "./screen_record.js";
 import { normalizeSkillSteps, type SkillStep, type SkillStore } from "./skills.js";
 import { annotateScreenshot } from "./som.js";
@@ -16,6 +27,7 @@ import {
   type ScreenshotResult,
   type WindowInfo,
 } from "./types.js";
+import { waitFor } from "./wait_for.js";
 
 type BackendProvider = () => Promise<DesktopBackend>;
 
@@ -31,6 +43,14 @@ export interface DesktopToolOptions {
   sessionSteps: SkillStep[];
   /** Mutable last-marks list for desktop_click_mark resolution. */
   lastMarks: { value: Mark[] };
+  /** Optional content-addressed store for large observations. */
+  artifactStore?: ArtifactStore;
+  /** Optional persistent task progress store. */
+  progressStore?: ProgressStore;
+  /** Mutable holder for the active plan (set when user starts a task). */
+  plan?: { value: Plan | undefined };
+  /** Mutable holder for the active progress record. */
+  progressRecord?: { value: TaskProgress | undefined };
 }
 
 const Region = Type.Object({
@@ -209,6 +229,16 @@ export function createDesktopTools(
         }
       } else {
         options.cache.invalidate();
+      }
+
+      // Auto-capture: if a read-heavy tool returned a large body, store it
+      // as an artifact and replace the inline body with a preview + id.
+      if (options.artifactStore) {
+        try {
+          await maybeCaptureArtifact(toolName, params, result, options.artifactStore);
+        } catch {
+          // best-effort; never let artifact capture break tool dispatch
+        }
       }
 
       void options.trace.writeEvent("tool_result", `OK ${toolName}`, { tool_name: toolName, details: result.details });
@@ -797,6 +827,225 @@ export function createDesktopTools(
     );
   }
 
+  // ── desktop_wait_for ────────────────────────────────────────────────
+  definitions.push(
+    defineTool({
+      name: "desktop_wait_for",
+      label: "Wait For",
+      description:
+        "Block until a target becomes observable on the desktop, or the timeout elapses. Use this after desktop_launch / browser_navigate / any action that triggers a slow UI transition, instead of immediately clicking on something that might not be drawn yet. Provide ONE of: window_title (substring), element_name (a11y name), text (visible label via OCR), window_id.",
+      promptSnippet: "desktop_wait_for: poll until a window/element/text appears.",
+      promptGuidelines: [
+        "Always call desktop_wait_for after desktop_launch before clicking inside the new window.",
+      ],
+      parameters: Type.Object({
+        window_title: Type.Optional(Type.String()),
+        element_name: Type.Optional(Type.String()),
+        text: Type.Optional(Type.String()),
+        window_id: Type.Optional(Type.String()),
+        timeout: Type.Optional(Type.Number({ description: "Seconds to wait (default 15)." })),
+      }),
+      executionMode: "sequential",
+      execute: wrap("desktop_wait_for", async (params, signal) => {
+        const backend = await getBackend();
+        const r = await waitFor(backend, {
+          windowTitle: params.window_title,
+          elementName: params.element_name,
+          text: params.text,
+          windowId: params.window_id,
+          timeout: params.timeout,
+        }, signal);
+        const msg = r.found
+          ? `Target ${r.target} matched after ${r.elapsed}s.`
+          : (r.error ?? `Target not found within ${r.timeout}s; tried ${JSON.stringify(r.targets)}.`);
+        return textResult(msg, r as unknown as Record<string, unknown>);
+      }),
+    }),
+  );
+
+  // ── Plan / artifact / checkpoint meta-tools ─────────────────────────
+  if (options.artifactStore || options.progressStore || options.plan) {
+    definitions.push(
+      defineTool({
+        name: "plan_get",
+        label: "Plan: get",
+        description: "Return the current typed plan (steps, ids, statuses). Use to remind yourself which step the controller expects you to work on. Returns null when no plan has been initialised this session.",
+        promptSnippet: "plan_get: read the current typed plan.",
+        parameters: Type.Object({}),
+        executionMode: "sequential",
+        execute: wrap("plan_get", async () => {
+          const plan = options.plan?.value;
+          if (!plan) return textResult("No structured plan in this session.", { plan: null });
+          return textResult(`Plan revision ${plan.revision}: ${progressSummary(plan)}.`, {
+            plan: planToDict(plan),
+            rendered: renderForPrompt(plan),
+          });
+        }),
+      }),
+      defineTool({
+        name: "plan_set",
+        label: "Plan: set",
+        description: "Initialise or replace the structured plan from a JSON document. The schema matches the typed planner output ({ steps: [{ id, goal, expected, tools_hint?, depends_on? }, ...] }). Use this once at the start of a complex multi-app task so plan_update_step / plan_get can track progress. Calling this again replaces the plan in place.",
+        promptSnippet: "plan_set: install a typed plan for this task.",
+        parameters: Type.Object({
+          plan_json: Type.String({ description: "JSON object with a 'steps' array." }),
+        }),
+        executionMode: "sequential",
+        execute: wrap("plan_set", async (params) => {
+          if (!options.plan) return textResult("Plan slot not configured.", { error: "no_plan_slot" });
+          const plan = parsePlan(params.plan_json);
+          if (!plan.steps.length) {
+            return textResult("Plan rejected — no steps parsed.", { error: "empty" });
+          }
+          options.plan.value = plan;
+          if (options.progressStore && options.progressRecord?.value) {
+            await options.progressStore.updatePlanSnapshot(options.progressRecord.value, planToDict(plan));
+          }
+          return textResult(`Plan installed with ${plan.steps.length} steps.`, {
+            plan: planToDict(plan),
+            rendered: renderForPrompt(plan),
+          });
+        }),
+      }),
+      defineTool({
+        name: "plan_update_step",
+        label: "Plan: update step",
+        description: "Mark a plan step done/skipped/blocked, or attach notes. Use this when finishing a step so plan_get reflects progress accurately.",
+        promptSnippet: "plan_update_step: change a step's status.",
+        parameters: Type.Object({
+          id: Type.String(),
+          status: Type.Optional(Type.Union([
+            Type.Literal("pending"),
+            Type.Literal("running"),
+            Type.Literal("done"),
+            Type.Literal("failed"),
+            Type.Literal("skipped"),
+            Type.Literal("blocked"),
+          ])),
+          notes: Type.Optional(Type.String()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("plan_update_step", async (params) => {
+          const plan = options.plan?.value;
+          if (!plan) return textResult("No plan in this session.", { error: "no_plan" });
+          const step = plan.steps.find((s) => s.id === params.id);
+          if (!step) return textResult(`No step with id ${params.id}.`, { error: "no_step" });
+          if (params.status) step.status = params.status as StepStatus;
+          if (params.notes) step.notes = step.notes ? `${step.notes}\n${params.notes}` : params.notes;
+          if (options.progressStore && options.progressRecord?.value) {
+            if (params.status === "done") {
+              await options.progressStore.markDone(options.progressRecord.value, step.id);
+            } else if (params.status === "failed" || params.status === "blocked") {
+              await options.progressStore.markFailed(options.progressRecord.value, step.id);
+            }
+            await options.progressStore.updatePlanSnapshot(options.progressRecord.value, planToDict(plan));
+          }
+          return textResult(`Step ${step.id} updated.`, { step });
+        }),
+      }),
+    );
+  }
+
+  if (options.artifactStore) {
+    const store = options.artifactStore;
+    definitions.push(
+      defineTool({
+        name: "get_artifact",
+        label: "Artifact: get",
+        description: "Fetch the body of a previously stored artifact (file content, command output, OCR snippet) by id. Use this when the agent context only shows an artifact summary and you need the full text.",
+        promptSnippet: "get_artifact: fetch a stored artifact by id.",
+        parameters: Type.Object({
+          id: Type.String({ description: "artifact://<id> or the bare id." }),
+        }),
+        executionMode: "sequential",
+        execute: wrap("get_artifact", async (params) => {
+          const art = await store.get(params.id);
+          if (!art) return textResult(`Unknown artifact id: ${params.id}.`, { error: "unknown_id" });
+          const body = (await store.getBody(params.id)) ?? "";
+          return textResult(`Artifact ${art.id} [${art.kind}] ${art.bytesLen}B.`, {
+            id: art.id,
+            kind: art.kind,
+            source: art.source,
+            summary: art.summary,
+            bytes: art.bytesLen,
+            content: body,
+          });
+        }),
+      }),
+      defineTool({
+        name: "list_artifacts",
+        label: "Artifact: list",
+        description: "List recent artifacts captured during this task. Use to find a previously-read file before re-reading it from disk.",
+        promptSnippet: "list_artifacts: enumerate recent stored artifacts.",
+        parameters: Type.Object({
+          kind: Type.Optional(Type.String()),
+          limit: Type.Optional(Type.Number()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("list_artifacts", async (params) => {
+          const items = await store.listRecent({ kind: params.kind, limit: params.limit });
+          return textResult(`Found ${items.length} artifacts.`, {
+            count: items.length,
+            artifacts: items.map((a) => ({
+              id: a.id, kind: a.kind, source: a.source,
+              summary: a.summary, bytes: a.bytesLen,
+            })),
+          });
+        }),
+      }),
+    );
+  }
+
+  if (options.progressStore) {
+    const ps = options.progressStore;
+    definitions.push(
+      defineTool({
+        name: "checkpoint",
+        label: "Checkpoint",
+        description: "Persist a free-form progress marker so the task can resume after a crash or abort. Use after non-trivial milestones (\"finished tab 3 of 7\", \"wrote intermediate output\").",
+        promptSnippet: "checkpoint: persist a progress marker.",
+        parameters: Type.Object({
+          label: Type.Optional(Type.String()),
+          data: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+        }),
+        executionMode: "sequential",
+        execute: wrap("checkpoint", async (params) => {
+          const rec = options.progressRecord?.value;
+          if (!rec) return textResult("No active progress record.", { saved: false });
+          const payload: Record<string, unknown> = { ...(params.data ?? {}) };
+          if (params.label) payload.label = params.label;
+          await ps.updateCheckpoint(rec, payload);
+          return textResult("Checkpoint saved.", { saved: true, checkpoint: payload });
+        }),
+      }),
+    );
+  }
+
+  // Diagnostics: classify a failure message — useful when the model is
+  // deciding whether to retry-with-wait, replan, or escalate.
+  definitions.push(
+    defineTool({
+      name: "classify_failure",
+      label: "Classify failure",
+      description: "Classify an error message into one of {transient_io, app_not_ready, missing_element, permission, predicate_not_met, user_input_needed, unknown} and recommend a recovery action. Use after a tool failure when you're unsure whether to retry, wait, or replan.",
+      promptSnippet: "classify_failure: get a recovery recommendation for an error string.",
+      parameters: Type.Object({
+        tool_name: Type.String(),
+        error_message: Type.String(),
+      }),
+      executionMode: "sequential",
+      execute: wrap("classify_failure", async (params) => {
+        const v = classifyFailure({
+          toolName: params.tool_name,
+          errorMessage: params.error_message,
+        });
+        return textResult(`${v.cls} → ${v.action} (${v.reason})`, {
+          class: v.cls, action: v.action, wait_seconds: v.waitSeconds, reason: v.reason,
+        });
+      }),
+    }),
+  );
+
   return definitions;
 }
 
@@ -844,6 +1093,59 @@ async function replayStep(backend: DesktopBackend, _opts: DesktopToolOptions, st
       return;
     default:
       throw new Error(`replay: tool ${step.tool} is not replayable`);
+  }
+}
+
+/**
+ * If a tool returned a long string body in its details (file content, page
+ * text, command stdout), store it in the artifact store and replace the
+ * inline body in the details object with a short preview and the artifact
+ * id.  Mutates ``result.details`` in place.
+ */
+async function maybeCaptureArtifact(
+  toolName: string,
+  params: Record<string, unknown>,
+  result: { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; details: Record<string, unknown> },
+  store: ArtifactStore,
+): Promise<void> {
+  let bodyKey: string | undefined;
+  let source = "";
+  switch (toolName) {
+    case "fs_read":
+      bodyKey = "content";
+      source = String(params["path"] ?? "");
+      break;
+    case "desktop_get_window_text":
+      bodyKey = "text";
+      break;
+    case "browser_get_text":
+      bodyKey = "text";
+      source = String(params["selector"] ?? "page");
+      break;
+    case "shell_run": {
+      const stdout = result.details["stdout"];
+      if (typeof stdout === "string" && stdout.length > 4096) {
+        const captured = await store.maybeCapture(stdout, {
+          kind: "shell_stdout",
+          source: String(params["command"] ?? "").slice(0, 120),
+        });
+        if (captured) {
+          result.details["stdout"] = stdout.slice(0, 400) + `\n...\n[stored as ${captured.id}]`;
+          result.details["stdout_artifact_id"] = captured.id;
+        }
+      }
+      return;
+    }
+    default:
+      return;
+  }
+  if (!bodyKey) return;
+  const body = result.details[bodyKey];
+  if (typeof body !== "string" || body.length <= 4096) return;
+  const captured = await store.maybeCapture(body, { kind: toolName, source });
+  if (captured) {
+    result.details[bodyKey] = captured.preview;
+    result.details[bodyKey + "_artifact_id"] = captured.id;
   }
 }
 

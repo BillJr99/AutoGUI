@@ -42,6 +42,13 @@ export interface ExtensionConfig {
   blockedWindowTitles: string[];
   /** When true, plan-first behaviour is included in the AUTOGUI_PROMPT. */
   plannerEnabled: boolean;
+  /** When true, the typed-plan controller protocol is injected into the prompt
+   *  and plan_set / plan_update_step / plan_get tools are wired to the plan slot. */
+  controllerEnabled: boolean;
+  /** Directory for the content-addressed artifact store. Empty = disabled. */
+  artifactsDir: string;
+  /** Directory for persistent task progress records. Empty = disabled. */
+  progressDir: string;
   screenRecord: {
     enabled: boolean;
     fps: number;
@@ -70,6 +77,9 @@ const DEFAULTS: ExtensionConfig = {
   allowedApps: [],
   blockedWindowTitles: [],
   plannerEnabled: true,
+  controllerEnabled: false,
+  artifactsDir: "",   // resolved to <extensionRoot>/runtime/artifacts in loadConfig
+  progressDir: "",    // resolved to <extensionRoot>/runtime/progress in loadConfig
   screenRecord: {
     enabled: true,
     fps: 5,
@@ -151,6 +161,12 @@ export async function loadConfig(extensionRoot: string): Promise<ExtensionConfig
   }
   if (!merged.screenRecord.outDir) {
     merged.screenRecord.outDir = join(extensionRoot, "runtime", "failures");
+  }
+  if (!merged.artifactsDir) {
+    merged.artifactsDir = join(extensionRoot, "runtime", "artifacts");
+  }
+  if (!merged.progressDir) {
+    merged.progressDir = join(extensionRoot, "runtime", "progress");
   }
 
   return merged;

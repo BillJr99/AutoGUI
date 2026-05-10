@@ -23,6 +23,27 @@
       "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces.",
       "enabled": true
     },
+    "controller": {
+      "_comment": "Typed plan + step-by-step executor. When enabled, the planner emits a JSON plan and each step runs in its own scoped history with its own iteration budget. Replan triggers automatically on persistent failures.",
+      "enabled": false,
+      "step_max_iterations": 8,
+      "step_max_retries": 2,
+      "auto_resume": true,
+      "replan_on_block": true
+    },
+    "artifacts": {
+      "_comment": "Content-addressed store for large observations (file bodies, command stdout, OCR snippets). The model fetches by id with get_artifact when it actually needs the body.",
+      "dir": "logs/artifacts"
+    },
+    "progress": {
+      "_comment": "Task progress markers persisted across runs so a crash or abort can resume mid-task.",
+      "dir": "logs/progress"
+    },
+    "subagent": {
+      "_comment": "Read-only subagent for pure-lookup questions; keeps the main conversation small.",
+      "enabled": true,
+      "max_tool_calls": 4
+    },
     "bon": {
       "_comment": "Best-of-N action sampling. Samples n completions and picks the best. Increases token cost on uncertain steps.",
       "enabled": true,
