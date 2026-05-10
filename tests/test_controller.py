@@ -120,6 +120,29 @@ def test_step_outcome_parses_blocked_marker():
     assert "captcha" in reason
 
 
+def test_step_outcome_no_marker_returns_blocked():
+    """A final assistant message with NO STEP_DONE / STEP_BLOCKED marker
+    is a protocol violation — the model narrated instead of acting.  The
+    parser must NOT treat this as implicit success: that lets the model
+    coast through every step without invoking tools.  BLOCKED routes
+    through the retry / replan path which re-prompts with the protocol
+    reminder so the next attempt actually executes."""
+    verdict, reason = parse_step_outcome(
+        "I'll now execute the plan step by step.",
+    )
+    assert verdict == StepVerdict.BLOCKED
+    # The narrative text is preserved in the reason so the controller
+    # can show the user what the model said instead of acting.
+    assert "no STEP_DONE" in reason
+    assert "execute the plan" in reason
+
+
+def test_step_outcome_empty_text_returns_failed():
+    verdict, reason = parse_step_outcome("")
+    assert verdict == StepVerdict.FAILED
+    assert reason
+
+
 def test_to_dict_round_trip_preserves_predicate_and_risks():
     plan = Plan(steps=[PlanStep(
         id="s1", goal="g", expected="e",

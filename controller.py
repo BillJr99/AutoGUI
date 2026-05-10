@@ -356,19 +356,29 @@ def parse_step_outcome(text: str) -> tuple[StepVerdict, str]:
     """
     Inspect the executor's final assistant text and return the implied
     verdict plus the proof / reason string.
+
+    The protocol REQUIRES a STEP_DONE / STEP_BLOCKED marker on the final
+    turn, so a missing marker is a protocol violation, not implicit
+    success.  The previous behaviour ("non-empty text = DONE") let the
+    model coast through the entire plan by just narrating "I'll execute
+    step 1" without invoking any tools — every step then closed as DONE
+    with zero actual work done.  Returning BLOCKED here routes through
+    the controller's retry / replan path, which re-prompts the model
+    with the protocol reminder so the next attempt actually acts.
     """
     if not text:
-        return StepVerdict.FAILED, ""
+        return StepVerdict.FAILED, "executor produced no final text"
     m = _DONE_RE.search(text)
     if m:
         return StepVerdict.DONE, m.group(1).strip()
     m = _BLOCKED_RE.search(text)
     if m:
         return StepVerdict.BLOCKED, m.group(1).strip()
-    # No explicit marker — accept the run as ``done`` only if the executor
-    # produced ANY non-error final text.  The caller is expected to have
-    # already checked that no tool failures occurred this turn.
-    return StepVerdict.DONE, text.strip()[:200]
+    return (
+        StepVerdict.BLOCKED,
+        "no STEP_DONE / STEP_BLOCKED marker; final text: "
+        + text.strip()[:160],
+    )
 
 
 # ---------------------------------------------------------------------------
