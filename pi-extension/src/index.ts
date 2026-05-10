@@ -67,10 +67,8 @@ ${controllerOn ? `Typed-plan protocol (REQUIRED):
 - After each step finishes, call check_predicate (when one is set), then plan_update_step(id, status="done").
 - If a step is blocked, call plan_update_step(id, status="blocked", notes="why"), then revise the plan with another plan_set call.
 - Use plan_get when you need to see current statuses; budget_status to see how much of the budget is used.
-- For long-running tasks, call checkpoint(label, data) after non-trivial milestones.
-- Use desktop_wait_for after desktop_launch / browser_navigate / any action that triggers a slow UI transition.
-- For pure read-only lookups, prefer get_artifact / list_artifacts to keep history small.
-- Classify persistent failures with classify_failure; record them via memory_note so future tasks see the warning.
+${progressOn ? "- For long-running tasks, call checkpoint(label, data) after non-trivial milestones.\n" : ""}- Use desktop_wait_for after desktop_launch / browser_navigate / any action that triggers a slow UI transition.
+${artifactsOn ? "- For pure read-only lookups, prefer get_artifact / list_artifacts to keep history small.\n" : ""}- Classify persistent failures with classify_failure${cfg.memoryEnabled ? "; record them via memory_note so future tasks see the warning" : ""}.
 
 ` : (planner ? `Planning protocol:
 - BEFORE taking any state-changing action, your FIRST assistant message must be a numbered plan of 3 to 8 high-level steps that will accomplish the task.

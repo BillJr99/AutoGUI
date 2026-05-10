@@ -1128,11 +1128,18 @@ export function createDesktopTools(
             return (r as { value?: unknown }).value;
           };
         }
-        helpers.findText = async (text: string) => {
-          const shot = await (await getBackend()).screenshot({ saveDir }, signal);
-          const f = await findText(shot.path, text, 0, signal);
-          return { found: !!f.found };
-        };
+        // Reuse the already-resolved backend instead of calling
+        // getBackend() a second time inside the OCR helper.  When the
+        // top-level resolve failed (backend is undefined), text_visible
+        // returns a clear error rather than triggering a second
+        // initialization attempt that would also fail.
+        if (backend) {
+          helpers.findText = async (text: string) => {
+            const shot = await backend.screenshot({ saveDir }, signal);
+            const f = await findText(shot.path, text, 0, signal);
+            return { found: !!f.found };
+          };
+        }
         const result = await checkPredicate(pred, backend, helpers);
         return textResult(
           `${result.ok ? "ok" : "FAIL"}: ${renderPredicate(pred)} — ${result.detail}`,

@@ -65,3 +65,22 @@ def test_file_absent_pass(tmp_path):
         {"kind": "file_absent", "path": str(tmp_path / "nope")},
     )
     assert res.ok is True
+
+
+def test_file_exists_rejects_directory(tmp_path):
+    """A directory at the path should NOT satisfy file_exists — the kind
+    is named for *files*, and the README documents that semantic."""
+    d = tmp_path / "a_dir"
+    d.mkdir()
+    res = check_filesystem_predicate_sync({"kind": "file_exists", "path": str(d)})
+    assert res.ok is False
+    assert "directory" in res.detail.lower() or "absent" in res.detail.lower()
+
+
+def test_file_absent_passes_for_directory(tmp_path):
+    """Symmetric: a directory at the path should NOT make file_absent
+    fail — only a regular file should count as 'present'."""
+    d = tmp_path / "a_dir"
+    d.mkdir()
+    res = check_filesystem_predicate_sync({"kind": "file_absent", "path": str(d)})
+    assert res.ok is True

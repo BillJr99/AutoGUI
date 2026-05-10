@@ -203,12 +203,16 @@ def _check_file_presence(p: dict, *, must_exist: bool) -> PredicateResult:
     path = str(p.get("path") or "")
     if not path:
         return PredicateResult(False, p["kind"], "empty path")
-    exists = Path(path).expanduser().exists()
-    if exists == must_exist:
+    # ``file_exists`` / ``file_absent`` are *file* predicates — a directory
+    # at the path should NOT satisfy file_exists, and a directory should
+    # NOT make file_absent fail.  Use is_file so both cases ignore
+    # directories the same way callers naturally read the kind name.
+    is_file = Path(path).expanduser().is_file()
+    if is_file == must_exist:
         return PredicateResult(True, p["kind"],
-                               f"file_{'exists' if exists else 'absent'} satisfied", path)
+                               f"file_{'exists' if is_file else 'absent'} satisfied", path)
     return PredicateResult(False, p["kind"],
-                           f"unexpectedly {'absent' if not exists else 'present'}: {path}")
+                           f"unexpectedly {'absent' if not is_file else 'present (or directory)'}: {path}")
 
 
 def _check_file_contains(p: dict) -> PredicateResult:

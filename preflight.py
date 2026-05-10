@@ -105,9 +105,15 @@ async def _check_file(target: str) -> PreflightResult:
     if not target:
         return PreflightResult(PreflightCheck("file", target), False, "empty path")
     expanded = os.path.expanduser(target)
-    if os.path.exists(expanded):
+    # The ``file`` check kind is documented as "a file exists at a path".
+    # ``os.path.exists`` would also pass for directories, so use isfile
+    # to avoid treating a directory as a satisfied file requirement.
+    if os.path.isfile(expanded):
         return PreflightResult(PreflightCheck("file", target), True,
                                f"resolved to {expanded}")
+    if os.path.isdir(expanded):
+        return PreflightResult(PreflightCheck("file", target), False,
+                               f"path is a directory, not a file: {expanded}")
     return PreflightResult(PreflightCheck("file", target), False,
                            f"missing: {expanded}")
 
