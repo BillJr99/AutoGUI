@@ -11,6 +11,17 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
+
+function isRegularFile(path: string): boolean {
+  // Match Python predicates._check_file_presence: directories must NOT
+  // satisfy file_exists and must NOT make file_absent fail.  Use stat
+  // and gracefully degrade to "not a file" on any I/O error.
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
 import { dirname } from "node:path";
 import type { DesktopBackend } from "./types.js";
 
@@ -81,19 +92,28 @@ export function checkFilesystemPredicateSync(p: Predicate): PredicateResult {
   switch (p.kind) {
     case "file_exists": {
       const path = p.path ?? "";
+      if (!path) return { ok: false, kind: p.kind, detail: "empty path" };
+      if (isRegularFile(path)) {
+        return { ok: true, kind: p.kind, detail: `path=${path}` };
+      }
+      const exists = existsSync(path);
       return {
-        ok: !!path && existsSync(path),
+        ok: false,
         kind: p.kind,
-        detail: path ? `path=${path}` : "empty path",
+        detail: exists
+          ? `path is a directory, not a file: ${path}`
+          : `missing: ${path}`,
       };
     }
     case "file_absent": {
       const path = p.path ?? "";
-      return {
-        ok: !!path && !existsSync(path),
-        kind: p.kind,
-        detail: path ? `path=${path}` : "empty path",
-      };
+      if (!path) return { ok: false, kind: p.kind, detail: "empty path" };
+      // file_absent passes for both "no entry" and "directory at this path"
+      // — only a regular file should count as "present".
+      if (!isRegularFile(path)) {
+        return { ok: true, kind: p.kind, detail: `path=${path}` };
+      }
+      return { ok: false, kind: p.kind, detail: `unexpectedly present: ${path}` };
     }
     case "file_contains": {
       const path = p.path ?? "";

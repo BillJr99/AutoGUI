@@ -7,7 +7,7 @@
  * ``PreflightResult`` so the report renders cleanly in either UI.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { connect } from "node:net";
@@ -54,9 +54,27 @@ async function checkApp(target: string): Promise<PreflightResult> {
 async function checkFile(target: string): Promise<PreflightResult> {
   if (!target) return { check: { kind: "file", target }, ok: false, detail: "empty path" };
   const path = expand(target);
-  return existsSync(path)
-    ? { check: { kind: "file", target }, ok: true, detail: `resolved to ${path}` }
-    : { check: { kind: "file", target }, ok: false, detail: `missing: ${path}` };
+  // The `file` check kind is documented as "a file exists at a path".
+  // existsSync would also pass for directories, so use statSync().isFile()
+  // to match the Python preflight._check_file behaviour and avoid
+  // treating a directory as a satisfied file requirement.
+  if (!existsSync(path)) {
+    return { check: { kind: "file", target }, ok: false, detail: `missing: ${path}` };
+  }
+  try {
+    if (statSync(path).isFile()) {
+      return { check: { kind: "file", target }, ok: true, detail: `resolved to ${path}` };
+    }
+    return {
+      check: { kind: "file", target }, ok: false,
+      detail: `path is a directory, not a file: ${path}`,
+    };
+  } catch (e) {
+    return {
+      check: { kind: "file", target }, ok: false,
+      detail: `stat failed: ${(e as Error).message}`,
+    };
+  }
 }
 
 async function checkUrl(target: string): Promise<PreflightResult> {
