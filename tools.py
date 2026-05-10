@@ -973,9 +973,10 @@ class ToolRegistry:
                         "or the timeout elapses.  Use this after desktop_launch / "
                         "browser_navigate / any action that triggers a slow UI "
                         "transition, instead of immediately clicking on something "
-                        "that might not be drawn yet.  Provide ONE of: "
+                        "that might not be drawn yet.  Provide one or more of: "
                         "window_title (substring), element_name (a11y name), "
-                        "text (visible label via OCR), window_id."
+                        "text (visible label via OCR), window_id.  When multiple "
+                        "are given, the wait succeeds as soon as any one matches."
                     ),
                     "parameters": {"type": "object", "properties": {
                         "window_title": {"type": "string"},
