@@ -247,26 +247,57 @@ def parse_plan(raw: str) -> Plan:
         steps with auto-generated ids.
 
     The fallback path means an old planner that ignores the typed-plan
-    instructions still produces a working plan.
+    instructions still produces a working plan — but we MUST not let
+    JSON-shaped text fall into that path on a parse failure, or every
+    line of the JSON (``{``, ``"steps": [``, …) becomes its own step
+    and the controller tries to execute braces as goals.
     """
     raw = (raw or "").strip()
     if not raw:
         return Plan()
 
-    # Strip code fences if present.
+    # Strip a leading code fence (```json) and trailing ``` if present.
     raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
 
-    # Try JSON first.
-    try:
-        data = json.loads(raw)
+    # Try JSON in three escalating passes so a single malformed
+    # character (trailing comma, surrounding prose, etc.) doesn't
+    # demote a valid plan to the numbered-list fallback.
+    json_attempts = [raw]
+    # 2. If there's prose surrounding the JSON, extract the outermost
+    #    {...} object (greedy match, single-line-by-default but DOTALL).
+    obj_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if obj_match and obj_match.group(0) != raw:
+        json_attempts.append(obj_match.group(0))
+    # 3. Try the same with the outermost [...] array so list-only plans
+    #    embedded in commentary still parse.
+    arr_match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if arr_match and arr_match.group(0) != raw:
+        json_attempts.append(arr_match.group(0))
+
+    for candidate in json_attempts:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
         if isinstance(data, dict) and "steps" in data:
             return Plan.from_dict(data)
         if isinstance(data, list):
             return Plan.from_dict({"steps": data})
-    except json.JSONDecodeError:
-        pass
 
-    # Legacy numbered-list fallback.
+    # If the input STARTS with a JSON-shaped character but every parse
+    # attempt failed, splitting it into lines would produce garbage
+    # steps named after braces and quotes.  Return an empty plan so
+    # the caller falls back to the legacy free-form executor instead
+    # of trying to execute "{" as a goal.
+    if raw.lstrip().startswith(("{", "[")):
+        logger.warning(
+            "[controller.parse_plan] JSON-shaped plan failed to parse; "
+            "returning empty plan so caller can fall back. raw_head=%r",
+            raw[:160],
+        )
+        return Plan()
+
+    # Legacy numbered-list fallback (free-text planner output).
     steps: list[PlanStep] = []
     for i, line in enumerate(raw.splitlines(), 1):
         line = line.strip()

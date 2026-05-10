@@ -38,6 +38,43 @@ def test_parse_plan_falls_back_to_numbered_list():
     assert plan.steps[1].goal == "step two"
 
 
+def test_parse_plan_recovers_json_with_surrounding_prose():
+    """Models sometimes wrap their JSON in a prose preamble like
+    ``Here is the plan:`` or trailing commentary.  Strict json.loads
+    rejects that; the parser should still extract the outermost
+    {...} block instead of falling through to the line splitter."""
+    raw = (
+        "Here's the plan you asked for:\n\n"
+        '{"steps": [{"id": "s1", "goal": "open notepad"}]}\n\n'
+        "Let me know if you want me to revise."
+    )
+    plan = parse_plan(raw)
+    assert len(plan.steps) == 1
+    assert plan.steps[0].id == "s1"
+    assert plan.steps[0].goal == "open notepad"
+
+
+def test_parse_plan_does_not_split_broken_json_into_brace_steps():
+    """If a JSON-shaped plan fails to parse (trailing comma, missing
+    quote, single-line stray comma), we MUST NOT fall back to the
+    numbered-list splitter — that would produce one "step" per
+    physical line of the JSON, including ``{``, ``"steps": [``,
+    ``},`` etc.  Return an empty plan so the controller cleanly
+    falls back to the legacy free-form executor."""
+    raw = (
+        "{\n"
+        '  "steps": [\n'
+        '    {"id": "s1", "goal": "open notepad",},\n'  # trailing comma → invalid
+        "  ]\n"
+        "}\n"
+    )
+    plan = parse_plan(raw)
+    assert plan.steps == [], (
+        f"expected empty plan from broken JSON, got {len(plan.steps)} steps: "
+        f"{[s.goal for s in plan.steps]}"
+    )
+
+
 def test_next_runnable_respects_dependencies():
     plan = Plan(steps=[
         PlanStep(id="a", goal=""),

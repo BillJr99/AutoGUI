@@ -658,8 +658,33 @@ Examples
     return parser.parse_args()
 
 
+def _suppress_windows_proactor_resource_warnings() -> None:
+    """Silence the noisy "I/O operation on closed pipe" /
+    "unclosed transport" ResourceWarnings that the Python 3.13 Windows
+    ProactorEventLoop emits at process exit when subprocesses we spawned
+    (PowerShell helpers for desktop_launch, screenshot, etc.) get torn
+    down by the GC after the loop has already closed.
+
+    The transports ARE closed cleanly at runtime — this is a known
+    cosmetic race in CPython's __del__ that fires during interpreter
+    shutdown.  The warnings flood the user's terminal on Ctrl+C and add
+    no diagnostic value, so suppress them.  Only fires on Windows; on
+    Linux/macOS asyncio uses the SelectorEventLoop which doesn't have
+    this issue.
+    """
+    if sys.platform != "win32":
+        return
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message=r"unclosed transport.*",
+        category=ResourceWarning,
+    )
+
+
 def main():
     args = parse_args()
+    _suppress_windows_proactor_resource_warnings()
 
     # -- Load and patch configuration -----------------------------------
     try:
