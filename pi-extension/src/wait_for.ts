@@ -45,9 +45,16 @@ export async function waitFor(
   if (options.windowId) targets.window_id = options.windowId;
 
   if (Object.keys(targets).length === 0) {
+    // Match the timeout/success branches' shape so callers can branch
+    // on `target` / `elapsed` / `lastObservation` without KeyError-ing.
+    // Mirrors the Python wait_for early-return contract.
     return {
       found: false,
+      target: undefined,
       elapsed: 0,
+      timeout: Math.max(0.5, options.timeout ?? 15.0),
+      targets: {},
+      lastObservation: {},
       error: "wait_for requires at least one of window_title, element_name, text, window_id.",
     };
   }
@@ -129,7 +136,11 @@ export async function waitFor(
     }
 
     const remaining = (deadline - Date.now()) / 1000;
-    const sleep = Math.max(0.05, Math.min(pollInterval, remaining));
+    // Floor at 0 (NOT 0.05) — a 50ms minimum sleep would push the loop
+    // past the configured deadline near the end of the window.
+    // setTimeout with a non-positive delay queues a microtask, which is
+    // exactly what we want when we're already at the deadline.
+    const sleep = remaining <= 0 ? 0 : Math.min(pollInterval, remaining);
     await new Promise((r) => setTimeout(r, sleep * 1000));
     if (signal?.aborted) {
       return { found: false, elapsed: elapsedSec(start), error: "aborted" };

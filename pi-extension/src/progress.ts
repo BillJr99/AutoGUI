@@ -45,26 +45,44 @@ function progressToPython(rec: TaskProgress): Record<string, unknown> {
 
 /** Parse from disk.  Accept the Python schema as authoritative AND the
  *  legacy camelCase shape that older extension builds wrote, so existing
- *  in-flight tasks still resume after the upgrade. */
+ *  in-flight tasks still resume after the upgrade.  Each field is
+ *  type-validated against the expected shape — a corrupted or
+ *  forward-version record where, say, `completed_step_ids` is a string
+ *  must NOT silently flow through and crash later code that does
+ *  `array.includes(...)`. */
 function progressFromDisk(parsed: unknown): TaskProgress | undefined {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
   const o = parsed as Record<string, unknown>;
-  const pick = <T,>(snake: string, camel: string, fallback: T): T => {
-    const v = o[snake] !== undefined ? o[snake] : o[camel];
-    return (v ?? fallback) as T;
-  };
-  const taskId = pick("task_id", "taskId", "");
-  if (!taskId) return undefined;
-  const status = pick("status", "status", "running") as TaskProgress["status"];
+  const raw = (snake: string, camel: string): unknown =>
+    o[snake] !== undefined ? o[snake] : o[camel];
+  const taskId = raw("task_id", "taskId");
+  if (typeof taskId !== "string" || !taskId) return undefined;
+  const stringArr = (v: unknown): string[] =>
+    Array.isArray(v) ? (v as unknown[]).map((x) => String(x)) : [];
+  const plainObj = (v: unknown): Record<string, unknown> =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : {};
+  const num = (v: unknown, fallback: number): number =>
+    typeof v === "number" && Number.isFinite(v) ? v : fallback;
+  const validStatuses = new Set(["running", "done", "failed", "abandoned"]);
+  const rawStatus = raw("status", "status");
+  const status: TaskProgress["status"] =
+    typeof rawStatus === "string" && validStatuses.has(rawStatus)
+      ? (rawStatus as TaskProgress["status"])
+      : "running";
+  const now = Date.now() / 1000;
   return {
     taskId,
-    userInput: pick("user_input", "userInput", ""),
-    created: pick("created", "created", Date.now() / 1000),
-    updated: pick("updated", "updated", Date.now() / 1000),
-    completedStepIds: pick("completed_step_ids", "completedStepIds", []),
-    failedStepIds: pick("failed_step_ids", "failedStepIds", []),
-    planSnapshot: pick("plan_snapshot", "planSnapshot", {}),
-    checkpointData: pick("checkpoint_data", "checkpointData", {}),
+    userInput: typeof raw("user_input", "userInput") === "string"
+      ? (raw("user_input", "userInput") as string)
+      : "",
+    created: num(raw("created", "created"), now),
+    updated: num(raw("updated", "updated"), now),
+    completedStepIds: stringArr(raw("completed_step_ids", "completedStepIds")),
+    failedStepIds: stringArr(raw("failed_step_ids", "failedStepIds")),
+    planSnapshot: plainObj(raw("plan_snapshot", "planSnapshot")),
+    checkpointData: plainObj(raw("checkpoint_data", "checkpointData")),
     status,
   };
 }

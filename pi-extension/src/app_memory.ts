@@ -58,25 +58,42 @@ function recordToPython(rec: AppRecord): Record<string, unknown> {
 
 /** Parse from disk.  Accept the Python schema as the authoritative format
  *  AND the legacy camelCase shape that older extension builds wrote, so
- *  records produced before this migration still load. */
+ *  records produced before this migration still load.  Each field is
+ *  type-validated — a corrupted record where, say, ``failure_counts`` is
+ *  a string must not silently flow through and explode later when
+ *  ``Object.entries(...)`` runs over it. */
 function recordFromDisk(parsed: unknown, app: string): AppRecord {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return emptyRecord(app);
   }
   const o = parsed as Record<string, unknown>;
-  const pick = <T,>(snake: string, camel: string, fallback: T): T => {
-    const v = o[snake] !== undefined ? o[snake] : o[camel];
-    return (v ?? fallback) as T;
+  const raw = (snake: string, camel: string): unknown =>
+    o[snake] !== undefined ? o[snake] : o[camel];
+  const numberMap = (v: unknown): Record<string, number> => {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    const out: Record<string, number> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      if (typeof val === "number" && Number.isFinite(val)) out[k] = val;
+    }
+    return out;
   };
-  const rec: AppRecord = {
+  const objArr = (v: unknown): Record<string, unknown>[] => {
+    if (!Array.isArray(v)) return [];
+    return v.filter(
+      (e): e is Record<string, unknown> =>
+        !!e && typeof e === "object" && !Array.isArray(e),
+    );
+  };
+  return {
     app: typeof o["app"] === "string" && o["app"] ? (o["app"] as string) : normalizeApp(app),
-    failureCounts: pick("failure_counts", "failureCounts", {}),
-    successCounts: pick("success_counts", "successCounts", {}),
-    lastFailures: pick("last_failures", "lastFailures", []),
-    notes: pick("notes", "notes", []),
-    updated: typeof o["updated"] === "number" ? (o["updated"] as number) : Date.now() / 1000,
+    failureCounts: numberMap(raw("failure_counts", "failureCounts")),
+    successCounts: numberMap(raw("success_counts", "successCounts")),
+    lastFailures: objArr(raw("last_failures", "lastFailures")) as AppRecord["lastFailures"],
+    notes: objArr(raw("notes", "notes")) as AppRecord["notes"],
+    updated: typeof o["updated"] === "number" && Number.isFinite(o["updated"] as number)
+      ? (o["updated"] as number)
+      : Date.now() / 1000,
   };
-  return rec;
 }
 
 export class AppMemory {

@@ -198,6 +198,14 @@ async def run_preflight(checks: list[PreflightCheck], registry=None) -> Prefligh
                                        f"unknown preflight kind: {kind}")
             coros.append(_bad())
     results = await asyncio.gather(*coros, return_exceptions=False)
+    # The per-kind checkers build a fresh PreflightCheck(kind, target) for
+    # the result, dropping any caller-supplied ``note`` — so the user's
+    # explanation (e.g. "step s3 hints xdg-open") never made it into
+    # PreflightReport.to_dict().  Copy the original ``note`` back onto each
+    # result so reports keep the context the planner / inferrer attached.
+    for original, result in zip(checks, results):
+        if original.note:
+            result.check.note = original.note
     return PreflightReport(results=list(results))
 
 

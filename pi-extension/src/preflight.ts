@@ -150,16 +150,24 @@ export async function runPreflight(
   },
 ): Promise<PreflightReport> {
   const results = await Promise.all(checks.map(async (c) => {
+    let r: PreflightResult;
     switch (c.kind) {
-      case "app": return checkApp(c.target);
-      case "file": return checkFile(c.target);
-      case "url": return checkUrl(c.target);
-      case "tool": return checkTool(c.target, helpers.registeredTools);
-      case "command": return checkCommand(c.target, helpers.runShell);
-      default: return {
-        check: c, ok: false, detail: `unknown preflight kind: ${(c as { kind: string }).kind}`,
-      };
+      case "app": r = await checkApp(c.target); break;
+      case "file": r = await checkFile(c.target); break;
+      case "url": r = await checkUrl(c.target); break;
+      case "tool": r = await checkTool(c.target, helpers.registeredTools); break;
+      case "command": r = await checkCommand(c.target, helpers.runShell); break;
+      default:
+        return {
+          check: c, ok: false, detail: `unknown preflight kind: ${(c as { kind: string }).kind}`,
+        };
     }
+    // The per-kind checkers build a fresh PreflightCheck(kind, target) for
+    // the result, dropping any caller-supplied note (e.g. "step s3 hints
+    // xdg-open").  Re-attach the original note so reports keep the
+    // context the planner / inferrer attached.  Mirrors the Python fix.
+    if (c.note) r.check = { ...r.check, note: c.note };
+    return r;
   }));
   return { results, allPassed: results.every((r) => r.ok) };
 }

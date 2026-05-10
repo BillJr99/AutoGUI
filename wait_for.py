@@ -122,8 +122,15 @@ async def wait_for(
                 "targets": targets,
                 "last_observation": last_observation,
             }
-        # Sleep until next poll, but never past the deadline.
-        await asyncio.sleep(min(poll_interval, max(0.05, deadline - time.monotonic())))
+        # Sleep until next poll, but never past the deadline.  Floor at
+        # 0 (NOT 0.05) — a 50ms minimum sleep would push us past the
+        # configured deadline near the end of the window.  asyncio.sleep
+        # with 0/negative arguments yields control without sleeping.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            await asyncio.sleep(0)
+        else:
+            await asyncio.sleep(min(poll_interval, remaining))
 
 
 def _ok(start: float, kind: str, observation: Any) -> dict[str, Any]:
