@@ -63,10 +63,21 @@ class AppMemory:
     leave a half-written file.
     """
 
-    def __init__(self, directory: str = "memory"):
+    def __init__(self, directory: str = "memory", *, allow_writes: bool = False):
+        # Lazy-create semantics, matching SkillStore: the constructor
+        # never touches the disk, so a read-only AppMemory leaves no
+        # ``memory/`` directory behind.  ``allow_writes`` gates the
+        # mutators (record_failure / record_success / add_note); when
+        # False they are silent no-ops.  Reads always work — get() and
+        # hint_for_planner() simply return empty records when the
+        # underlying file does not exist.
         self._dir = Path(directory).expanduser()
-        self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = self._dir / "index.jsonl"
+        self._allow_writes = bool(allow_writes)
+
+    @property
+    def allow_writes(self) -> bool:
+        return self._allow_writes
 
     # ------------------------------------------------------------------
     # I/O
@@ -88,6 +99,18 @@ class AppMemory:
             return AppRecord(app=_normalize_app(app))
 
     def _save(self, rec: AppRecord) -> None:
+        # Hard guard: callers gate at the recorder level, but a
+        # belt-and-braces check here means a misuse never accidentally
+        # writes a memory file when allow_writes is False.
+        if not self._allow_writes:
+            return
+        # Lazy directory creation — only on the write path, so a
+        # read-only store with no on-disk records leaves nothing behind.
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("[app_memory] mkdir failed for %s: %s", self._dir, e)
+            return
         p = self._path_for(rec.app)
         tmp = p.with_suffix(p.suffix + ".tmp")
         try:
@@ -170,6 +193,10 @@ class AppMemory:
         return "\n".join(lines)
 
     def list_apps(self) -> list[str]:
+        # ``listing a missing directory`` is a no-op rather than an error
+        # so a read-only store on a fresh checkout simply returns [].
+        if not self._dir.exists():
+            return []
         return sorted(p.stem for p in self._dir.glob("*.json"))
 
 

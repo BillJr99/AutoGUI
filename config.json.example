@@ -46,7 +46,8 @@
       "dir": "logs/progress"
     },
     "memory": {
-      "_comment": "Per-app failure/success histograms + free-form notes. Surfaced to the planner as 'app memory hints' so future tasks against the same app see what worked / failed before. Lives under ./memory (git-ignored). The pi-extension keeps its own memory under pi-extension/runtime/memory/.",
+      "_comment": "Per-app failure/success histograms + free-form notes, surfaced to the planner as 'app memory hints' so future tasks against the same app see what worked / failed before. enabled controls CREATION ONLY (mirrors skills_enabled): when false (the default) memory_get and the planner's app-memory hints continue to read whatever is already at dir, but memory_note is not registered, the controller does NOT auto-record successes/failures, and no memory/ directory is created. The standalone agent stores at ./memory/ (git-ignored, distinct from pi-extension/runtime/memory/) — both directories are created lazily the first time something is written.",
+      "enabled": false,
       "dir": "memory"
     },
     "budget": {

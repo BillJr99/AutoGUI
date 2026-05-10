@@ -159,6 +159,24 @@ async def test_controller_dispatches_a_tool_call(tmp_path):
     assert any(e.kind == "step_done" for e in events)
 
 
+def test_memory_note_only_when_enabled(tmp_path):
+    """Default config: memory_get registered, memory_note absent;
+    flip the flag and memory_note appears."""
+    cfg = _config(tmp_path)
+    cfg["agent"]["memory"]["enabled"] = False
+    a1 = Agent(StubClient(), StubRegistry(), cfg)
+    tools_off = set(a1._registry.list_tools())
+    assert "memory_get" in tools_off
+    assert "memory_note" not in tools_off
+    assert not (tmp_path / "memory").exists(), "memory dir must not be created"
+
+    cfg["agent"]["memory"]["enabled"] = True
+    a2 = Agent(StubClient(), StubRegistry(), cfg)
+    tools_on = set(a2._registry.list_tools())
+    assert "memory_get" in tools_on
+    assert "memory_note" in tools_on
+
+
 @pytest.mark.asyncio
 async def test_controller_budget_ceiling_stops_loop(tmp_path):
     cfg = _config(tmp_path)

@@ -1164,13 +1164,18 @@ export function createDesktopTools(
   }
 
   // ── memory_get / memory_note ───────────────────────────────────────
+  // memory_get is read-only and registers whenever the store exists,
+  // so existing app-memory records remain queryable even when the
+  // user has not opted in to creation.  memory_note (which writes new
+  // records) is gated behind cfg.memoryEnabled / appMemory.writes,
+  // mirroring how skill_save is gated behind skillsEnabled.
   if (options.appMemory) {
     const mem = options.appMemory;
     definitions.push(
       defineTool({
         name: "memory_get",
         label: "Memory: get",
-        description: "Read the per-app memory record (failure histogram, success counts, recent notes). Pass an empty app to list every recorded app.",
+        description: "Read the per-app memory record (failure histogram, success counts, recent notes). Pass an empty app to list every recorded app. Always available — reads are not gated by memoryEnabled.",
         promptSnippet: "memory_get: inspect what worked / failed for an app.",
         parameters: Type.Object({
           app: Type.Optional(Type.String()),
@@ -1186,23 +1191,27 @@ export function createDesktopTools(
                             rec as unknown as Record<string, unknown>);
         }),
       }),
-      defineTool({
-        name: "memory_note",
-        label: "Memory: note",
-        description: "Attach a free-form note (\"input box doesn't respond to ctrl+a\") to an app's memory record so future tasks see the warning.",
-        promptSnippet: "memory_note: persist a per-app warning.",
-        parameters: Type.Object({
-          app: Type.String(),
-          text: Type.String(),
-          tag: Type.Optional(Type.String()),
-        }),
-        executionMode: "sequential",
-        execute: wrap("memory_note", async (params) => {
-          await mem.addNote({ app: params.app, text: params.text, tag: params.tag });
-          return textResult(`Note saved for ${params.app}.`, { saved: true });
-        }),
-      }),
     );
+    if (mem.writes) {
+      definitions.push(
+        defineTool({
+          name: "memory_note",
+          label: "Memory: note",
+          description: "Attach a free-form note (\"input box doesn't respond to ctrl+a\") to an app's memory record so future tasks see the warning.",
+          promptSnippet: "memory_note: persist a per-app warning.",
+          parameters: Type.Object({
+            app: Type.String(),
+            text: Type.String(),
+            tag: Type.Optional(Type.String()),
+          }),
+          executionMode: "sequential",
+          execute: wrap("memory_note", async (params) => {
+            await mem.addNote({ app: params.app, text: params.text, tag: params.tag });
+            return textResult(`Note saved for ${params.app}.`, { saved: true });
+          }),
+        }),
+      );
+    }
   }
 
   // ── preflight ──────────────────────────────────────────────────────

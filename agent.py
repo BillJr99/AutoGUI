@@ -337,10 +337,22 @@ class Agent:
         # Lives under <agent.memory.dir> (default ./memory) and survives
         # across sessions so the planner can warn about app quirks the
         # next time the user touches the same app.
+        #
+        # ``memory.enabled`` controls CREATION only.  When false (the
+        # default) existing records remain readable via memory_get and
+        # the planner still consumes hints from on-disk memory, but
+        # record_failure / record_success / add_note become silent
+        # no-ops and memory_note is not registered as a tool.  This
+        # mirrors the skills.skills_enabled gate and keeps the agent
+        # from writing a memory/ directory unless the user opts in.
         memory_cfg = self._agent_cfg.get("memory", {}) or {}
+        self._memory_enabled: bool = bool(memory_cfg.get("enabled", False))
         self._memory: AppMemory | None = None
         try:
-            self._memory = AppMemory(memory_cfg.get("dir", "memory"))
+            self._memory = AppMemory(
+                memory_cfg.get("dir", "memory"),
+                allow_writes=self._memory_enabled,
+            )
         except Exception as e:
             logger.warning("[agent] AppMemory init failed: %s", e)
             self._memory = None
@@ -712,17 +724,15 @@ class Agent:
             )
 
         # ---- App-memory tools ------------------------------------------
+        # memory_get is read-only and registers whenever the store
+        # exists; memory_note creates new entries and is gated behind
+        # agent.memory.enabled so a default install never writes a
+        # memory/ directory.
         if self._memory is not None:
             async def _memory_get(app: str = "") -> dict:
                 if not app:
                     return {"apps": agent._memory.list_apps()}
                 return agent._memory.get(str(app))
-
-            async def _memory_note(app: str, text: str, tag: str = "") -> dict:
-                if not app or not text:
-                    return {"error": "app and text are required"}
-                agent._memory.add_note(app=str(app), text=str(text), tag=str(tag or ""))
-                return {"saved": True, "app": _normalize_app(str(app))}
 
             registry.add_tool(
                 {"type": "function", "function": {
@@ -731,7 +741,8 @@ class Agent:
                         "Read the per-app memory record for an app (failure "
                         "histogram, success counts, recent notes).  Pass an "
                         "empty app to list every app the memory store has "
-                        "ever recorded."
+                        "ever recorded.  Always available — reads are not "
+                        "gated by agent.memory.enabled."
                     ),
                     "parameters": {"type": "object", "properties": {
                         "app": {"type": "string"},
@@ -739,22 +750,30 @@ class Agent:
                 }},
                 _memory_get,
             )
-            registry.add_tool(
-                {"type": "function", "function": {
-                    "name": "memory_note",
-                    "description": (
-                        "Attach a free-form note (\"Slack input box doesn't "
-                        "respond to ctrl+a\") to an app's memory record so "
-                        "future tasks against the same app see the warning."
-                    ),
-                    "parameters": {"type": "object", "properties": {
-                        "app": {"type": "string"},
-                        "text": {"type": "string"},
-                        "tag": {"type": "string"},
-                    }, "required": ["app", "text"]},
-                }},
-                _memory_note,
-            )
+
+            if self._memory_enabled:
+                async def _memory_note(app: str, text: str, tag: str = "") -> dict:
+                    if not app or not text:
+                        return {"error": "app and text are required"}
+                    agent._memory.add_note(app=str(app), text=str(text), tag=str(tag or ""))
+                    return {"saved": True, "app": _normalize_app(str(app))}
+
+                registry.add_tool(
+                    {"type": "function", "function": {
+                        "name": "memory_note",
+                        "description": (
+                            "Attach a free-form note (\"Slack input box doesn't "
+                            "respond to ctrl+a\") to an app's memory record so "
+                            "future tasks against the same app see the warning."
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "app": {"type": "string"},
+                            "text": {"type": "string"},
+                            "tag": {"type": "string"},
+                        }, "required": ["app", "text"]},
+                    }},
+                    _memory_note,
+                )
 
         # ---- Budget tool -----------------------------------------------
         async def _budget_status() -> dict:
@@ -1098,8 +1117,10 @@ class Agent:
                 step.status = StepStatus.DONE
                 step.last_error = ""
                 # Record per-app success so the planner can prefer the
-                # tools that worked next time.
-                if self._memory is not None:
+                # tools that worked next time.  Skipped when memory
+                # creation is disabled — the call would no-op anyway,
+                # but cheaper not to make it.
+                if self._memory is not None and self._memory_enabled:
                     try:
                         active_app = await self._best_effort_active_app()
                         if active_app:
@@ -1144,8 +1165,9 @@ class Agent:
             )
 
             # Record the failure against the active app's memory so the
-            # next plan can warn about it.
-            if self._memory is not None:
+            # next plan can warn about it.  Same gate as success-record
+            # above: skipped entirely when memory creation is disabled.
+            if self._memory is not None and self._memory_enabled:
                 try:
                     active_app = await self._best_effort_active_app()
                     if active_app:

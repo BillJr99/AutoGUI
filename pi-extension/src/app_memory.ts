@@ -42,8 +42,19 @@ function emptyRecord(app: string): AppRecord {
 }
 
 export class AppMemory {
-  constructor(private readonly dir: string) {}
+  /**
+   * ``allowWrites`` gates the mutators (recordFailure / recordSuccess /
+   * addNote).  When false they are silent no-ops, the constructor
+   * never touches the disk, and listApps() returns [] for a missing
+   * directory — so a read-only store on a fresh checkout leaves no
+   * filesystem state behind.
+   */
+  constructor(
+    private readonly dir: string,
+    private readonly allowWrites: boolean = false,
+  ) {}
 
+  /** Always safe — only fires on the write path. */
   private async ensureDir(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
   }
@@ -53,7 +64,8 @@ export class AppMemory {
   }
 
   private async load(app: string): Promise<AppRecord> {
-    await this.ensureDir();
+    // No mkdir on the read path — a missing directory simply means "no
+    // record yet", returned as an empty AppRecord.
     const p = this.pathFor(app);
     if (!existsSync(p)) return emptyRecord(app);
     try {
@@ -65,6 +77,10 @@ export class AppMemory {
   }
 
   private async save(rec: AppRecord): Promise<void> {
+    // Hard guard mirrored from Python: callers gate at the recorder
+    // level, but a misuse never accidentally writes a memory file when
+    // allowWrites is false.
+    if (!this.allowWrites) return;
     await this.ensureDir();
     const p = this.pathFor(rec.app);
     const tmp = p + ".tmp";
@@ -139,7 +155,8 @@ export class AppMemory {
   }
 
   async listApps(): Promise<string[]> {
-    await this.ensureDir();
+    // Don't mkdir on the read path; ENOENT cleanly maps to [].
+    if (!existsSync(this.dir)) return [];
     try {
       const files = await readdir(this.dir);
       return files
@@ -149,5 +166,11 @@ export class AppMemory {
     } catch {
       return [];
     }
+  }
+
+  /** Whether the store will persist new records.  Useful for tools.ts
+   *  to decide whether to register memory_note. */
+  get writes(): boolean {
+    return this.allowWrites;
   }
 }

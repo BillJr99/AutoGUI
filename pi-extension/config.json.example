@@ -39,7 +39,8 @@
   "_progress_section": "Persistent task progress markers under pi-extension/runtime/progress. Re-running the same task text resumes where the previous attempt stopped. Set progressDir to an empty string to disable.",
   "progressDir": "",
 
-  "_memory_section": "Per-app memory store (failure histograms, success counts, free-form notes attached via memory_note). Default lives at pi-extension/runtime/memory — separate from the standalone Python agent's ./memory directory so each side has its own quirk database. Set memoryDir to an empty string to disable.",
+  "_memory_section": "Per-app memory store (failure histograms, success counts, free-form notes). memoryEnabled controls CREATION ONLY (mirrors skillsEnabled): when false (the default) memory_get and the planner's app-memory hints continue to read whatever is already at memoryDir, but memory_note is NOT registered and the controller does not persist new records. Default storage is pi-extension/runtime/memory — separate from the standalone Python agent's ./memory directory so each side has its own quirk database. Set memoryDir to an empty string to disable the store entirely.",
+  "memoryEnabled": false,
   "memoryDir": "",
 
   "_budget_section": "Per-task ceilings consulted by the budget_status tool. 0 = no ceiling. Pi owns the LLM loop, so the extension only counts tool calls + wall time directly; the model is expected to call budget_status periodically and wrap up early when the fraction is high.",

@@ -162,7 +162,10 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
       progressStore = new ProgressStore(cfg.progressDir);
     }
     if (cfg.memoryDir) {
-      appMemory = new AppMemory(cfg.memoryDir);
+      // Always construct so memory_get + the planner's app-memory hints
+      // can read whatever already exists on disk; cfg.memoryEnabled
+      // controls whether new records are persisted.
+      appMemory = new AppMemory(cfg.memoryDir, cfg.memoryEnabled);
     }
     budget = new BudgetTracker({
       maxToolCalls: cfg.budget.maxToolCalls,

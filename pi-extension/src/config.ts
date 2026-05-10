@@ -59,6 +59,12 @@ export interface ExtensionConfig {
   /** Directory for the per-app memory store (failure histograms, success
    *  counts, free-form notes).  Empty string disables app memory. */
   memoryDir: string;
+  /** When true, memory_note registers and the controller persists
+   *  recordFailure / recordSuccess / addNote calls.  Default false:
+   *  memory_get and the planner's app-memory hints continue to read
+   *  whatever is already on disk, but the extension itself never
+   *  creates a memory file. */
+  memoryEnabled: boolean;
   /** Hard ceilings for the per-task budget tracker.  0 = no ceiling. */
   budget: {
     maxToolCalls: number;
@@ -97,6 +103,7 @@ const DEFAULTS: ExtensionConfig = {
   artifactsDir: "",   // resolved to <extensionRoot>/runtime/artifacts in loadConfig
   progressDir: "",    // resolved to <extensionRoot>/runtime/progress in loadConfig
   memoryDir: "",      // resolved to <extensionRoot>/runtime/memory in loadConfig
+  memoryEnabled: false,
   budget: {
     maxToolCalls: 0,
     maxSeconds: 0,

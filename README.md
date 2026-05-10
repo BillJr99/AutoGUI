@@ -471,6 +471,43 @@ If you want a single shared library across both programs, point
 `skills_path` and `skillsPath` at the same absolute path — the default
 is to keep them separate so each program's library is private.
 
+### App-memory library
+
+Per-app quirk database — failure histograms, success counts, and free-form
+notes attached to an app via `memory_note(app, text)`.  Surfaced into the
+planner as "app memory hints" for any apps visible at task start so plans
+bias toward strategies that worked before.
+
+**`agent.memory.enabled` controls *creation* only.**  Same pattern as
+`skills_enabled`:
+
+| `memory.enabled` | `memory_get` | planner hints | controller auto-records | `memory_note` | `memory/` dir on disk |
+|---|---|---|---|---|---|
+| `false` (default) | ✓ | ✓ (reads existing) | — | — (not registered) | none until user opts in |
+| `true` | ✓ | ✓ | ✓ | ✓ | created lazily on first write |
+
+```jsonc
+{
+  "agent": {
+    "memory": {
+      "enabled": false,        // default — no NEW records are written
+      "dir": "memory"          // standalone-agent quirk database
+    }
+  }
+}
+```
+
+The standalone agent stores at `./memory/`; the Pi extension stores at
+`pi-extension/runtime/memory/`.  Both directories are git-ignored and
+created lazily the first time `memory_note` (or the controller's auto-
+recorder) actually fires.  Point both at the same absolute path if you
+want a single shared quirk database across both programs.
+
+| Side | Default memory path | Config key (creation gate) |
+|------|---------------------|----------------------------|
+| Standalone Python agent | `memory/` | `agent.memory.enabled` |
+| Pi extension | `pi-extension/runtime/memory/` | `memoryEnabled` (in `pi-extension/config.json`) |
+
 ### Runtime directories
 
 The standalone Python agent creates runtime directories as needed:
@@ -481,7 +518,7 @@ The standalone Python agent creates runtime directories as needed:
 | `logs/traces/` | Per-task JSONL trajectory logs |
 | `logs/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
 | `logs/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
-| `memory/` | **Per-app quirk store** — `memory/<app>.json` + `memory/index.jsonl`. Failure histograms, success counts, free-form notes (git-ignored). |
+| `memory/` | **Per-app quirk store** — `memory/<app>.json` + `memory/index.jsonl`. Only created the first time `memory_note` runs or the controller auto-records, which requires `agent.memory.enabled=true`. Reads via `memory_get` work regardless. |
 | `screenshots/` | Ad-hoc screenshots taken by the agent |
 | `screenshots/failures/` | Animated GIF failure recordings |
 | `skills/` | **Skill library** — `skills/skills.jsonl` (only created the first time `skill_save` runs, which requires `skills_enabled=true`) |
@@ -494,7 +531,7 @@ The Pi extension writes runtime files under `pi-extension/runtime/`:
 | `pi-extension/runtime/traces/` | Per-session JSONL trajectory logs |
 | `pi-extension/runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
 | `pi-extension/runtime/progress/` | Per-task JSON progress records |
-| `pi-extension/runtime/memory/` | **Per-app quirk store** — `<app>.json` + `index.jsonl` |
+| `pi-extension/runtime/memory/` | **Per-app quirk store** — `<app>.json` + `index.jsonl`. Created lazily when `memoryEnabled=true` and a write fires; reads via `memory_get` work regardless. |
 | `pi-extension/runtime/screenshots/` | Ad-hoc screenshots |
 | `pi-extension/runtime/failures/` | Animated GIF failure recordings |
 | `pi-extension/runtime/logs/` | `autogui.log` |
@@ -610,7 +647,8 @@ and reliability.
 | `agent.controller.visual_diff_enabled` | `true` | When vision is on, hashes each pre/post screenshot pair via a 16×16 perceptual ("dHash") hash and tags the tool result with `verifier.visual_diff` when a state-changing action moved fewer than ~12% of bits — i.e. the screen barely changed. Catches the silent-no-op failure mode that exit-code checks miss. |
 | `agent.controller.watchdog_stall_threshold` | `3` | Hashes `(window list, active window, first proposed tool, first args)` per iteration. When the same signature recurs N times in a row the step is flagged as stuck and routed through the standard BLOCKED path. `0` disables. |
 | `agent.budget.max_*` | `0` | Hard ceilings for tool calls / chat calls / total tokens / seconds.  When any ceiling is exceeded a `budget_exceeded` event fires and the task ends before the next step runs. |
-| `agent.memory.dir` | `memory/` | Per-app quirk store (`memory/<app>.json`). The planner reads up to four "app memory hints" at task start so it can prefer strategies that worked before and avoid those that didn't. The model can also write notes via `memory_note(app, text)` and read records via `memory_get(app)`. |
+| `agent.memory.enabled` | `false` | **Creation gate.** When false (the default) `memory_note` is not registered, the controller does NOT auto-record successes/failures, and no `memory/` directory is created. `memory_get` and the planner's app-memory hints continue to read whatever is already on disk, so an existing quirk database stays useful even when creation is off. Set to `true` to allow new records. Mirrors the `agent.skills_enabled` flag. |
+| `agent.memory.dir` | `memory/` | Per-app quirk store location (`memory/<app>.json`). Created lazily the first time something is written. The pi extension keeps its own quirk database under `pi-extension/runtime/memory/` so the two libraries don't shadow each other (point both at the same absolute path if you want them merged). |
 
 The planner also receives **few-shot exemplars** from the skill library
 (top-3 matches by keyword) and **app memory hints** for any visible
@@ -747,7 +785,11 @@ No configuration is needed.
     },
     "artifacts": {"dir": "logs/artifacts"},  // Content-addressed observation store
     "progress":  {"dir": "logs/progress"},   // Per-task resume markers
-    "memory":    {"dir": "memory"},          // Per-app quirk database (separate from skills)
+    "memory": {                              // Per-app quirk database (separate from skills)
+      "enabled": false,                      //   CREATION gate. False blocks memory_note + auto-recording;
+                                              //   memory_get and planner hints still read whatever is on disk
+      "dir": "memory"                        //   Distinct from pi-extension/runtime/memory/
+    },
     "budget": {                              // Hard ceilings; 0 = no ceiling
       "max_tool_calls": 0,
       "max_chat_calls": 0,

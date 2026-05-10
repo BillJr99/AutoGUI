@@ -68,7 +68,8 @@ Every key has a sensible default — leave the file out and everything works. Se
 - `controllerEnabled`: typed-plan + step-by-step protocol; injects the `plan_set` / `plan_update_step` / `checkpoint` workflow into the prompt and wires the plan slot to the new meta-tools.
 - `skillsEnabled` (default `false`): creation gate. False blocks `skill_save`; `skill_list`, `skill_run`, and the candidate-skills suggestion are always available so any existing library at `skillsPath` stays usable. Override the path with `skillsPath` (absolute).
 - `artifactsDir` / `progressDir`: locations for the artifact store and per-task progress records (default `runtime/artifacts/` and `runtime/progress/`; empty string disables that store entirely).
-- `memoryDir`: location for the per-app quirk database (default `runtime/memory/`; empty string disables). The pi-extension uses its own memory dir, separate from the standalone agent's `./memory/`.
+- `memoryEnabled` (default `false`): creation gate for the per-app quirk database (mirrors `skillsEnabled`). False blocks `memory_note` and the controller's auto-recording; `memory_get` and the planner's app-memory hints continue to read whatever is already at `memoryDir`. Set true to allow new records.
+- `memoryDir`: location for the per-app quirk database (default `runtime/memory/`; empty string disables the store entirely). The pi-extension uses its own memory dir, separate from the standalone agent's `./memory/` so they don't shadow each other.
 - `budget.maxToolCalls` / `budget.maxSeconds`: hard ceilings consulted by the `budget_status` tool. 0 = no ceiling.
 - `screenRecord.*`: rolling screen buffer for failure post-mortem.
 
@@ -80,7 +81,8 @@ Every key has a sensible default — leave the file out and everything works. Se
 | `check_predicate(kind, value/path/command/...)` | Verify a typed post-condition deterministically (window/file/URL/text/process/shell). Use after a step's expected outcome should hold. |
 | `preflight(checks?)` | Verify required apps / files / URLs / tools / commands are available. With no `checks` arg, derives the list from the active plan's `tools_hint` + predicate paths + explicit `preflight` block. |
 | `classify_failure(tool_name, error_message)` | Maps an error to one of `{transient_io, app_not_ready, missing_element, permission, predicate_not_met, user_input_needed, unknown}` and recommends `retry` / `wait_and_retry` / `replan` / `escalate`. |
-| `memory_get(app)` / `memory_note(app, text, tag?)` | Read/write the per-app quirk database under `runtime/memory/`. Surfaced into the system prompt so future tasks see what failed last time. |
+| `memory_get(app)` | Always available. Read the per-app quirk database under `runtime/memory/`. Empty `app` lists every recorded app. |
+| `memory_note(app, text, tag?)` | Registered only when `memoryEnabled=true` (default false). Persists a free-form note into the quirk database so future tasks against the same app see the warning. |
 | `budget_status()` | Return tool-call / wall-time counters and the fraction of any configured ceiling consumed. |
 | `plan_set` / `plan_get` / `plan_update_step` | Manage the typed plan from inside the loop; wire `plan_update_step(id, status="done")` after each verified step. |
 | `checkpoint(label, data?)` | Persist a free-form progress marker so the task can resume after a crash or abort. |
@@ -246,7 +248,7 @@ All runtime output lives under `pi-extension/runtime/` (git-ignored):
 | `runtime/traces/` | Per-session JSONL trajectory logs |
 | `runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
 | `runtime/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
-| `runtime/memory/` | Per-app quirk store — `<app>.json` + `index.jsonl` (failure histograms, success counts, free-form notes) |
+| `runtime/memory/` | Per-app quirk store — `<app>.json` + `index.jsonl`. Only created when `memoryEnabled=true` and a write fires; reads via `memory_get` work regardless. |
 | `runtime/screenshots/` | Ad-hoc screenshots taken by the agent |
 | `runtime/failures/` | Animated GIF failure recordings |
 | `runtime/browser/` | Playwright browser screenshots |
