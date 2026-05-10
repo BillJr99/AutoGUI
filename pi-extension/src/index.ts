@@ -396,10 +396,14 @@ ${autoGuiTask}`;
       // Kill any validator tmux sessions started by this extension.
       if (activeValidatorSessions.size > 0) {
         const sessions = [...activeValidatorSessions];
-        activeValidatorSessions.clear();
         await Promise.all(sessions.map(async (s) => {
-          const r = await execFile("tmux", ["kill-session", "-t", s]).catch((e: unknown) => ({ code: -1, stderr: String(e) }));
-          await logger.log("autogui-abort.kill-session", { session: s, code: (r as { code: number }).code });
+          try {
+            const r = await execFile("tmux", ["kill-session", "-t", s]);
+            await logger.log("autogui-abort.kill-session", { session: s, code: r.code ?? -1, stderr: r.stderr });
+            activeValidatorSessions.delete(s);
+          } catch (e: unknown) {
+            await logger.log("autogui-abort.kill-session", { session: s, code: -1, stderr: String(e) });
+          }
         }));
       }
 
