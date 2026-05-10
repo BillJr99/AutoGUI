@@ -143,7 +143,17 @@ export async function waitFor(
     const sleep = remaining <= 0 ? 0 : Math.min(pollInterval, remaining);
     await new Promise((r) => setTimeout(r, sleep * 1000));
     if (signal?.aborted) {
-      return { found: false, elapsed: elapsedSec(start), error: "aborted" };
+      // Full timeout shape on abort so callers don't need a special
+      // case for this branch — mirrors the timeout/success returns.
+      return {
+        found: false,
+        target: undefined,
+        elapsed: elapsedSec(start),
+        timeout,
+        targets,
+        lastObservation,
+        error: "aborted",
+      };
     }
   }
 }

@@ -60,7 +60,10 @@ async def wait_for(
             "found": False,
             "target": None,
             "elapsed": 0.0,
-            "timeout": float(timeout) if timeout else 0.0,
+            # Apply the same 0.5s floor the normal path uses so callers
+            # see a single consistent timeout contract (and so the TS
+            # mirror's behaviour matches).  Mirrors the clamp below.
+            "timeout": max(0.5, float(timeout)),
             "targets": targets,
             "last_observation": {},
         }

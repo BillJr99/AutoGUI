@@ -324,7 +324,10 @@ async def _check_process(p: dict, registry) -> PredicateResult:
             )
         cmd = f'tasklist /FI "IMAGENAME eq {needle}*"'
     else:
-        cmd = f"pgrep -lf {shlex.quote(needle)}"
+        # `--` defangs a needle that starts with `-` so pgrep treats it
+        # as a pattern instead of an unknown option.  shlex.quote still
+        # handles the value's metacharacters.
+        cmd = f"pgrep -lf -- {shlex.quote(needle)}"
     raw = await registry.dispatch("shell_run", {"command": cmd})
     try:
         result = json.loads(raw)
