@@ -57,3 +57,23 @@ def test_reset_clears_history():
     wd.observe(sig)
     wd.reset()
     assert wd.observe(sig).stuck is False
+
+
+def test_signature_distinguishes_args_past_200_char_cutoff():
+    """Regression: arguments that differ only past a hard truncation point
+    must still produce different signatures.  The old implementation hashed
+    only the first 200 chars of the canonical args, so a model varying a
+    long selector / path past that point would falsely look stuck."""
+    wd = Watchdog(stall_threshold=3)
+    base_prefix = "x" * 250
+    sig_a = wd.signature(
+        windows=[], active_window={},
+        pending_tool="browser_click",
+        pending_args={"selector": base_prefix + "BUTTON_A"},
+    )
+    sig_b = wd.signature(
+        windows=[], active_window={},
+        pending_tool="browser_click",
+        pending_args={"selector": base_prefix + "BUTTON_B"},
+    )
+    assert sig_a != sig_b, "watchdog must hash full args, not a 200-char prefix"

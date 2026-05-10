@@ -166,9 +166,9 @@ class ProgressStore:
 
     def list_resumable(self) -> list[TaskProgress]:
         out: list[TaskProgress] = []
+        # glob("*.json") cannot match the index.jsonl sidecar so no
+        # extra filter is needed — every match is a per-task record.
         for path in sorted(self._dir.glob("*.json")):
-            if path.name == "index.jsonl":
-                continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 rec = TaskProgress(**data)

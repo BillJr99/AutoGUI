@@ -78,10 +78,21 @@ class Watchdog:
             if isinstance(w, dict):
                 active = (str(w.get("title", ""))[:80] + "|"
                           + str(w.get("app", "")))
+        # Hash the FULL canonical args — truncating before hashing means
+        # two calls that differ only past the cutoff (long selectors,
+        # file paths, prompts) collapse to the same signature and the
+        # watchdog falsely reports the step as stuck.  The cap below is
+        # generous enough to bound memory while still distinguishing
+        # realistic argument payloads.
         try:
-            args_str = json.dumps(pending_args or {}, sort_keys=True, default=str)[:200]
+            args_str = json.dumps(pending_args or {}, sort_keys=True, default=str)
         except (TypeError, ValueError):
-            args_str = repr(pending_args)[:200]
+            args_str = repr(pending_args)
+        # Defensive ceiling: cap at ~64 KiB so a pathological payload
+        # can't blow up sha1 work without bound.  Real tool args are
+        # orders of magnitude smaller; for those this is a no-op.
+        if len(args_str) > 65536:
+            args_str = args_str[:65536]
         payload = json.dumps({
             "w": win_seq[:50],
             "a": active,
