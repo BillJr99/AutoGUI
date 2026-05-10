@@ -7,8 +7,10 @@ description: Poll a GitHub PR for new (unaddressed) Copilot review comments, add
 
 Run a self-paced loop that polls a PR for Copilot review feedback, fixes
 each new (unaddressed, non-outdated) thread, pushes a fix commit, and
-requests a fresh Copilot review. Stops early when there are no new
-unaddressed threads, or when the persistence window expires.
+requests a fresh Copilot review. Runs to natural completion — Copilot
+can take several minutes between when a review is requested and when
+new threads appear, so a "no new threads" tick is not a stopping
+condition; future ticks may still find feedback.
 
 ## Invocation
 
@@ -41,8 +43,11 @@ The user can override any of these in the invocation prompt.
    `is_outdated=false`. Drop threads whose timestamps are older than the
    most recent commit you pushed in a prior tick (those are the ones you
    already addressed — Copilot just hasn't re-reviewed yet).
-3. **If no actionable threads**, end the loop early with a one-line
-   summary ("no new comments after N ticks").
+3. **If no actionable threads on this tick:** emit a one-line "no new
+   threads" status and yield to the next tick. Do NOT end the loop —
+   Copilot's re-review can take several minutes after a request, and a
+   later tick may still find feedback. Only the natural `loop-done`
+   line, the persistence cap, or an unrecoverable error stops the loop.
 4. **For each actionable thread:** read the file, fix the issue, mark
    the thread as addressed in your todo list. Group related fixes into a
    single commit when they touch the same module.
@@ -74,13 +79,18 @@ main" when they configured this skill.
 
 End the loop and report when **any** of these is true:
 
-- No actionable threads on the current tick.
-- Tick count exhausted.
+- Natural loop completion — the monitor emits `loop-done` after the
+  configured number of ticks.
 - Persistence cap hit (30 min wall clock).
 - A push fails with a non-network error (auth/permission/branch
   protection) — surface the error and stop instead of retrying blindly.
 - Tests or typecheck fail and you can't repair them within the tick —
   push a WIP commit *if* you're confident, otherwise stop and ask.
+
+A "no actionable threads" tick is **not** a stopping condition — the
+loop runs the full window because Copilot's re-review can lag the
+request by several minutes. There is no `TaskStop` available to cut a
+monitor short; it always runs to completion.
 
 ## Self-pacing the ticks
 
