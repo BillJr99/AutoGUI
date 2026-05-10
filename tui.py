@@ -30,6 +30,7 @@ Key bindings
 import asyncio
 import json
 import logging
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -273,6 +274,63 @@ class _AgentCommands(Provider):
 
 
 # ---------------------------------------------------------------------------
+# Logging bridge
+# ---------------------------------------------------------------------------
+
+class _TUILogHandler(logging.Handler):
+    """Logging handler that writes records into the TUI's conversation
+    pane via Textual's thread-safe ``call_from_thread``.
+
+    main.py installs a stderr StreamHandler at WARNING; under the TUI
+    that paints raw ``[WARNING] …`` lines over the layout.  We attach
+    this handler on mount and detach the stderr handler so warnings
+    coming from our own code or from libraries (urllib3 retry, asyncio,
+    pyautogui fail-safe, etc.) land in the visible conversation log
+    instead.
+    """
+
+    def __init__(self, app: "AgentTUI") -> None:
+        super().__init__(level=logging.WARNING)
+        self._app = app
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            return
+        # Color the line by severity so a stray WARNING in the middle of
+        # a conversation is easy to spot but not alarming, while ERROR/
+        # CRITICAL stand out as red.
+        colour = (
+            "red" if record.levelno >= logging.ERROR
+            else "yellow" if record.levelno >= logging.WARNING
+            else "dim"
+        )
+        # Our log messages routinely contain `[backend:screenshot]`,
+        # `[agent.py:run]`, etc. — RichLog with markup=True would parse
+        # those bracketed strings as Rich markup tags and either swallow
+        # the line or apply unintended styles.  Escape the formatted
+        # record before wrapping it in our own colour tags.
+        from rich.markup import escape as _rich_escape
+        line = f"[{colour}]{_rich_escape(msg)}[/{colour}]"
+        try:
+            # call_from_thread is safe whether emit() runs on the
+            # event-loop thread or a worker thread.
+            self._app.call_from_thread(self._write_to_log, line)
+        except Exception:
+            # Late teardown / app already exiting — drop the record.
+            pass
+
+    def _write_to_log(self, line: str) -> None:
+        try:
+            log = self._app.query_one("#conversation", RichLog)
+            log.write(line)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main TUI Application
 # ---------------------------------------------------------------------------
 
@@ -355,6 +413,16 @@ class AgentTUI(App):
         self.show_tools = self._tui_cfg.get("show_tool_calls", True)
         # Per-session log file — created on mount, one file per TUI invocation.
         self._session_log: Path | None = None
+        # Logging handler that routes WARNING+ records into the
+        # conversation pane so library warnings (urllib3, asyncio, etc.)
+        # don't paint over the TUI layout.  Installed on mount, removed
+        # on unmount.  See _install_log_handler for details.
+        self._log_handler: logging.Handler | None = None
+        # stderr/stdout StreamHandlers that were attached to the root
+        # logger before mount; we detach them on install (so they don't
+        # paint the terminal) and re-attach them on uninstall so the
+        # process's logging state is restored when the TUI exits.
+        self._displaced_handlers: list[logging.Handler] = []
 
     # ------------------------------------------------------------------
     # Composition
@@ -368,6 +436,11 @@ class AgentTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Install the logging bridge BEFORE anything that might warn —
+        # the agent has already initialized at this point but any
+        # subsequent library warning (urllib3 retry, pyautogui fail-safe,
+        # etc.) should land in the conversation pane, not stderr.
+        self._install_log_handler()
         log = self.query_one("#conversation", RichLog)
         model = self._cfg.get("openwebui", {}).get("model", "unknown")
         vision = self._agent._vision_screenshots
@@ -454,6 +527,88 @@ class AgentTUI(App):
                     self._log_session(f"PLAN: {event.content}")
                     continue
 
+                # ---- Controller-specific events ------------------------
+                # Without these handlers the controller path appears to
+                # do nothing after the plan is shown — the step loop is
+                # actually running but its events drop into the void
+                # because the if/elif chain below only knew about the
+                # legacy executor's events.  Each branch logs to the
+                # session file too so the trace stays informative.
+                if event.kind == "preflight":
+                    failures = event.data.get("results") or []
+                    if not event.data.get("all_passed", True):
+                        log.write(f"[bold red]  ✗ PREFLIGHT FAILED:[/bold red] {event.content}")
+                        # PreflightReport.to_dict flattens kind/target/ok/
+                        # detail onto each result entry — they are NOT
+                        # nested under a "check" key, so reading
+                        # `r.get("check", {}).get(...)` would always
+                        # produce "?=?" placeholders instead of the
+                        # actual "tool=foo" diagnosis.
+                        for r in failures:
+                            if not r.get("ok", True):
+                                log.write(
+                                    f"[red]      - {r.get('kind','?')}="
+                                    f"{r.get('target','?')}: "
+                                    f"{r.get('detail','')}[/red]"
+                                )
+                    else:
+                        log.write(f"[dim green]  ✓ Preflight: {event.content}[/dim green]")
+                    self._log_session(f"PREFLIGHT: {event.content}")
+                    continue
+
+                if event.kind == "plan_critique":
+                    log.write(f"[yellow]  ⚠ Critique: {event.content}[/yellow]")
+                    self._log_session(f"CRITIQUE: {event.content}")
+                    continue
+
+                if event.kind == "plan_revised":
+                    log.write(f"\n[bold cyan]Plan revised:[/bold cyan]\n[cyan]{event.content}[/cyan]")
+                    self._log_session(f"PLAN_REVISED: {event.content}")
+                    continue
+
+                if event.kind == "step_start":
+                    step_id = (event.data.get("step") or {}).get("id", "?")
+                    self._update_status(f"Running step {step_id}…")
+                    log.write(f"\n[bold magenta]{event.content}[/bold magenta]")
+                    self._log_session(f"STEP_START: {event.content}")
+                    continue
+
+                if event.kind == "step_done":
+                    log.write(f"[green]  ✓ {event.content}[/green]")
+                    self._log_session(f"STEP_DONE: {event.content}")
+                    continue
+
+                if event.kind == "predicate":
+                    ok = event.data.get("ok", True)
+                    colour = "dim green" if ok else "yellow"
+                    icon = "✓" if ok else "✗"
+                    log.write(f"[{colour}]  {icon} predicate: {event.content}[/{colour}]")
+                    self._log_session(f"PREDICATE: {event.content}")
+                    continue
+
+                if event.kind == "step_failure":
+                    log.write(f"[yellow]  ✗ {event.content}[/yellow]")
+                    self._log_session(f"STEP_FAIL: {event.content}")
+                    continue
+
+                if event.kind == "step_escalate":
+                    log.write(f"[bold red]  ⚠ Step escalated to user: {event.content}[/bold red]")
+                    self._log_session(f"STEP_ESCALATE: {event.content}")
+                    continue
+
+                if event.kind == "budget_exceeded":
+                    log.write(f"[bold red]  ⚠ Budget exceeded: {event.content}[/bold red]")
+                    self._log_session(f"BUDGET_EXCEEDED: {event.content}")
+                    continue
+
+                if event.kind == "failure_recording" or event.kind == "state_diff":
+                    # Diagnostic-level; only show when the user has tools
+                    # turned on, mirroring tool_call / tool_result.
+                    if self.show_tools:
+                        log.write(f"[dim]  • {event.kind}: {event.content}[/dim]")
+                    self._log_session(f"{event.kind.upper()}: {event.content}")
+                    continue
+
                 iteration = event.data.get("iteration", "?")
                 self._update_status(f"Running… iteration {iteration}")
 
@@ -518,6 +673,7 @@ class AgentTUI(App):
     async def action_quit(self) -> None:
         if self._active_task and self._active_task.state in (WorkerState.PENDING, WorkerState.RUNNING):
             self._active_task.cancel()
+        self._uninstall_log_handler()
         self.exit()
 
     async def action_reset(self) -> None:
@@ -629,6 +785,59 @@ class AgentTUI(App):
                 f.write(f"[{ts}] {line}\n")
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Logging bridge — installed on mount so warnings land in the
+    # conversation pane instead of corrupting the TUI layout.
+    # ------------------------------------------------------------------
+
+    def _install_log_handler(self) -> None:
+        if self._log_handler is not None:
+            return
+        root = logging.getLogger()
+        # Drop any stderr/stdout StreamHandler main.py installed — those
+        # write ``[WARNING] …`` lines straight to the terminal which
+        # paints over the Textual layout.  The file handler stays so
+        # logs are still persisted to disk.  Each removed handler is
+        # remembered so _uninstall_log_handler can restore them.
+        for h in list(root.handlers):
+            if isinstance(h, logging.StreamHandler) and not isinstance(
+                h, logging.FileHandler,
+            ) and h.stream in (sys.stderr, sys.stdout):
+                root.removeHandler(h)
+                self._displaced_handlers.append(h)
+        handler = _TUILogHandler(self)
+        root.addHandler(handler)
+        self._log_handler = handler
+
+    def _uninstall_log_handler(self) -> None:
+        """Detach the TUI log handler and re-attach any stderr/stdout
+        handlers we displaced during install.  Called from action_quit
+        AND on_unmount so the process's root-logger state is restored
+        regardless of how the TUI exits."""
+        root = logging.getLogger()
+        if self._log_handler is not None:
+            try:
+                root.removeHandler(self._log_handler)
+            except Exception:
+                pass
+            self._log_handler = None
+        for h in self._displaced_handlers:
+            try:
+                # Don't re-attach a handler that's somehow already on
+                # the root (e.g. a third party also added it back).
+                if h not in root.handlers:
+                    root.addHandler(h)
+            except Exception:
+                pass
+        self._displaced_handlers.clear()
+
+    def on_unmount(self) -> None:
+        """Textual lifecycle hook — fires for every shutdown path
+        (Ctrl+C, action_quit, parent app exit, exception during teardown).
+        Belt-and-suspenders cleanup so we never leave the process with
+        a TUI log handler that points at a destroyed RichLog widget."""
+        self._uninstall_log_handler()
 
     # ------------------------------------------------------------------
     # Reactive watchers and helpers

@@ -20,6 +20,7 @@ Requirements
 
 import asyncio
 import base64
+import binascii
 import io
 import json
 import logging
@@ -58,6 +59,47 @@ _SK_SPECIAL: dict[str, str] = {
 }
 # Characters that have special meaning in SendKeys and must be braced.
 _SK_ESCAPE = set("+^%~{}[]() ")
+
+
+def _decode_clixml(text: str) -> str:
+    """Extract human-readable error/warning messages from PowerShell's
+    CLIXML-serialised stderr.
+
+    PowerShell wraps non-success streams in
+    ``#< CLIXML\\n<Objs ...>...</Objs>`` when invoked via
+    ``powershell.exe -Command`` / ``-EncodedCommand`` without
+    ``-OutputFormat Text``.  We pass -OutputFormat Text now, but some
+    older 5.1 builds still emit CLIXML for certain pipeline shapes —
+    parse it as a backstop so the user always sees a real diagnostic
+    instead of an unreadable XML blob.
+    """
+    try:
+        import re as _re
+        envelope = text.split("\n", 1)[1] if text.startswith("#< CLIXML") else text
+        # Pull every <S S="Error"> ... </S> — that's where the actual
+        # exception messages live.  Order is preserved so the user
+        # sees them in the same sequence PowerShell produced them.
+        msgs = _re.findall(
+            r'<S S="Error">(.*?)</S>',
+            envelope,
+            flags=_re.DOTALL,
+        )
+        if not msgs:
+            return text  # unrecognised CLIXML shape; show raw
+        decoded = []
+        for m in msgs:
+            # CLIXML escapes some control chars as _x000D_ / _x000A_
+            # (UTF-16 hex escapes); replace the common ones with their
+            # actual characters.
+            m = (
+                m.replace("_x000D_", "\r")
+                 .replace("_x000A_", "\n")
+                 .replace("_x0009_", "\t")
+            )
+            decoded.append(m.strip())
+        return " | ".join(s for s in decoded if s)
+    except Exception:
+        return text
 
 
 def _to_sendkeys(keys: list[str]) -> str:
@@ -124,15 +166,31 @@ class WSLBackend(DesktopBackend):
         try:
             proc = await asyncio.create_subprocess_exec(
                 "powershell.exe",
+                # NOTE: do NOT add -OutputFormat Text here.  Main branch
+                # (which the user confirmed worked) uses just
+                # -NoProfile -NonInteractive -EncodedCommand, and
+                # adding -OutputFormat Text in fbf58bd silently broke
+                # screenshots — PowerShell echoed the source script
+                # back as stderr instead of executing it.  The
+                # _decode_clixml helper below handles any CLIXML that
+                # PowerShell DOES emit on stderr without needing the
+                # -OutputFormat flag.
                 "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_text = stdout.decode("utf-8", errors="replace").strip()
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            # Decode CLIXML if PowerShell serialized non-success
+            # streams that way (older 5.1 builds with certain
+            # pipeline shapes).  No-op for plain-text stderr.
+            if stderr_text.startswith("#< CLIXML"):
+                stderr_text = _decode_clixml(stderr_text)
             return (
                 proc.returncode or 0,
-                stdout.decode("utf-8", errors="replace").strip(),
-                stderr.decode("utf-8", errors="replace").strip(),
+                stdout_text,
+                stderr_text,
             )
         except FileNotFoundError:
             return (-1, "", "powershell.exe not found — WSL interop may be disabled")
@@ -159,10 +217,37 @@ class WSLBackend(DesktopBackend):
         try:
             from PIL import Image
 
+            # Script body restored byte-for-byte to the version on main
+            # (which the user confirmed worked).  Specifically:
+            #   - NO $ErrorActionPreference='Stop'.  Add-Type emits a
+            #     non-terminating warning when the assembly is already
+            #     loaded, and 'Stop' promoted that warning to a fatal
+            #     error which made the entire script abort before
+            #     producing output (this was the empty-base64 +
+            #     "stderr=script content" symptom the user kept hitting).
+            #   - Write-Host for the metadata line, NOT a bare string.
+            #     Bare strings hit the success stream too, but
+            #     Write-Host has reliably worked across every WSL
+            #     PowerShell variant the user tested on main.
+            #   - NO try/catch wrapper.  PowerShell's default behaviour
+            #     prints a real exception to stderr; our _decode_clixml
+            #     helper cleans up the CLIXML envelope downstream.
+            # System.Drawing.Bitmap's 2-arg constructor (width, height)
+            # picks a default pixel format that's incompatible with
+            # CopyFromScreen on some multi-monitor / WSL-interop setups
+            # — the user hits "New-Object : Exception calling .ctor with
+            # 2 argument(s): Parameter is not valid".  Passing an
+            # explicit Format32bppArgb (3-arg constructor) makes the
+            # bitmap-creation deterministic across machines.  Same fix
+            # applies to both region and full-screen capture.
+            pixfmt_setup = (
+                "$pixfmt = [System.Drawing.Imaging.PixelFormat]::Format32bppArgb\n"
+            )
             if region:
                 script = (
                     "Add-Type -AssemblyName System.Drawing\n"
-                    "$bmp = New-Object System.Drawing.Bitmap __W__, __H__\n"
+                    + pixfmt_setup +
+                    "$bmp = New-Object System.Drawing.Bitmap __W__, __H__, $pixfmt\n"
                     "$g   = [System.Drawing.Graphics]::FromImage($bmp)\n"
                     "$g.CopyFromScreen(__X__, __Y__, 0, 0, $bmp.Size)\n"
                     "$g.Dispose()\n"
@@ -184,10 +269,11 @@ class WSLBackend(DesktopBackend):
                     "$top    = ($scr | % { $_.Bounds.Top    } | Measure-Object -Min).Minimum\n"
                     "$right  = ($scr | % { $_.Bounds.Right  } | Measure-Object -Max).Maximum\n"
                     "$bottom = ($scr | % { $_.Bounds.Bottom } | Measure-Object -Max).Maximum\n"
-                    "$w      = $right - $left\n"
-                    "$h      = $bottom - $top\n"
+                    "$w      = [int]($right - $left)\n"
+                    "$h      = [int]($bottom - $top)\n"
                     "$n      = $scr.Count\n"
-                    "$bmp    = New-Object System.Drawing.Bitmap $w, $h\n"
+                    + pixfmt_setup +
+                    "$bmp    = New-Object System.Drawing.Bitmap $w, $h, $pixfmt\n"
                     "$g      = [System.Drawing.Graphics]::FromImage($bmp)\n"
                     "$g.CopyFromScreen($left, $top, 0, 0, (New-Object System.Drawing.Size $w, $h))\n"
                     "$g.Dispose()\n"
@@ -202,9 +288,24 @@ class WSLBackend(DesktopBackend):
             if returncode != 0 or not stdout:
                 return {"error": f"Screenshot failed (code {returncode}). stderr={stderr!r}"}
 
+            # Find the metadata line (PowerShell sometimes prepends
+            # blank lines or progress junk before "monitors=...") and
+            # treat everything after it as the base64 payload.  Falling
+            # back to "first line is meta, rest is b64" as before only
+            # works when stdout is exactly two lines; CRLF/CR splitting,
+            # PSReadLine output, or Write-Host buffering can break that.
             lines = stdout.splitlines()
-            meta_line = lines[0] if lines else ""
-            b64_data  = "".join(lines[1:]) if len(lines) > 1 else stdout
+            meta_idx = next(
+                (i for i, ln in enumerate(lines) if ln.lstrip().startswith("monitors=")),
+                -1,
+            )
+            if meta_idx >= 0:
+                meta_line = lines[meta_idx]
+                b64_data = "".join(ln.strip() for ln in lines[meta_idx + 1:])
+            else:
+                # No metadata found — treat the whole stdout as base64.
+                meta_line = ""
+                b64_data = "".join(ln.strip() for ln in lines)
 
             # Parse metadata if present
             monitors = 1
@@ -215,8 +316,37 @@ class WSLBackend(DesktopBackend):
                     except ValueError:
                         pass
 
-            img_bytes = base64.b64decode(b64_data)
-            img = Image.open(io.BytesIO(img_bytes))
+            if not b64_data:
+                # Empty base64 means PowerShell ran but emitted nothing
+                # parseable as image data.  Image.open would later raise
+                # ``cannot identify image file`` — surface a clearer
+                # diagnostic instead so the user knows where it went wrong.
+                return {
+                    "error": (
+                        "Screenshot failed: empty base64 payload from PowerShell. "
+                        f"stdout_head={stdout[:200]!r} stderr_head={stderr[:200]!r}"
+                    ),
+                }
+            try:
+                img_bytes = base64.b64decode(b64_data)
+            except (ValueError, binascii.Error) as e:
+                return {
+                    "error": (
+                        f"Screenshot failed: base64 decode error ({e}). "
+                        f"b64_head={b64_data[:120]!r}"
+                    ),
+                }
+            try:
+                img = Image.open(io.BytesIO(img_bytes))
+                img.load()  # force the decode now so any UnidentifiedImageError surfaces here
+            except Exception as e:
+                return {
+                    "error": (
+                        f"Screenshot failed: PIL could not decode "
+                        f"{len(img_bytes)} bytes ({type(e).__name__}: {e}). "
+                        f"First 16 bytes (hex): {img_bytes[:16].hex()}"
+                    ),
+                }
 
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
@@ -243,6 +373,13 @@ class WSLBackend(DesktopBackend):
             }
 
         except Exception as e:
+            # WARNING (not DEBUG) so the failure is visible in the user's
+            # log + TUI bridge.  WSL screenshots fail in practice when
+            # PowerShell times out or the System.Drawing assemblies are
+            # unavailable; hiding it at DEBUG made the root cause
+            # invisible and produced misleading "Auto-screenshot saved
+            # (vision off): ? (None×None)" messages downstream.
+            logger.warning("[wsl:screenshot] capture failed: %s", e)
             logger.debug("[wsl:screenshot] %s", traceback.format_exc())
             return {"error": str(e)}
 

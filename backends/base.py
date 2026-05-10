@@ -150,8 +150,15 @@ class DesktopBackend:
                 self._screenshot_cache = (time.monotonic(), cache_key, dict(result))
             return result
         except ImportError as e:
+            # WARNING (not DEBUG) so the failure surfaces in the user's
+            # log / TUI bridge — a missing Pillow on the machine the
+            # standalone agent runs on means screenshots never save and
+            # the screenshots/ directory never gets created.  Hiding it
+            # at DEBUG made that root cause invisible.
+            logger.warning("[backend:screenshot] PIL/Pillow unavailable: %s", e)
             return {"error": f"pyautogui/Pillow not installed: {e}"}
         except Exception as e:
+            logger.warning("[backend:screenshot] capture failed: %s", e)
             logger.debug("[backend:screenshot] %s", traceback.format_exc())
             return {"error": str(e)}
 
@@ -228,8 +235,10 @@ class DesktopBackend:
                 "base64_png": b64,
             }
         except ImportError as e:
+            logger.warning("[backend:screenshot_marked] PIL/Pillow unavailable: %s", e)
             return {"error": f"Pillow not installed: {e}"}
         except Exception as e:
+            logger.warning("[backend:screenshot_marked] capture failed: %s", e)
             logger.debug("[backend:screenshot_marked] %s", traceback.format_exc())
             return {"error": str(e)}
 

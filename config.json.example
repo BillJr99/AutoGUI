@@ -16,12 +16,56 @@
     "vision_screenshots": true,
     "record_trace": true,
     "trace_dir": "logs/traces",
+    "_skills_comment": "skills_enabled controls CREATION ONLY. When false (the default) the agent will NOT register skill_save and will NOT write a skills/ directory or skills.jsonl on disk — but skill_list, skill_run, and the candidate-skills suggestion at task start are always available, so any skills already on disk remain readable and replayable. Set skills_enabled=true to allow new skills to be recorded. The standalone agent uses ./skills/skills.jsonl relative to the project root, intentionally distinct from the pi-extension's pi-extension/runtime/skills/skills.jsonl so each side has its own library. The directory is git-ignored and created lazily the first time skill_save fires. suggest_skills toggles the candidate-skills block at task start regardless of skills_enabled.",
+    "skills_enabled": false,
     "suggest_skills": true,
-    "_skills_comment": "Skills (replayable macros) are stored in ./skills/skills.jsonl relative to the project root. The directory is created automatically and is git-ignored.",
     "skills_path": "skills/skills.jsonl",
+    "_drift_anchor_comment": "Post-action world snapshot attached to each session step so 'replay --drift-check' can flag steps whose live state has shifted vs. the recording. window_titles capture is essentially free; capture_phash adds a screenshot per step (a few percent overhead) and is opt-in.",
+    "drift_anchor": {
+      "enabled": true,
+      "capture_phash": false
+    },
     "planner": {
       "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces.",
       "enabled": true
+    },
+    "controller": {
+      "_comment": "Typed plan + step-by-step executor. ON by default. The planner emits a JSON plan and each step runs in its own scoped history with its own iteration budget. Replan triggers automatically on persistent failures. critique_enabled adds one extra LLM call after the planner to review the plan; preflight_enabled gates resource availability before any UI action; predicate_check_enabled verifies typed post-conditions deterministically; visual_diff_enabled flags state-changing actions whose screen pixels barely moved; watchdog_stall_threshold flags a step as stuck after the same (state+action) signature recurs N iterations in a row (0 = disabled). Set enabled=false to fall back to the legacy single-loop ReAct executor.",
+      "enabled": true,
+      "step_max_iterations": 8,
+      "step_max_retries": 2,
+      "auto_resume": true,
+      "replan_on_block": true,
+      "critique_enabled": true,
+      "preflight_enabled": true,
+      "predicate_check_enabled": true,
+      "visual_diff_enabled": true,
+      "watchdog_stall_threshold": 3
+    },
+    "artifacts": {
+      "_comment": "Stable-id store for large observations (file bodies, command stdout, OCR snippets). Each capture gets a fresh artifact://<id>; identical bodies are NOT deduped — the store is an append-only log of what the agent saw and when. The model fetches by id with get_artifact when it needs the body.",
+      "dir": "logs/artifacts"
+    },
+    "progress": {
+      "_comment": "Task progress markers persisted across runs so a crash or abort can resume mid-task.",
+      "dir": "logs/progress"
+    },
+    "memory": {
+      "_comment": "Per-app failure/success histograms + free-form notes, surfaced to the planner as 'app memory hints' so future tasks against the same app see what worked / failed before. enabled controls CREATION ONLY (mirrors skills_enabled): when false (the default) memory_get and the planner's app-memory hints continue to read whatever is already at dir, but memory_note is not registered, the controller does NOT auto-record successes/failures, and no memory/ directory is created. The standalone agent stores at ./memory/ (git-ignored, distinct from pi-extension/runtime/memory/) — both directories are created lazily the first time something is written.",
+      "enabled": false,
+      "dir": "memory"
+    },
+    "budget": {
+      "_comment": "Per-task hard ceilings. 0 = no ceiling for that dimension. Exceeding any ceiling fires a budget_exceeded event and ends the task before the next step runs.",
+      "max_tool_calls": 0,
+      "max_chat_calls": 0,
+      "max_total_tokens": 0,
+      "max_seconds": 0
+    },
+    "subagent": {
+      "_comment": "Read-only subagent for pure-lookup questions; keeps the main conversation small.",
+      "enabled": true,
+      "max_tool_calls": 4
     },
     "bon": {
       "_comment": "Best-of-N action sampling. Samples n completions and picks the best. Increases token cost on uncertain steps.",

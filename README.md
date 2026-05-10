@@ -35,7 +35,7 @@ is configured to use and exposes desktop tools plus `/autogui`.
 | **Browser (Playwright)** | First-class Chromium driver: real DOM/ARIA selectors, `browser_click`, `browser_fill`, `browser_eval` — opt-in via `allowed_browser` |
 | **Native input (Windows)** | `click`/`type_text`/`hotkey` go through `user32.SendInput` directly (real INPUT events, correct DPI, full Unicode) |
 | **Best-of-N sampling** | On uncertain steps (recent failure or non-APPROVED validator), sample N candidates and pick via self-consistency or a verifier model |
-| **Skill library** | `skill_save`/`skill_list`/`skill_run`: persist successful tool sequences, retrieve them by keyword on the next task |
+| **Skill library** | `skill_save`/`skill_list`/`skill_run`: persist successful tool sequences and retrieve them by keyword on the next task. `skill_list` / `skill_run` are always available, so existing libraries are readable; `skill_save` (creation) is gated by `agent.skills_enabled` (default false). Each side keeps its own library: standalone agent uses `./skills/`, Pi extension uses `pi-extension/runtime/skills/`. |
 | **Trajectory replay** | Per-session JSONL trace + `replay.py` re-runs any saved skill or trace deterministically (no LLM) |
 | **Failure recording** | Rolling 5-second screen buffer dumps to an animated GIF on tool failure |
 | **State diff & modal flag** | Pre/post-action window-set diff with an `[UNEXPECTED MODAL: …]` banner when an error/permission/confirm dialog appears |
@@ -422,10 +422,94 @@ Inside Pi:
 /autogui Open a harmless app and describe what you see
 ```
 
-For a read-only second pass, `/autogui-validate <task>` spawns a separate Pi
-validator in a tmux session with only screenshot and window-listing tools active.
+When an `/autogui` task completes naturally, the extension auto-spawns a
+read-only Pi validator in a fresh tmux session (only screenshot and window-
+listing tools active) to double-check the desktop state.  Set
+`validateAfterAutogui: false` in the extension's `config.json` to skip the
+follow-up.
 
 See `pi-extension/README.md` for the full extension details.
+
+### Skill library
+
+Skills are named, replayable sequences of successful tool calls — saved
+with `skill_save`, listed with `skill_list`, replayed with `skill_run`
+(or `replay.py` outside the agent loop).
+
+**`skills_enabled` controls *creation* only.**  Reads are always
+allowed:
+
+| `skills_enabled` | `skill_list` | `skill_run` | `skill_save` | Candidate suggestion at task start |
+|------------------|--------------|-------------|--------------|------------------------------------|
+| `false` (default) | ✓ | ✓ | — (not registered) | ✓ |
+| `true`            | ✓ | ✓ | ✓ | ✓ |
+
+So a fresh checkout never writes a `skills/` directory until you opt
+in, but if you copy in an existing `skills.jsonl` (or someone else
+on the same machine has already created one) it remains usable
+immediately.
+
+```jsonc
+{
+  "agent": {
+    "skills_enabled": false,            // default — no NEW skills are written
+    "skills_path": "skills/skills.jsonl"
+  }
+}
+```
+
+The standalone agent stores skills at `./skills/skills.jsonl` relative
+to the project root.  This path is **deliberately separate** from the
+Pi extension's library at `pi-extension/runtime/skills/skills.jsonl` —
+each side manages its own library so they don't shadow each other.
+Both directories are git-ignored and created lazily the first time
+`skill_save` fires (no creation = no directory).
+
+| Side | Default skill path | Config key (creation gate) |
+|------|--------------------|----------------------------|
+| Standalone Python agent | `skills/skills.jsonl` | `agent.skills_enabled` |
+| Pi extension | `pi-extension/runtime/skills/skills.jsonl` | `skillsEnabled` (in `pi-extension/config.json`) |
+
+If you want a single shared library across both programs, point
+`skills_path` and `skillsPath` at the same absolute path — the default
+is to keep them separate so each program's library is private.
+
+### App-memory library
+
+Per-app quirk database — failure histograms, success counts, and free-form
+notes attached to an app via `memory_note(app, text)`.  Surfaced into the
+planner as "app memory hints" for any apps visible at task start so plans
+bias toward strategies that worked before.
+
+**`agent.memory.enabled` controls *creation* only.**  Same pattern as
+`skills_enabled`:
+
+| `memory.enabled` | `memory_get` | planner hints | controller auto-records | `memory_note` | `memory/` dir on disk |
+|---|---|---|---|---|---|
+| `false` (default) | ✓ | ✓ (reads existing) | — | — (not registered) | none until user opts in |
+| `true` | ✓ | ✓ | ✓ | ✓ | created lazily on first write |
+
+```jsonc
+{
+  "agent": {
+    "memory": {
+      "enabled": false,        // default — no NEW records are written
+      "dir": "memory"          // standalone-agent quirk database
+    }
+  }
+}
+```
+
+The standalone agent stores at `./memory/`; the Pi extension stores at
+`pi-extension/runtime/memory/`.  Both directories are git-ignored and
+created lazily the first time `memory_note` (or the controller's auto-
+recorder) actually fires.  Point both at the same absolute path if you
+want a single shared quirk database across both programs.
+
+| Side | Default memory path | Config key (creation gate) |
+|------|---------------------|----------------------------|
+| Standalone Python agent | `memory/` | `agent.memory.enabled` |
+| Pi extension | `pi-extension/runtime/memory/` | `memoryEnabled` (in `pi-extension/config.json`) |
 
 ### Runtime directories
 
@@ -435,20 +519,22 @@ The standalone Python agent creates runtime directories as needed:
 |------|----------|
 | `logs/` | `agent.log` (rotating) + per-session `session_<ts>.log` files |
 | `logs/traces/` | Per-task JSONL trajectory logs |
+| `logs/artifacts/` | Artifact bodies + `index.jsonl`. Stable-id store: each capture gets a fresh `artifact://<id>` even when the body is identical to a prior capture. |
+| `logs/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
+| `memory/` | **Per-app quirk store** — `memory/<app>.json` + `memory/index.jsonl`. Only created the first time `memory_note` runs or the controller auto-records, which requires `agent.memory.enabled=true`. Reads via `memory_get` work regardless. |
 | `screenshots/` | Ad-hoc screenshots taken by the agent |
 | `screenshots/failures/` | Animated GIF failure recordings |
-| `skills/` | **Skill library** — `skills/skills.jsonl`, one record per saved skill |
-
-`skills/` is git-ignored. Skills are replayable macros saved with `skill_save` and
-retrieved automatically at task start by keyword. They are shared with the Pi extension
-when both are run from the same project root (point `skillsPath` at the same file).
+| `skills/` | **Skill library** — `skills/skills.jsonl` (only created the first time `skill_save` runs, which requires `skills_enabled=true`) |
 
 The Pi extension writes runtime files under `pi-extension/runtime/`:
 
 | Path | Contents |
 |------|----------|
-| `pi-extension/runtime/skills/` | **Skill library** — `skills.jsonl` |
+| `pi-extension/runtime/skills/` | **Skill library** — `skills.jsonl` (only created when `skillsEnabled=true` and `skill_save` fires; reads are always allowed) |
 | `pi-extension/runtime/traces/` | Per-session JSONL trajectory logs |
+| `pi-extension/runtime/artifacts/` | Artifact bodies + `index.jsonl` (stable-id, not deduped). |
+| `pi-extension/runtime/progress/` | Per-task JSON progress records |
+| `pi-extension/runtime/memory/` | **Per-app quirk store** — `<app>.json` + `index.jsonl`. Created lazily when `memoryEnabled=true` and a write fires; reads via `memory_get` work regardless. |
 | `pi-extension/runtime/screenshots/` | Ad-hoc screenshots |
 | `pi-extension/runtime/failures/` | Animated GIF failure recordings |
 | `pi-extension/runtime/logs/` | `autogui.log` |
@@ -549,6 +635,64 @@ Open the model picker via **Ctrl+P** (the command palette) — type "model" and 
 
 ---
 
+## Robustness, planning & verification (controller-only)
+
+`agent.controller.enabled` defaults to **true**, so all of this runs by
+default; set it to false to fall back to the legacy single-loop ReAct
+executor.  When the controller is on it layers
+several extra safeguards on top of the standard ReAct loop.  Each is
+individually toggleable so you can dial in the tradeoff between speed
+and reliability.
+
+| Knob | Default | What it does |
+|------|---------|-------------|
+| `agent.controller.critique_enabled` | `true` | Adds one extra LLM call after the planner that critiques the plan and returns a revised version when issues are found. Catches plan-level mistakes (missing steps, vague post-conditions, wrong dependencies) before any UI is touched. |
+| `agent.controller.preflight_enabled` | `true` | Before the first state-changing action, verifies that resources the plan needs are available: apps on PATH, files present, URLs TCP-reachable, named tools registered, probe commands exit 0. Tasks abort with a structured `preflight_failed` event when something is missing. |
+| `agent.controller.predicate_check_enabled` | `true` | When a plan step declares a typed `predicate` (`window_title_contains`, `file_exists`, `url_contains`, `text_visible`, `process_running`, `shell_returns`, …), the controller verifies it deterministically after `STEP_DONE`. A miss demotes the verdict to BLOCKED and triggers replan via the standard failure-classification path. |
+| `agent.controller.visual_diff_enabled` | `true` | When vision is on, hashes each pre/post screenshot pair via a 16×16 perceptual ("dHash") hash and tags the tool result with `verifier.visual_diff` when a state-changing action moved fewer than ~12% of bits — i.e. the screen barely changed. Catches the silent-no-op failure mode that exit-code checks miss. |
+| `agent.controller.watchdog_stall_threshold` | `3` | Hashes `(window list, active window, first proposed tool, first args)` per iteration. When the same signature recurs N times in a row the step is flagged as stuck and routed through the standard BLOCKED path. `0` disables. |
+| `agent.budget.max_*` | `0` | Hard ceilings for tool calls / chat calls / total tokens / seconds.  When any ceiling is exceeded a `budget_exceeded` event fires and the task ends before the next step runs. |
+| `agent.memory.enabled` | `false` | **Creation gate.** When false (the default) `memory_note` is not registered, the controller does NOT auto-record successes/failures, and no `memory/` directory is created. `memory_get` and the planner's app-memory hints continue to read whatever is already on disk, so an existing quirk database stays useful even when creation is off. Set to `true` to allow new records. Mirrors the `agent.skills_enabled` flag. |
+| `agent.memory.dir` | `memory/` | Per-app quirk store location (`memory/<app>.json`). Created lazily the first time something is written. The pi extension keeps its own quirk database under `pi-extension/runtime/memory/` so the two libraries don't shadow each other (point both at the same absolute path if you want them merged). |
+
+The planner also receives **few-shot exemplars** from the skill library
+(top-3 matches by keyword) and **app memory hints** for any visible
+apps, so plans are biased by what previously succeeded against the
+same software.
+
+`replay.py --drift-check` re-runs a saved skill while comparing the
+live post-state against the windows + perceptual screen hash recorded
+when the skill was first captured (`step.drift_anchor`).  Drift
+between rounds is logged so you know when a recipe has gone stale
+without having to re-record it from scratch.
+
+The pi extension exposes the same primitives as tools: `check_predicate`,
+`preflight`, `memory_get` / `memory_note`, `budget_status`,
+`classify_failure`, `desktop_wait_for`.  Pi owns the LLM loop, so the
+controller protocol injected into the system prompt instructs Pi's
+agent to call them at the right beats (preflight up front, predicate
+check before STEP_DONE, etc.) rather than the extension running them
+implicitly.
+
+## Test harness
+
+A pytest suite under `tests/` exercises the controller / artifacts /
+predicates / failures / app memory / budget / preflight / watchdog /
+visual diff modules with no live model and no desktop backend
+required:
+
+```bash
+pip install pytest pytest-asyncio
+python -m pytest
+```
+
+The tests use mocked `OpenWebUIClient` and `ToolRegistry` stubs (see
+`tests/conftest.py`) to drive `Agent._run_with_controller` end-to-end,
+including a budget-exhaustion case that proves the ceiling stops the
+loop before the next step runs.  Run this on every controller change
+to catch regressions in the orchestration logic without burning real
+model calls.
+
 ## Safety Guardrails
 
 ### Destructive command guard
@@ -625,10 +769,37 @@ No configuration is needed.
     "vision_screenshots": true,          // Send screenshots to vision-capable models
     "record_trace": true,                // Persist every event to logs/traces/<session>.jsonl
     "trace_dir": "logs/traces",          // Where the JSONL trajectory log lives
+    "skills_enabled": false,             // CREATION gate. False (default) blocks skill_save; skill_list/skill_run/candidate-suggestion still work
     "suggest_skills": true,              // Offer top-K saved skills at task start
-    "skills_path": "skills/skills.jsonl",  // Skill library — git-ignored, created automatically
+    "skills_path": "skills/skills.jsonl",  // Standalone-agent skill library; deliberately distinct from
+                                            //   pi-extension/runtime/skills/skills.jsonl so each side has its own
     "planner": {                          // Pre-execution planning pass
       "enabled": true                     // One extra LLM call up front (uses the primary client)
+    },
+    "controller": {                       // Typed-plan + step-by-step executor (default ON)
+      "enabled": true,
+      "step_max_iterations": 8,           // Per-step iteration ceiling (separate from max_iterations)
+      "step_max_retries": 2,
+      "auto_resume": true,                // Resume completed step ids from logs/progress
+      "replan_on_block": true,
+      "critique_enabled": true,           // Extra LLM call to review the plan
+      "preflight_enabled": true,          // Verify apps/files/URLs/tools/commands before acting
+      "predicate_check_enabled": true,    // Verify typed post-conditions deterministically
+      "visual_diff_enabled": true,        // Perceptual-hash diff to flag silent-no-op actions
+      "watchdog_stall_threshold": 3       // 0 disables; flag step stuck after N identical signatures
+    },
+    "artifacts": {"dir": "logs/artifacts"},  // Stable-id observation store (append-only; not deduped)
+    "progress":  {"dir": "logs/progress"},   // Per-task resume markers
+    "memory": {                              // Per-app quirk database (separate from skills)
+      "enabled": false,                      //   CREATION gate. False blocks memory_note + auto-recording;
+                                              //   memory_get and planner hints still read whatever is on disk
+      "dir": "memory"                        //   Distinct from pi-extension/runtime/memory/
+    },
+    "budget": {                              // Hard ceilings; 0 = no ceiling
+      "max_tool_calls": 0,
+      "max_chat_calls": 0,
+      "max_total_tokens": 0,
+      "max_seconds": 0
     },
     "bon": {                              // Best-of-N action sampling
       "enabled": true,                    // Samples n completions, picks best on uncertain steps

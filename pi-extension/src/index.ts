@@ -1,9 +1,14 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { AppMemory } from "./app_memory.js";
+import { ArtifactStore } from "./artifacts.js";
 import { BrowserBackend } from "./browser_backend.js";
+import { BudgetTracker } from "./budget.js";
 import { PerceptionCache } from "./cache.js";
 import { loadConfig, type ExtensionConfig } from "./config.js";
+import type { Plan } from "./controller.js";
+import { ProgressStore, type TaskProgress } from "./progress.js";
 import { runInstaller } from "./install_runner.js";
 import { createLogger } from "./logger.js";
 import { createBackend } from "./platform.js";
@@ -30,16 +35,51 @@ function buildAutoGuiPrompt(cfg: ExtensionConfig, backend: DesktopBackend | unde
   const browserOn = cfg.allowedBrowser;
   const a11yOn = backend?.capabilities?.findElement === true;
   const planner = cfg.plannerEnabled;
+  const controllerOn = cfg.controllerEnabled;
+  // Match the prompt to runtime behaviour: a non-empty `*Dir` is not
+  // sufficient because index.ts only constructs the store when the
+  // corresponding `*Enabled` flag is also true.  Advertising the
+  // artifact / progress workflow when the store isn't actually
+  // running just makes the model call tools that aren't registered.
+  const artifactsOn = cfg.artifactsEnabled && !!cfg.artifactsDir;
+  const progressOn = cfg.progressEnabled && !!cfg.progressDir;
   return `You are using the AutoGUI desktop automation extension.
 
 Goal: complete the user's desktop task using Pi's normal agent workflow and the registered desktop_*${browserOn ? "/browser_*" : ""} tools.
 
-${planner ? `Planning protocol:
+${controllerOn ? `Typed-plan protocol (REQUIRED):
+- Your FIRST tool call must be plan_set with a JSON plan whose schema is:
+    { "steps": [
+        { "id": "s1", "goal": "...", "expected": "<observable post-condition>",
+          "predicate": { "kind": "window_title_contains"|"window_active_app"|"file_exists"|
+                                  "file_absent"|"file_contains"|"url_contains"|"text_visible"|
+                                  "process_running"|"shell_returns",
+                          "value": "...", "path": "...", "command": "...",
+                          "stdout_contains": "..." },
+          "tools_hint": ["browser_navigate"], "depends_on": [],
+          "risks": ["login wall", "captcha"] },
+        ...
+      ],
+      "preflight": [ {"kind":"app"|"file"|"url"|"tool"|"command", "target":"..."} ]
+    }
+- 3 to 8 steps; each maps to ONE observable post-condition.  Add a typed predicate when the post-condition is checkable so check_predicate can verify it deterministically.
+- BEFORE the first state-changing action, call preflight() to confirm required apps/files/URLs/tools/commands are available.  Bail out cleanly if anything is missing.
+- After each step finishes, call check_predicate (when one is set), then plan_update_step(id, status="done").
+- If a step is blocked, call plan_update_step(id, status="blocked", notes="why"), then revise the plan with another plan_set call.
+- Use plan_get when you need to see current statuses; budget_status to see how much of the budget is used.
+${progressOn ? "- For long-running tasks, call checkpoint(label, data) after non-trivial milestones.\n" : ""}- Use desktop_wait_for after desktop_launch / browser_navigate / any action that triggers a slow UI transition.
+${artifactsOn ? "- For pure read-only lookups, prefer get_artifact / list_artifacts to keep history small.\n" : ""}- Classify persistent failures with classify_failure${cfg.memoryEnabled ? "; record them via memory_note so future tasks see the warning" : ""}.
+
+` : (planner ? `Planning protocol:
 - BEFORE taking any state-changing action, your FIRST assistant message must be a numbered plan of 3 to 8 high-level steps that will accomplish the task.
 - Steps describe goals ("open Edge", "navigate to weather page"), not specific clicks.
 - Then execute the plan step by step. After each step, verify with desktop_screenshot, desktop_list_windows, or desktop_active_window.
 - Adapt the plan if the screen state diverges from what a step expects.
 - For trivial single-step tasks, the plan may be a single line.
+
+` : "")}${artifactsOn ? `Large observations (file bodies, page text, command stdout > 4KB) are auto-stored as artifacts.  The tool result will contain a preview plus an \`artifact_id\` you can fetch later with get_artifact.  Use list_artifacts before re-reading a file you already read.
+
+` : ""}${progressOn ? `This task has a persistent progress record. Re-running the same task text will resume — call plan_get on session start to see what was already done.
 
 ` : ""}Click ladder — pick the strongest available method for each click:
 1. ${browserOn ? "browser_click for any element on a web page (most reliable for web).\n2. " : ""}desktop_click_element for any native UI control with a visible name/label (uses the OS accessibility API; survives DPI scaling, window moves, async redraws). ${a11yOn ? "" : "(Limited support on the current backend.)\n"}
@@ -56,6 +96,8 @@ Rules:
 - Keep using Pi's built-in coding/filesystem tools for code and file work; use desktop_*${browserOn ? "/browser_*" : ""} tools only for desktop UI automation.
 - If a desktop tool reports a missing permission or dependency, tell the user exactly what is missing and stop that desktop action.
 - When you finish a task that worked well, consider calling skill_save with descriptive keywords so the procedure can be replayed via skill_run later.
+- ALWAYS use desktop_launch({application: "name"}) to start an application — never \`shell_run\` with \`start <app>\`, \`cmd /c start <app>\`, or \`open -a <app>\`. Those commands can hang because the parent shell may wait for the spawned GUI process even after the window is visible, so the tool call never returns. desktop_launch resolves the executable + spawns it detached + returns immediately; reach for shell_run only when you genuinely need the command's exit status (e.g. \`where.exe\`, \`which\`, \`pgrep\`).
+- Argument schema discipline: every desktop_* / browser_* tool takes a flat JSON object — pass \`{"application": "notepad"}\`, not XML, not stringified parameter lists, not a free-form sentence describing the call. If you find yourself writing \`<arg name="...">\` you have the wrong call shape.
 ${browserOn
   ? "- For any task involving a web page or URL, prefer browser_navigate and browser_* tools over launching a browser via desktop_launch.\n- browser_navigate(url) navigates the Playwright-managed Chromium page in place; it does not open the user's existing browser window.\n"
   : "- Browser tools are NOT enabled. Do NOT attempt desktop_launch with browser names (Edge, Chrome, Firefox, etc.) — those paths are unreliable. If a web task is requested, tell the user to set allowedBrowser=true in pi-extension/config.json and re-run the install script to set up Playwright + Chromium.\n"}`;
@@ -76,6 +118,10 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   // Per-session state for skills + Set-of-Mark + trace.
   const sessionSteps: SkillStep[] = [];
   const lastMarks: { value: Mark[] } = { value: [] };
+  // Mutable holders so tools.ts can read/write the current plan +
+  // progress record over the lifetime of an /autogui task.
+  const planSlot: { value: Plan | undefined } = { value: undefined };
+  const progressSlot: { value: TaskProgress | undefined } = { value: undefined };
 
   const getConfig = async () => {
     cfgPromise ??= loadConfig(extensionRoot);
@@ -96,12 +142,44 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   let recorder: ScreenRecorder | undefined;
   let browser: BrowserBackend | undefined;
   let cfg: ExtensionConfig | undefined;
+  let artifactStore: ArtifactStore | undefined;
+  let progressStore: ProgressStore | undefined;
+  let appMemory: AppMemory | undefined;
+  let budget: BudgetTracker | undefined;
 
   const init = (async () => {
     cfg = await getConfig();
     omitScreenshotImages = !cfg.visionEnabled;
     cache.configure(cfg.perceptionCacheTtlMs);
+    // SkillStore is constructed unconditionally — its constructor does
+    // NOT touch the disk, so existing skill libraries remain readable
+    // and replayable while the extension never creates a skills.jsonl
+    // for users who don't opt in.  cfg.skillsEnabled gates only
+    // skill_save (creation) — skill_list and skill_run stay available.
     skillStore = new SkillStore(cfg.skillsPath);
+    if (!cfg.skillsEnabled) {
+      await logger.log("init.skill_save_disabled", { reason: "skillsEnabled=false; reads still allowed" });
+    }
+    // Each store is built only when its *Enabled flag is true AND the
+    // resolved dir is non-empty.  Setting Enabled=false in config.json
+    // is the canonical way to disable a store; setting the dir to ""
+    // (with Enabled=true) reverts to the runtime-default path.
+    if (cfg.artifactsEnabled && cfg.artifactsDir) {
+      artifactStore = new ArtifactStore(cfg.artifactsDir);
+    }
+    if (cfg.progressEnabled && cfg.progressDir) {
+      progressStore = new ProgressStore(cfg.progressDir);
+    }
+    if (cfg.memoryDir) {
+      // Always construct so memory_get + the planner's app-memory hints
+      // can read whatever already exists on disk; cfg.memoryEnabled
+      // controls whether new records are persisted.
+      appMemory = new AppMemory(cfg.memoryDir, cfg.memoryEnabled);
+    }
+    budget = new BudgetTracker({
+      maxToolCalls: cfg.budget.maxToolCalls,
+      maxSeconds: cfg.budget.maxSeconds,
+    });
     if (cfg.recordTrace) {
       trace = new TraceWriter(cfg.traceDir);
       void trace.writeMeta({ event: "session_start" });
@@ -214,6 +292,9 @@ ${autoGuiTask}`;
   // closures see the real config / skill store / browser.
   void init.then(async () => {
     if (!cfg) return;
+    // SkillStore is built unconditionally so existing skills can be
+    // listed and replayed; tools.ts uses cfg.skillsEnabled to decide
+    // whether to register the *creation* tool (skill_save).
     if (!skillStore) skillStore = new SkillStore(cfg.skillsPath);
     if (!trace) trace = new TraceWriter(cfg.traceDir);
     const tools = createDesktopTools(getBackend, screenshotDir, logger, {
@@ -226,6 +307,12 @@ ${autoGuiTask}`;
       browser,
       sessionSteps,
       lastMarks,
+      artifactStore,
+      progressStore,
+      plan: planSlot,
+      progressRecord: progressSlot,
+      appMemory,
+      budget,
     });
     for (const tool of tools) {
       pi.registerTool(tool);
@@ -254,6 +341,17 @@ ${autoGuiTask}`;
       // Reset per-task session state so skill_save snapshots only this task.
       sessionSteps.length = 0;
       lastMarks.value = [];
+      planSlot.value = undefined;
+      budget?.reset();
+      // Open (or resume) a progress record for this task so progress
+      // markers + plan snapshots survive crashes and aborts.
+      if (progressStore) {
+        try {
+          progressSlot.value = await progressStore.openTask(task);
+        } catch {
+          progressSlot.value = undefined;
+        }
+      }
 
       const c = await getConfig();
       let backend: DesktopBackend | undefined;
@@ -261,13 +359,19 @@ ${autoGuiTask}`;
       let prompt = buildAutoGuiPrompt(c, backend);
 
       // Skill suggestion: top-3 candidate skills whose keywords match the task.
-      try {
-        const candidates = (await (skillStore ?? new SkillStore(c.skillsPath)).search(task, 3));
-        if (candidates.length) {
-          const lines = candidates.map((s) => `- ${JSON.stringify(s.name)} (app=${s.app || "?"}, steps=${s.steps.length}, successes=${s.success_count})`);
-          prompt += `\n\nCandidate saved skills (call skill_run if one matches):\n${lines.join("\n")}`;
-        }
-      } catch { /* best-effort */ }
+      // Always runs (read-only) so an existing skill library is surfaced
+      // even when skill_save is disabled.  search() returns [] if the
+      // skills file does not exist, which keeps this a no-op for users
+      // who have never opted in to creation.
+      if (skillStore) {
+        try {
+          const candidates = await skillStore.search(task, 3);
+          if (candidates.length) {
+            const lines = candidates.map((s) => `- ${JSON.stringify(s.name)} (app=${s.app || "?"}, steps=${s.steps.length}, successes=${s.success_count})`);
+            prompt += `\n\nCandidate saved skills (call skill_run if one matches):\n${lines.join("\n")}`;
+          }
+        } catch { /* best-effort */ }
+      }
 
       const message = `${prompt}\n\nUser desktop task:\n${task}`;
       if (ctx.isIdle()) {
@@ -304,25 +408,31 @@ ${autoGuiTask}`;
     },
   });
 
-  pi.registerCommand("autogui-validate", {
-    description: "Spawn a read-only AutoGUI validator Pi in tmux",
-    handler: async (args, ctx) => {
-      const task = args.trim();
-      await logger.log("command.autogui-validate", { task });
-      if (!task) {
-        ctx.ui.notify("Usage: /autogui-validate <task or expected desktop state>", "warning");
-        return;
-      }
-      if (!await commandExists("tmux", ctx.signal)) {
-        ctx.ui.notify("tmux is not installed or not on PATH; cannot spawn validator.", "error");
-        return;
-      }
+  /** Spawn a read-only AutoGUI validator Pi in a fresh tmux session.
+   *  Used to be wired to /autogui-validate as a manual command, but now
+   *  fires automatically from message_end() when an /autogui task
+   *  completes (stopReason="stop") and ``cfg.validateAfterAutogui`` is
+   *  on.  Best-effort: any spawn failure is logged + notified but never
+   *  rolls back the autogui completion. */
+  const spawnAutoGuiValidator = async (task: string, opts: {
+    cwd?: string;
+    notify?: (msg: string, level: "info" | "warning" | "error") => void;
+    signal?: AbortSignal;
+  } = {}): Promise<void> => {
+    const trimmed = task.trim();
+    if (!trimmed) return;
+    const cwd = opts.cwd ?? process.cwd();
+    const notify = opts.notify ?? (() => undefined);
+    if (!await commandExists("tmux", opts.signal)) {
+      notify("tmux is not installed or not on PATH; cannot spawn AutoGUI validator.", "warning");
+      return;
+    }
 
-      const sessionName = `autogui-validator-${Date.now()}`;
-      const c = await getConfig();
-      let backend: DesktopBackend | undefined;
-      try { backend = await getBackend(); } catch { /* fall through */ }
-      const validatorPrompt = `${buildAutoGuiPrompt(c, backend)}
+    const sessionName = `autogui-validator-${Date.now()}`;
+    const c = await getConfig();
+    let backend: DesktopBackend | undefined;
+    try { backend = await getBackend(); } catch { /* fall through */ }
+    const validatorPrompt = `${buildAutoGuiPrompt(c, backend)}
 
 Validator mode:
 - You are a read-only validator running in a separate Pi process.
@@ -331,31 +441,30 @@ Validator mode:
 - Report whether the current desktop state appears consistent with the requested task.
 
 Task or expected state to validate:
-${task}`;
+${trimmed}`;
 
-      const command = [
-        "cd", shellQuote(ctx.cwd), "&&",
-        "pi",
-        "--no-session",
-        "--no-builtin-tools",
-        "--tools", shellQuote("desktop_screenshot,desktop_list_windows,desktop_active_window"),
-        "-e", shellQuote(extensionEntry),
-        "-p", shellQuote(validatorPrompt),
-        ";",
-        "printf", shellQuote("\\nValidator finished. Press Enter to close this tmux pane.\\n"),
-        ";",
-        "read", "-r", "_",
-      ].join(" ");
+    const command = [
+      "cd", shellQuote(cwd), "&&",
+      "pi",
+      "--no-session",
+      "--no-builtin-tools",
+      "--tools", shellQuote("desktop_screenshot,desktop_list_windows,desktop_active_window"),
+      "-e", shellQuote(extensionEntry),
+      "-p", shellQuote(validatorPrompt),
+      ";",
+      "printf", shellQuote("\\nValidator finished. Press Enter to close this tmux pane.\\n"),
+      ";",
+      "read", "-r", "_",
+    ].join(" ");
 
-      const result = await execFile("tmux", ["new-session", "-d", "-s", sessionName, command], { timeoutMs: 5000, signal: ctx.signal });
-      await logger.log("command.autogui-validate.spawn", { sessionName, code: result.code, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut });
-      if (result.code !== 0) {
-        ctx.ui.notify(`Failed to spawn tmux validator: ${result.stderr || result.stdout}`, "error");
-        return;
-      }
-      ctx.ui.notify(`Spawned validator in tmux session: ${sessionName}`, "info");
-    },
-  });
+    const result = await execFile("tmux", ["new-session", "-d", "-s", sessionName, command], { timeoutMs: 5000, signal: opts.signal });
+    await logger.log("autogui.validator.spawn", { sessionName, code: result.code, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut, trigger: "auto-after-autogui" });
+    if (result.code !== 0) {
+      notify(`Failed to spawn AutoGUI validator: ${result.stderr || result.stdout}`, "error");
+      return;
+    }
+    notify(`Spawned AutoGUI validator in tmux session: ${sessionName}`, "info");
+  };
 
   pi.on("before_provider_request", async (event) => {
     await logger.log("provider.request", { payloadPreview: JSON.stringify(event.payload).slice(0, 4000) });
@@ -379,7 +488,24 @@ ${task}`;
 
   pi.on("message_end", async (event) => {
     if (autoGuiActive && event.message.role === "assistant" && (event.message.stopReason === "stop" || event.message.stopReason === "aborted")) {
+      // Capture the task BEFORE resetAutoGuiState() clears it.  When the
+      // task completes naturally (stopReason="stop") and the user has
+      // left ``validateAfterAutogui`` on, kick off a read-only tmux
+      // validator pane that double-checks the desktop matches the
+      // requested task.  Aborted runs skip the validator since there's
+      // nothing meaningful to validate.
+      const completedTask = autoGuiTask;
+      const stopReason = event.message.stopReason;
       resetAutoGuiState();
+      if (stopReason === "stop" && completedTask) {
+        const c = await getConfig().catch(() => undefined);
+        if (c?.validateAfterAutogui) {
+          // Fire-and-forget; spawnAutoGuiValidator catches its own errors.
+          void spawnAutoGuiValidator(completedTask).catch((e) => {
+            void logger.log("autogui.validator.spawn.error", { error: String(e) });
+          });
+        }
+      }
       return;
     }
     if (!autoGuiActive || event.message.role !== "assistant" || event.message.stopReason !== "error") return;

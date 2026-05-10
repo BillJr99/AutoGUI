@@ -50,7 +50,23 @@ def _load_trace_steps(trace_path: Path) -> list[dict]:
     return steps
 
 
-async def _run_steps(steps: list[dict], speed: float = 1.0, continue_on_error: bool = False):
+async def _run_steps(
+    steps: list[dict],
+    speed: float = 1.0,
+    continue_on_error: bool = False,
+    drift_check: bool = False,
+):
+    """
+    Replay ``steps`` through a fresh ToolRegistry.
+
+    When ``drift_check`` is True, after each step the replay also takes a
+    perceptual-hash snapshot of the screen and a window-list snapshot,
+    then compares them to the same observations recorded the first time
+    the skill ran (when available — captured under step['drift_anchor']).
+    Steps whose post-state has drifted materially are flagged so the
+    user knows the skill is no longer faithful to the world it was
+    recorded against.
+    """
     from skills import normalize_skill_steps
     from tools import ToolRegistry  # imported here to avoid circular import on module load
 
@@ -67,6 +83,7 @@ async def _run_steps(steps: list[dict], speed: float = 1.0, continue_on_error: b
     }
     registry = ToolRegistry(cfg)
 
+    drift_count = 0
     failures = 0
     for i, step in enumerate(steps, 1):
         tool = step["tool"]
@@ -86,9 +103,79 @@ async def _run_steps(steps: list[dict], speed: float = 1.0, continue_on_error: b
         else:
             preview = {k: v for k, v in result.items() if k != "base64_png"}
             print(f"    ok: {_short(preview)}", flush=True)
+
+        if drift_check:
+            drifted = await _check_drift(step, registry)
+            if drifted:
+                drift_count += 1
+                print(f"    drift: {drifted}", flush=True)
+
         if speed > 0:
             await asyncio.sleep(0.5 / speed)
+
+    if drift_check and drift_count:
+        print(f"Drift detected on {drift_count} step(s); the skill may be stale.",
+              flush=True)
     return failures
+
+
+async def _check_drift(step: dict, registry) -> str:
+    """
+    Compare the live post-state against ``step['drift_anchor']`` if one was
+    recorded.  Returns a non-empty description when drift is detected.
+    """
+    anchor = step.get("drift_anchor")
+    if not isinstance(anchor, dict):
+        return ""
+
+    notes: list[str] = []
+    expected_titles = anchor.get("window_titles") or []
+    if expected_titles and "desktop_list_windows" in registry.list_tools():
+        try:
+            raw = await registry.dispatch("desktop_list_windows", {})
+            wins = json.loads(raw).get("windows") or []
+            now_titles = [str(w.get("title", "")) for w in wins]
+            missing = [t for t in expected_titles if t not in now_titles]
+            if missing:
+                notes.append(f"missing windows: {missing[:3]}")
+        except Exception:
+            pass
+
+    expected_hash = anchor.get("screen_phash_b64")
+    if expected_hash and "desktop_screenshot" in registry.list_tools():
+        # The default fallback for visual_diff.diff() with a missing hash
+        # is fraction_changed=0.0, which would silently report "no drift"
+        # on systems without PIL or where the screenshot returned no
+        # base64_png.  Track whether each side is actually available so
+        # we can surface "screen hash unavailable" as a distinct note
+        # instead of letting the user assume the screen looked identical.
+        try:
+            from visual_diff import diff as _vdiff, hash_b64 as _vhash
+            import base64 as _b64
+            try:
+                expected = _b64.b64decode(expected_hash)
+            except Exception:
+                expected = None
+            raw = await registry.dispatch("desktop_screenshot", {})
+            shot = json.loads(raw)
+            png_b64 = shot.get("base64_png", "")
+            curr = _vhash(png_b64) if png_b64 else None
+            if expected is None or curr is None:
+                missing = []
+                if expected is None:
+                    missing.append("anchor")
+                if curr is None:
+                    missing.append("current")
+                notes.append(
+                    f"screen hash unavailable ({'/'.join(missing)} hash missing)"
+                )
+            else:
+                d = _vdiff(expected, curr)
+                if d.fraction_changed > 0.5:
+                    notes.append(f"screen perceptual hash differs ({d.fraction_changed:.0%})")
+        except Exception as e:
+            notes.append(f"screen hash check failed: {type(e).__name__}")
+    return "; ".join(notes)
 
 
 def _short(obj) -> str:
@@ -112,6 +199,10 @@ def main(argv: list[str] | None = None):
                     help="1.0 = default cadence; >1 faster, <1 slower")
     ap.add_argument("--continue-on-error", action="store_true",
                     help="Run remaining steps after a failure")
+    ap.add_argument("--drift-check", action="store_true",
+                    help="After each step, compare live state against the "
+                         "step's drift_anchor (recorded windows + perceptual "
+                         "screen hash) and flag drift.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -133,7 +224,9 @@ def main(argv: list[str] | None = None):
             return 1
         print(f"Replaying skill {args.skill!r} ({len(steps)} steps)…", flush=True)
         failures = asyncio.run(_run_steps(
-            steps, speed=args.speed, continue_on_error=args.continue_on_error
+            steps, speed=args.speed,
+            continue_on_error=args.continue_on_error,
+            drift_check=args.drift_check,
         ))
         if failures == 0:
             try:
@@ -153,7 +246,9 @@ def main(argv: list[str] | None = None):
             return 1
         print(f"Replaying {len(steps)} steps from {trace_path}…", flush=True)
         failures = asyncio.run(_run_steps(
-            steps, speed=args.speed, continue_on_error=args.continue_on_error
+            steps, speed=args.speed,
+            continue_on_error=args.continue_on_error,
+            drift_check=args.drift_check,
         ))
         return 0 if failures == 0 else 2
 

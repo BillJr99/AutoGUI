@@ -1,0 +1,492 @@
+"""
+controller.py — Typed plan + sub-executor controller.
+
+Replaces the old "flat numbered string plan" with a structured ``Plan``
+that survives the entire task lifecycle: each step has an id, goal text,
+expected post-condition, optional tools hint, dependencies, and a status
+the executor mutates as it works.
+
+The ``Controller`` owns the plan and dispatches step-scoped executor
+runs via the existing agent loop.  It does NOT subclass Agent; instead
+it composes one — calling ``Agent.run()`` repeatedly with carefully
+scoped per-step prompts so each step keeps a small focused history
+rather than dragging the whole task into a single ever-growing
+conversation.
+
+The controller is intentionally optional: when ``agent.controller.enabled``
+is false the agent runs in legacy single-loop mode unchanged.
+
+Public surface
+--------------
+
+    Plan                — typed plan object (json-serialisable)
+    PlanStep            — one step with status + expected outcome
+    StepStatus          — pending | running | done | failed | skipped | blocked
+    Controller          — orchestrates step-by-step execution
+
+The plan is produced by ``Planner.plan_typed`` (a thin wrapper over the
+existing planner that asks for JSON output) and persisted via the
+``ProgressStore`` so a crash or context reset can resume mid-task.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Normalise loose model output into a list of strings.
+
+    The model can return a list directly (the happy path), a single
+    string (we promote to a 1-element list), or something falsy (we
+    return []).  We deliberately do NOT call ``list(value)`` on a
+    string because that yields one entry per character, which would
+    corrupt fields like ``tools_hint=["desktop_launch"]`` into
+    ``["d","e","s","k",...]``.
+    """
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+class StepStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    BLOCKED = "blocked"
+
+
+@dataclass
+class PlanStep:
+    id: str
+    goal: str
+    expected: str = ""               # human-readable post-condition
+    # ``predicate`` is OPTIONAL — many steps don't need a typed
+    # post-condition.  An empty dict means "no predicate"; we keep
+    # the in-memory default an empty dict for ergonomics but drop the
+    # key from to_public()/from_dict so on-disk and wire payloads
+    # don't carry a spurious ``predicate: {}`` (which is truthy in JS
+    # and would trigger spurious rendering on the TS side).
+    predicate: dict = field(default_factory=dict)
+    tools_hint: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)   # pre-mortem risk notes
+    status: StepStatus = StepStatus.PENDING
+    attempts: int = 0
+    last_error: str = ""
+    artifacts: list[str] = field(default_factory=list)  # produced artifact ids
+    notes: str = ""
+
+    def to_public(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["status"] = self.status.value
+        # Empty predicate / risks / etc. are noise on the wire; predicate
+        # in particular is ambiguous on the TS side where {} is truthy.
+        if not d.get("predicate"):
+            d.pop("predicate", None)
+        return d
+
+
+@dataclass
+class Plan:
+    steps: list[PlanStep] = field(default_factory=list)
+    created: float = field(default_factory=time.time)
+    revision: int = 0
+    # Explicit preflight checks the planner / critique pass attached.  The
+    # controller passes these to ``preflight.run_preflight`` before the
+    # first step executes; failures abort the task with a structured report.
+    preflight: list[dict] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Lookup helpers
+    # ------------------------------------------------------------------
+
+    def by_id(self, step_id: str) -> PlanStep | None:
+        for s in self.steps:
+            if s.id == step_id:
+                return s
+        return None
+
+    def next_runnable(self) -> PlanStep | None:
+        """Return the first PENDING step whose dependencies are all DONE."""
+        done_ids = {s.id for s in self.steps if s.status == StepStatus.DONE}
+        for s in self.steps:
+            if s.status != StepStatus.PENDING:
+                continue
+            if all(d in done_ids for d in s.depends_on):
+                return s
+        return None
+
+    def all_terminal(self) -> bool:
+        return all(s.status in (StepStatus.DONE, StepStatus.SKIPPED, StepStatus.FAILED, StepStatus.BLOCKED)
+                   for s in self.steps)
+
+    def progress_summary(self) -> str:
+        counts: dict[str, int] = {}
+        for s in self.steps:
+            counts[s.status.value] = counts.get(s.status.value, 0) + 1
+        return ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "steps": [s.to_public() for s in self.steps],
+            "created": self.created,
+            "revision": self.revision,
+            "preflight": list(self.preflight),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Plan":
+        # The planner / a corrupted progress snapshot might hand us a
+        # `steps` value that isn't a list of dicts (an object keyed by
+        # id, a string, None, a list with primitives mixed in).  Guard
+        # the shape so the typed-plan path degrades to an empty plan
+        # instead of throwing — losing a plan is recoverable; aborting
+        # the whole controller on bad input is not.
+        raw_steps = data.get("steps")
+        if not isinstance(raw_steps, list):
+            raw_steps = []
+        steps_data = [sd for sd in raw_steps if isinstance(sd, dict)]
+        steps = []
+        for sd in steps_data:
+            try:
+                status = StepStatus(sd.get("status", "pending"))
+            except ValueError:
+                status = StepStatus.PENDING
+            pred = sd.get("predicate")
+            if not isinstance(pred, dict):
+                pred = {}
+            # tools_hint/depends_on/artifacts: the model occasionally
+            # returns a single string instead of a list.  list("foo")
+            # would split it into ['f','o','o'] which corrupts the
+            # plan; treat non-list values as either an empty list or a
+            # one-element list depending on whether they're truthy.
+            steps.append(PlanStep(
+                id=str(sd.get("id", "")),
+                goal=str(sd.get("goal", "")),
+                expected=str(sd.get("expected", "")),
+                predicate=dict(pred),
+                tools_hint=_coerce_str_list(sd.get("tools_hint")),
+                depends_on=_coerce_str_list(sd.get("depends_on")),
+                risks=_coerce_str_list(sd.get("risks")),
+                status=status,
+                attempts=int(sd.get("attempts", 0)),
+                last_error=str(sd.get("last_error", "")),
+                artifacts=_coerce_str_list(sd.get("artifacts")),
+                notes=str(sd.get("notes", "")),
+            ))
+        preflight_raw = data.get("preflight") or []
+        if not isinstance(preflight_raw, list):
+            preflight_raw = []
+        preflight = [p for p in preflight_raw if isinstance(p, dict)]
+        return cls(
+            steps=steps,
+            created=float(data.get("created") or time.time()),
+            revision=int(data.get("revision") or 0),
+            preflight=preflight,
+        )
+
+    def render_for_prompt(self) -> str:
+        """Render the plan as a human-readable block for the LLM context."""
+        lines = []
+        for i, s in enumerate(self.steps, 1):
+            marker = {
+                StepStatus.DONE: "[x]",
+                StepStatus.RUNNING: "[~]",
+                StepStatus.FAILED: "[!]",
+                StepStatus.SKIPPED: "[-]",
+                StepStatus.BLOCKED: "[#]",
+                StepStatus.PENDING: "[ ]",
+            }[s.status]
+            head = f"{marker} {i}. ({s.id}) {s.goal}"
+            extras = []
+            if s.expected:
+                extras.append(f"expected: {s.expected}")
+            if s.predicate:
+                from predicates import render as _render_pred
+                extras.append(f"predicate: {_render_pred(s.predicate)}")
+            if s.tools_hint:
+                extras.append(f"tools: {', '.join(s.tools_hint)}")
+            if s.depends_on:
+                extras.append(f"depends: {', '.join(s.depends_on)}")
+            if s.risks:
+                extras.append("risks: " + "; ".join(s.risks[:3]))
+            if s.last_error and s.status == StepStatus.FAILED:
+                extras.append(f"last_error: {s.last_error[:80]}")
+            if extras:
+                head += "\n     " + "; ".join(extras)
+            lines.append(head)
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Plan parsing — accepts either a JSON object or the legacy numbered string.
+# ---------------------------------------------------------------------------
+
+def parse_plan(raw: str) -> Plan:
+    """
+    Parse a plan from either:
+      * A JSON document with a top-level ``steps`` array, OR
+      * A numbered list (legacy planner output) that we promote to typed
+        steps with auto-generated ids.
+
+    The fallback path means an old planner that ignores the typed-plan
+    instructions still produces a working plan — but we MUST not let
+    JSON-shaped text fall into that path on a parse failure, or every
+    line of the JSON (``{``, ``"steps": [``, …) becomes its own step
+    and the controller tries to execute braces as goals.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return Plan()
+
+    # Strip a leading code fence (```json) and trailing ``` if present.
+    raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+
+    # Try JSON in three escalating passes so a single malformed
+    # character (trailing comma, surrounding prose, etc.) doesn't
+    # demote a valid plan to the numbered-list fallback.
+    json_attempts = [raw]
+    # 2. If there's prose surrounding the JSON, extract the outermost
+    #    {...} object (greedy match, single-line-by-default but DOTALL).
+    obj_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if obj_match and obj_match.group(0) != raw:
+        json_attempts.append(obj_match.group(0))
+    # 3. Try the same with the outermost [...] array so list-only plans
+    #    embedded in commentary still parse.
+    arr_match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if arr_match and arr_match.group(0) != raw:
+        json_attempts.append(arr_match.group(0))
+
+    for candidate in json_attempts:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and "steps" in data:
+            return Plan.from_dict(data)
+        if isinstance(data, list):
+            return Plan.from_dict({"steps": data})
+
+    # If the input STARTS with a JSON-shaped character but every parse
+    # attempt failed, splitting it into lines would produce garbage
+    # steps named after braces and quotes.  Return an empty plan so
+    # the caller falls back to the legacy free-form executor instead
+    # of trying to execute "{" as a goal.
+    if raw.lstrip().startswith(("{", "[")):
+        logger.warning(
+            "[controller.parse_plan] JSON-shaped plan failed to parse; "
+            "returning empty plan so caller can fall back. raw_head=%r",
+            raw[:160],
+        )
+        return Plan()
+
+    # Legacy numbered-list fallback (free-text planner output).
+    steps: list[PlanStep] = []
+    for i, line in enumerate(raw.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^\s*(?:\d+[.)]|[-*])\s+(.*)$", line)
+        text = m.group(1) if m else line
+        steps.append(PlanStep(id=f"s{i}", goal=text))
+    return Plan(steps=steps)
+
+
+# ---------------------------------------------------------------------------
+# Step prompt construction
+# ---------------------------------------------------------------------------
+
+def build_step_prompt(
+    *,
+    user_input: str,
+    plan: Plan,
+    step: PlanStep,
+    artifact_index_summary: str = "",
+    completed_actions_summary: str = "",
+) -> str:
+    """
+    Compose the per-step prompt the controller sends to the executor.
+
+    The prompt is intentionally STEP-CENTRIC, not task-centric: the
+    full user input + full plan are surfaced as background reference,
+    NOT as the active goal.  The executor's only job this turn is to
+    satisfy the CURRENT STEP's post-condition and stop — without that
+    framing the model would routinely conflate the entire user task
+    into step 1, launching the app + focusing + typing in a single
+    iteration, then having nothing left to do for steps 2 and 3 (which
+    then exhaust their iteration budgets).  When the step's
+    post-condition holds, the model emits a final assistant message
+    containing the proof and the controller marks the step DONE.
+    """
+    parts = [
+        # Lead with the current step so the model anchors on it before
+        # ever seeing the full task description.  The CURRENT STEP block
+        # is the active instruction; everything below is reference.
+        f"CURRENT STEP — DO THIS AND STOP\n"
+        f"================================\n"
+        f"id: {step.id}\n"
+        f"goal: {step.goal}",
+    ]
+    if step.expected:
+        parts.append(f"expected outcome (the ONLY thing this step verifies): {step.expected}")
+    if step.tools_hint:
+        parts.append(f"tools to consider: {', '.join(step.tools_hint)}")
+    if step.depends_on:
+        parts.append(f"depends on completed steps: {', '.join(step.depends_on)}")
+    if step.attempts > 1:
+        # Tell the model this is a retry so it doesn't blindly re-run
+        # the same launch / click / type and stack duplicate state
+        # (e.g. three Notepad windows from three retries).  The previous
+        # attempt's last_error gives the model a chance to diagnose
+        # before acting again.
+        parts.append(f"attempt: {step.attempts} (this is a RETRY — first verify "
+                     "the world isn't already in the desired state before re-running "
+                     "the same action; e.g. desktop_list_windows before another "
+                     "desktop_launch)")
+        if step.last_error:
+            parts.append(f"previous failure: {step.last_error[:200]}")
+    if completed_actions_summary:
+        parts.append("")
+        parts.append("ALREADY DONE (do not redo)\n==========================")
+        parts.append(completed_actions_summary)
+    if artifact_index_summary:
+        parts.append("")
+        parts.append("AVAILABLE ARTIFACTS\n===================")
+        parts.append(artifact_index_summary)
+
+    # Background context — surfaced after the active instruction so the
+    # model doesn't read it first and decide to do "the whole thing".
+    parts += [
+        "",
+        "BACKGROUND (reference only — NOT the goal this turn)",
+        "===================================================",
+        f"original user request: {user_input}",
+        "",
+        "full plan trajectory (your CURRENT STEP is one slice of this):",
+        plan.render_for_prompt(),
+        "",
+        "INSTRUCTIONS",
+        "============",
+        "Work on the CURRENT STEP and ONLY the CURRENT STEP.  The full plan",
+        "and original request are shown above as background only — the",
+        "controller will hand you the next step automatically.  If you find",
+        "yourself launching the app AND focusing AND typing in the same",
+        "iteration, you are doing too much: stop after the action that",
+        "satisfies the CURRENT STEP's expected outcome.  Earlier DONE steps",
+        "are settled; later PENDING steps are not your concern this turn.",
+        "",
+        "When the step's expected outcome holds, finish with a final",
+        "assistant message that starts with `STEP_DONE: <one-line proof of",
+        "post-condition>`.  If you cannot complete the step, finish with",
+        "`STEP_BLOCKED: <reason>` so the controller can replan.  Do not",
+        "narrate intent — call tools.",
+    ]
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Controller verdict — what came out of one step run.
+# ---------------------------------------------------------------------------
+
+class StepVerdict(str, Enum):
+    DONE = "done"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    EXHAUSTED = "exhausted"
+
+
+_DONE_RE = re.compile(r"^\s*STEP_DONE\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_BLOCKED_RE = re.compile(r"^\s*STEP_BLOCKED\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_step_outcome(text: str) -> tuple[StepVerdict, str]:
+    """
+    Inspect the executor's final assistant text and return the implied
+    verdict plus the proof / reason string.
+
+    The protocol REQUIRES a STEP_DONE / STEP_BLOCKED marker on the final
+    turn, so a missing marker is a protocol violation, not implicit
+    success.  The previous behaviour ("non-empty text = DONE") let the
+    model coast through the entire plan by just narrating "I'll execute
+    step 1" without invoking any tools — every step then closed as DONE
+    with zero actual work done.  Returning BLOCKED here routes through
+    the controller's retry / replan path, which re-prompts the model
+    with the protocol reminder so the next attempt actually acts.
+    """
+    if not text:
+        return StepVerdict.FAILED, "executor produced no final text"
+    m = _DONE_RE.search(text)
+    if m:
+        return StepVerdict.DONE, m.group(1).strip()
+    m = _BLOCKED_RE.search(text)
+    if m:
+        return StepVerdict.BLOCKED, m.group(1).strip()
+    return (
+        StepVerdict.BLOCKED,
+        "no STEP_DONE / STEP_BLOCKED marker; final text: "
+        + text.strip()[:160],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Replan helper
+# ---------------------------------------------------------------------------
+
+def merge_revised_plan(current: Plan, revised: Plan) -> Plan:
+    """
+    Combine an existing plan with a revised one returned by the planner.
+
+    Preserves DONE / SKIPPED step states from ``current`` when the same
+    id appears in ``revised``.  FAILED steps are NOT preserved on
+    purpose: the planner's whole job in a replan is to propose a new
+    approach to a step that just failed, so we accept the revised
+    step as-is.  New ids from ``revised`` are appended.  The revision
+    counter increments so the executor can tell plans apart in the
+    trace.
+
+    Plan-level preflight checks are carried forward — the revised
+    plan's preflight wins when it supplies one, otherwise the current
+    plan's checks are kept so a replan that doesn't restate them
+    doesn't silently lose them.  Mirrors the TS ``mergeRevisedPlan``.
+    """
+    by_id = {s.id: s for s in current.steps}
+    merged_steps: list[PlanStep] = []
+    seen_ids: set[str] = set()
+
+    for new_step in revised.steps:
+        seen_ids.add(new_step.id)
+        prev = by_id.get(new_step.id)
+        if prev and prev.status in (StepStatus.DONE, StepStatus.SKIPPED):
+            merged_steps.append(prev)
+        else:
+            merged_steps.append(new_step)
+
+    # Carry over any DONE step the new plan dropped (don't lose history).
+    for old in current.steps:
+        if old.id not in seen_ids and old.status == StepStatus.DONE:
+            merged_steps.append(old)
+
+    preflight = list(revised.preflight) if revised.preflight else list(current.preflight)
+    return Plan(
+        steps=merged_steps,
+        created=current.created,
+        revision=current.revision + 1,
+        preflight=preflight,
+    )

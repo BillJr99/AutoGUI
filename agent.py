@@ -37,13 +37,33 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
+from app_memory import AppMemory, _normalize_app
+from artifacts import ArtifactStore
+from budget import BudgetTracker
 from client import OpenWebUIClient
+from controller import (
+    Plan,
+    PlanStep,
+    StepStatus,
+    StepVerdict,
+    build_step_prompt,
+    merge_revised_plan,
+    parse_plan,
+    parse_step_outcome,
+)
+from failures import FailureClass, RecoveryAction, classify, escalate_action
+import predicates
 from planner import Planner
+import preflight
+from progress import ProgressStore
 from prompt_loader import PromptLoader
 from screen_record import ScreenRecorder
 from skills import SkillStore
+from subagent import Subagent
 from tools import ToolRegistry
 from trace import TraceWriter
+import visual_diff
+from watchdog import Watchdog
 
 logger = logging.getLogger(__name__)
 
@@ -138,12 +158,26 @@ class Agent:
         base = self._prompts.text("system_base") or self._agent_cfg.get(
             "system_prompt", "You are a helpful agent."
         )
+        # Controller protocol is appended to the system prompt only when
+        # the controller is enabled — otherwise the legacy "free-form
+        # assistant" guidance applies and the STEP_DONE markers would be
+        # noise.  Read the SAME default that the runtime branch below
+        # uses (True) so we don't accidentally take the controller path
+        # while leaving the system prompt without the step protocol —
+        # that combination caused the model to receive a typed plan
+        # with no STEP_DONE guidance and respond by hallucinating "I've
+        # completed the plan" in text without invoking tools.
+        controller_protocol = ""
+        if (self._agent_cfg.get("controller", {}) or {}).get("enabled", True):
+            controller_protocol = self._prompts.text("controller_step_protocol")
+
         self._system_prompt: str = "\n\n".join(filter(None, [
             base,
             _build_os_instructions(self._prompts),
             self._prompts.text("system_desktop_rules"),
             self._prompts.text("system_browser_rules"),
             self._prompts.text("system_tool_analysis"),
+            controller_protocol,
         ]))
 
         # Seconds to wait before dispatching each tool call (0 = immediate).
@@ -152,6 +186,19 @@ class Agent:
         # so vision-capable models can actually see it.  Set False for text-only models.
         self._vision_screenshots: bool = bool(self._agent_cfg.get("vision_screenshots", True))
         logger.info("[agent] vision_screenshots=%s", self._vision_screenshots)
+
+        # Pre-create the screenshots directory at startup so it's always
+        # there for the user to inspect, even if a backend's screenshot()
+        # later fails (PIL missing, ImageGrab raises, PowerShell hiccup,
+        # etc.).  Backends would otherwise create it lazily INSIDE the
+        # capture try-block — which never runs when the capture itself
+        # raises before reaching the mkdir call.
+        screenshots_dir = self._agent_cfg.get("screenshots_dir", "screenshots")
+        try:
+            from pathlib import Path as _P
+            _P(screenshots_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("[agent] could not pre-create %s: %s", screenshots_dir, e)
 
         # The message history is the single source of truth for the conversation.
         # It persists across multiple calls to run(), allowing multi-turn dialogue.
@@ -189,8 +236,27 @@ class Agent:
         # Trace + skill store wiring (Phase 2).
         trace_dir = self._agent_cfg.get("trace_dir", "logs/traces")
         skills_path = self._agent_cfg.get("skills_path", "skills/skills.jsonl")
+        # Skills are CREATION-OPT-IN: when skills_enabled is false (the
+        # default) existing skills are still readable / replayable
+        # (skill_list, skill_run, candidate suggestion at task start),
+        # but skill_save is NOT registered so the agent cannot create
+        # new skill records.  The SkillStore is constructed lazily —
+        # its constructor does not touch the disk, so nothing is
+        # written until skill_save fires for the first time.  Set
+        # skills_enabled=true to allow creation.
+        self._skills_enabled: bool = bool(self._agent_cfg.get("skills_enabled", False))
         self._suggest_skills: bool = bool(self._agent_cfg.get("suggest_skills", True))
         self._record_trace: bool = bool(self._agent_cfg.get("record_trace", True))
+        # Drift anchors are the post-action snapshots (window titles + an
+        # optional perceptual screen hash) attached to each session step
+        # so `replay --drift-check` can flag steps whose live world state
+        # has shifted vs. the recording.  Anchoring is on by default
+        # because window titles are essentially free; the perceptual
+        # screenshot hash is gated separately because it requires a
+        # screenshot per step.
+        drift_cfg = self._agent_cfg.get("drift_anchor", {}) or {}
+        self._drift_anchor_enabled: bool = bool(drift_cfg.get("enabled", True))
+        self._drift_anchor_phash: bool = bool(drift_cfg.get("capture_phash", False))
 
         try:
             self._trace = TraceWriter(trace_dir) if self._record_trace else None
@@ -199,6 +265,8 @@ class Agent:
             self._trace = None
 
         try:
+            # Constructed unconditionally — lazy disk semantics mean an
+            # empty / missing skills file produces no side effects.
             self._skill_store = SkillStore(skills_path)
         except Exception as e:
             logger.warning("[agent] SkillStore init failed: %s", e)
@@ -230,6 +298,120 @@ class Agent:
             except Exception as e:
                 logger.warning("[agent] Planner init failed: %s", e)
                 self._planner = None
+
+        # ---- Controller / artifact / progress / subagent (Phase 13) -----
+        # The controller decomposes a task into typed plan steps and runs
+        # the executor loop step-by-step with scoped per-step prompts.
+        # Artifact store gives observations stable IDs so big bodies stay
+        # out of history.  Progress store survives crashes/aborts and lets
+        # the user resume.  Subagent answers read-only questions without
+        # bloating the main conversation.
+        controller_cfg = self._agent_cfg.get("controller", {}) or {}
+        # Controller is ON by default — the typed-plan + step-scoped
+        # executor is the recommended path.  Set enabled=false to fall
+        # back to the legacy single-loop executor.
+        self._controller_enabled: bool = bool(controller_cfg.get("enabled", True))
+        self._step_max_iterations: int = max(1, int(controller_cfg.get("step_max_iterations", 8)))
+        self._step_max_retries: int = max(0, int(controller_cfg.get("step_max_retries", 2)))
+        self._auto_resume: bool = bool(controller_cfg.get("auto_resume", True))
+        self._replan_on_block: bool = bool(controller_cfg.get("replan_on_block", True))
+        self._critique_enabled: bool = bool(controller_cfg.get("critique_enabled", True))
+        self._preflight_enabled: bool = bool(controller_cfg.get("preflight_enabled", True))
+        self._predicate_check_enabled: bool = bool(
+            controller_cfg.get("predicate_check_enabled", True)
+        )
+        # Predicate retries: GUI state (process_running, text_visible,
+        # window_title_contains) is racy — Notepad takes a moment to
+        # show up in tasklist after desktop_launch returns, OCR may
+        # fail to read text on a screen that hasn't repainted yet.
+        # Retry the check a few times with a short gap so a transient
+        # miss doesn't tank a step that actually succeeded.  Set
+        # predicate_retry_count=0 to disable.
+        self._predicate_retry_count: int = max(
+            0, int(controller_cfg.get("predicate_retry_count", 3))
+        )
+        self._predicate_retry_delay: float = max(
+            0.0, float(controller_cfg.get("predicate_retry_delay_seconds", 0.5))
+        )
+        self._visual_diff_enabled: bool = bool(
+            controller_cfg.get("visual_diff_enabled", True)
+        )
+        self._watchdog_threshold: int = int(controller_cfg.get("watchdog_stall_threshold", 3))
+
+        artifact_cfg = self._agent_cfg.get("artifacts", {}) or {}
+        self._artifacts: ArtifactStore | None = None
+        try:
+            self._artifacts = ArtifactStore(artifact_cfg.get("dir", "logs/artifacts"))
+        except Exception as e:
+            logger.warning("[agent] ArtifactStore init failed: %s", e)
+            self._artifacts = None
+
+        progress_cfg = self._agent_cfg.get("progress", {}) or {}
+        self._progress: ProgressStore | None = None
+        try:
+            self._progress = ProgressStore(progress_cfg.get("dir", "logs/progress"))
+        except Exception as e:
+            logger.warning("[agent] ProgressStore init failed: %s", e)
+            self._progress = None
+
+        subagent_cfg = self._agent_cfg.get("subagent", {}) or {}
+        self._subagent_enabled: bool = bool(subagent_cfg.get("enabled", True))
+        self._subagent_max_calls: int = max(1, int(subagent_cfg.get("max_tool_calls", 4)))
+        self._subagent: Subagent | None = None
+        if self._subagent_enabled:
+            try:
+                self._subagent = Subagent(
+                    self._client, self._registry,
+                    max_tool_calls=self._subagent_max_calls,
+                    artifact_store=self._artifacts,
+                )
+            except Exception as e:
+                logger.warning("[agent] Subagent init failed: %s", e)
+                self._subagent = None
+
+        # Per-task plan + state (populated by run()).
+        self._plan: Plan | None = None
+        self._task_progress = None
+        self._step_retry_counts: dict[str, int] = {}
+        self._budget: BudgetTracker | None = None
+        self._watchdog: Watchdog | None = None
+        self._last_screenshot_hash: bytes | None = None
+
+        # Per-app memory store (failure histograms, success counts, notes).
+        # Lives under <agent.memory.dir> (default ./memory) and survives
+        # across sessions so the planner can warn about app quirks the
+        # next time the user touches the same app.
+        #
+        # ``memory.enabled`` controls CREATION only.  When false (the
+        # default) existing records remain readable via memory_get and
+        # the planner still consumes hints from on-disk memory, but
+        # record_failure / record_success / add_note become silent
+        # no-ops and memory_note is not registered as a tool.  This
+        # mirrors the skills.skills_enabled gate and keeps the agent
+        # from writing a memory/ directory unless the user opts in.
+        memory_cfg = self._agent_cfg.get("memory", {}) or {}
+        self._memory_enabled: bool = bool(memory_cfg.get("enabled", False))
+        self._memory: AppMemory | None = None
+        try:
+            self._memory = AppMemory(
+                memory_cfg.get("dir", "memory"),
+                allow_writes=self._memory_enabled,
+            )
+        except Exception as e:
+            logger.warning("[agent] AppMemory init failed: %s", e)
+            self._memory = None
+
+        # Budget ceilings.  All defaults zero = no ceiling — the user
+        # opts in to hard limits explicitly.
+        budget_cfg = self._agent_cfg.get("budget", {}) or {}
+        self._budget_max_tools: int = int(budget_cfg.get("max_tool_calls", 0))
+        self._budget_max_chats: int = int(budget_cfg.get("max_chat_calls", 0))
+        self._budget_max_tokens: int = int(budget_cfg.get("max_total_tokens", 0))
+        self._budget_max_seconds: float = float(budget_cfg.get("max_seconds", 0.0))
+
+        # Register the artifact / plan / checkpoint / subagent meta-tools
+        # so the model can interact with the new stores explicitly.
+        self._register_meta_tools()
 
         # Rolling screen buffer (Phase 11).  When a tool fails, the buffer
         # is flushed to an animated GIF so the user can see exactly how
@@ -325,10 +507,15 @@ class Agent:
                 pass
             return {"skill": name, "executed": executed, "step_count": len(executed), "success": True}
 
-        registry.add_tool(
-            {"type": "function", "function": {
-                "name": "skill_save",
-                "description": (
+        # skill_save creates new on-disk records, so it is only registered
+        # when the user has explicitly opted in via skills_enabled=true.
+        # skill_list and skill_run are read-only and always registered when
+        # a SkillStore exists, so existing libraries remain usable.
+        if self._skills_enabled:
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "skill_save",
+                    "description": (
                     "Save the sequence of tool calls completed in this session as a "
                     "named, replayable skill. Provide keywords describing when this "
                     "skill applies (e.g. 'open weather forecast in browser'). "
@@ -382,6 +569,370 @@ class Agent:
         )
 
     # ------------------------------------------------------------------
+    # Meta-tools: artifact, plan, checkpoint, ask
+    # ------------------------------------------------------------------
+
+    def _register_meta_tools(self):
+        """Add get_artifact / list_artifacts / plan_get / plan_update_step /
+        checkpoint / ask_subagent to the registry.  Always registered when
+        the supporting stores exist, so the model can opt to use them."""
+        registry = self._registry
+        agent = self
+
+        if self._artifacts is not None:
+            async def _get_artifact(id: str) -> dict:
+                aid = str(id or "")
+                if not aid.startswith("artifact://"):
+                    aid = "artifact://" + aid.lstrip("/")
+                art = agent._artifacts.get(aid)
+                if art is None:
+                    return {"error": f"unknown artifact id: {id}"}
+                body = agent._artifacts.get_body(aid) or ""
+                return {
+                    "id": aid,
+                    "kind": art.kind,
+                    "source": art.source,
+                    "summary": art.summary,
+                    "bytes": art.bytes_len,
+                    "content": body,
+                }
+
+            async def _list_artifacts(kind: str = "", limit: int = 10) -> dict:
+                items = agent._artifacts.list_recent(kind=kind or None, limit=int(limit) or 10)
+                return {
+                    "count": len(items),
+                    "artifacts": [
+                        {"id": a.id, "kind": a.kind, "source": a.source,
+                         "summary": a.summary, "bytes": a.bytes_len}
+                        for a in items
+                    ],
+                }
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "get_artifact",
+                    "description": (
+                        "Fetch the body of a previously stored artifact (file content, "
+                        "command output, OCR snippet) by id.  Use this when the agent "
+                        "context only shows an artifact summary and you need the full text."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "id": {"type": "string", "description": "artifact://<id> or just the id."},
+                    }, "required": ["id"]},
+                }},
+                _get_artifact,
+            )
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "list_artifacts",
+                    "description": (
+                        "List recent artifacts captured during this task.  Use to find "
+                        "a previously-read file before re-reading it from disk."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "kind": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    }},
+                }},
+                _list_artifacts,
+            )
+
+        async def _plan_get() -> dict:
+            if agent._plan is None:
+                return {"plan": None, "note": "No structured plan in this session."}
+            return {
+                "plan": agent._plan.to_dict(),
+                "progress": agent._plan.progress_summary(),
+            }
+
+        async def _plan_update_step(
+            id: str,
+            status: str = "",
+            notes: str = "",
+        ) -> dict:
+            if agent._plan is None:
+                return {"error": "No structured plan in this session."}
+            step = agent._plan.by_id(str(id))
+            if step is None:
+                return {"error": f"no step with id {id!r}"}
+            if status:
+                try:
+                    step.status = StepStatus(status)
+                except ValueError:
+                    return {"error": f"invalid status {status!r}"}
+            if notes:
+                step.notes = (step.notes + "\n" + notes).strip() if step.notes else notes
+            agent._persist_progress()
+            return {"step": step.to_public()}
+
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "plan_get",
+                "description": (
+                    "Return the current typed plan (steps, ids, statuses).  Use to "
+                    "remind yourself which step the controller expects you to work on."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            }},
+            _plan_get,
+        )
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "plan_update_step",
+                "description": (
+                    "Manually mark a plan step done/skipped/blocked, or attach notes.  "
+                    "The controller marks STEP_DONE / STEP_BLOCKED automatically; use "
+                    "this only to skip an obsolete step or annotate progress."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "id": {"type": "string"},
+                    "status": {"type": "string", "enum": [
+                        "pending", "running", "done", "failed", "skipped", "blocked",
+                    ]},
+                    "notes": {"type": "string"},
+                }, "required": ["id"]},
+            }},
+            _plan_update_step,
+        )
+
+        if self._progress is not None:
+            async def _checkpoint(label: str = "", data: dict | str = "") -> dict:
+                if agent._task_progress is None:
+                    return {"note": "no active task progress record"}
+                payload: dict = {}
+                if isinstance(data, dict):
+                    payload = dict(data)
+                elif isinstance(data, str) and data:
+                    payload = {"note": data}
+                if label:
+                    payload["label"] = label
+                agent._progress.update_checkpoint(agent._task_progress, payload)
+                return {"saved": True, "checkpoint": payload}
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "checkpoint",
+                    "description": (
+                        "Persist a free-form progress marker so the task can resume "
+                        "after a crash or abort.  Use after non-trivial milestones "
+                        "(\"finished tab 3 of 7\", \"wrote intermediate output\")."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "label": {"type": "string"},
+                        "data": {"type": "object"},
+                    }},
+                }},
+                _checkpoint,
+            )
+
+        if self._subagent is not None:
+            async def _ask_subagent(
+                question: str,
+                artifact_ids=None,
+            ) -> dict:
+                fetched: list[tuple[str, str]] = []
+                if isinstance(artifact_ids, list) and agent._artifacts is not None:
+                    for aid in artifact_ids[:6]:
+                        body = agent._artifacts.get_body(str(aid))
+                        if body:
+                            art = agent._artifacts.get(str(aid))
+                            label = art.summary if art else str(aid)
+                            fetched.append((label[:80], body))
+                result = await agent._subagent.ask(
+                    str(question),
+                    fetched_artifacts=fetched or None,
+                )
+                return {
+                    "answer": result.answer,
+                    "artifact_ids": result.artifact_ids,
+                    "tool_calls_made": result.tool_calls_made,
+                }
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "ask_subagent",
+                    "description": (
+                        "Delegate a read-only lookup question to a focused subagent so "
+                        "the answer doesn't bloat the main conversation history.  Good "
+                        "for \"which of these N files mentions X\", \"summarise this JSON\", "
+                        "and similar pure-read tasks.  The subagent has no desktop or shell "
+                        "access — only fs_read / fs_list / browser_get_text."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "question": {"type": "string"},
+                        "artifact_ids": {"type": "array", "items": {"type": "string"},
+                                         "description": "Optional pre-fetched artifact ids."},
+                    }, "required": ["question"]},
+                }},
+                _ask_subagent,
+            )
+
+        # ---- App-memory tools ------------------------------------------
+        # memory_get is read-only and registers whenever the store
+        # exists; memory_note creates new entries and is gated behind
+        # agent.memory.enabled so a default install never writes a
+        # memory/ directory.
+        if self._memory is not None:
+            async def _memory_get(app: str = "") -> dict:
+                if not app:
+                    return {"apps": agent._memory.list_apps()}
+                return agent._memory.get(str(app))
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "memory_get",
+                    "description": (
+                        "Read the per-app memory record for an app (failure "
+                        "histogram, success counts, recent notes).  Pass an "
+                        "empty app to list every app the memory store has "
+                        "ever recorded.  Always available — reads are not "
+                        "gated by agent.memory.enabled."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "app": {"type": "string"},
+                    }},
+                }},
+                _memory_get,
+            )
+
+            if self._memory_enabled:
+                async def _memory_note(app: str, text: str, tag: str = "") -> dict:
+                    if not app or not text:
+                        return {"error": "app and text are required"}
+                    agent._memory.add_note(app=str(app), text=str(text), tag=str(tag or ""))
+                    return {"saved": True, "app": _normalize_app(str(app))}
+
+                registry.add_tool(
+                    {"type": "function", "function": {
+                        "name": "memory_note",
+                        "description": (
+                            "Attach a free-form note (\"Slack input box doesn't "
+                            "respond to ctrl+a\") to an app's memory record so "
+                            "future tasks against the same app see the warning."
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "app": {"type": "string"},
+                            "text": {"type": "string"},
+                            "tag": {"type": "string"},
+                        }, "required": ["app", "text"]},
+                    }},
+                    _memory_note,
+                )
+
+        # ---- Budget tool -----------------------------------------------
+        async def _budget_status() -> dict:
+            if agent._budget is None:
+                return {"note": "no active task budget"}
+            snap = agent._budget.snapshot()
+            return {
+                "elapsed_seconds": snap.elapsed_seconds,
+                "tool_calls": snap.tool_calls,
+                "chat_calls": snap.chat_calls,
+                "prompt_tokens": snap.prompt_tokens,
+                "completion_tokens": snap.completion_tokens,
+                "total_tokens": snap.total_tokens,
+                "fraction_used": snap.fraction_used,
+                "exceeded": snap.exceeded,
+            }
+
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "budget_status",
+                "description": (
+                    "Return the current task's cost telemetry: elapsed time, "
+                    "tool/chat call counts, token usage, and how close we are "
+                    "to any configured ceiling.  Use periodically on long "
+                    "tasks to decide whether to wrap up early."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            }},
+            _budget_status,
+        )
+
+    def _persist_progress(self):
+        """Snapshot the live plan into the progress store (no-op if disabled)."""
+        if self._progress is None or self._task_progress is None or self._plan is None:
+            return
+        try:
+            self._progress.update_plan_snapshot(self._task_progress, self._plan.to_dict())
+        except Exception as e:
+            logger.debug("[agent] progress snapshot failed: %s", e)
+
+    def _resume_plan_state(self) -> None:
+        """Apply persisted completed_step_ids onto the freshly parsed plan,
+        BUT only when the persisted plan's shape (step id + goal pairs)
+        actually matches the new one.
+
+        Without the shape check we'd inherit completed_step_ids whenever
+        the new plan happened to use the same auto-generated ids
+        (s1, s2, ...) as the previous run — which is essentially every
+        run, since both planners number sequentially.  Result: the
+        agent silently skipped step 1 of a fresh task because a prior
+        run with the same task text had completed an *unrelated* s1.
+        """
+        if self._plan is None or self._task_progress is None:
+            return
+
+        prior_snapshot = self._task_progress.plan_snapshot or {}
+        prior_steps = prior_snapshot.get("steps") if isinstance(prior_snapshot, dict) else None
+        if not isinstance(prior_steps, list) or not prior_steps:
+            # No persisted shape to compare against — treat as a fresh
+            # plan rather than blindly inheriting completed ids.
+            logger.info(
+                "[agent] no persisted plan_snapshot to resume against; "
+                "starting fresh.  task_id=%s",
+                self._task_progress.task_id,
+            )
+            return
+
+        prior_shape = {
+            str(s.get("id", "")): str(s.get("goal", ""))
+            for s in prior_steps
+            if isinstance(s, dict)
+        }
+        new_shape = {step.id: step.goal for step in self._plan.steps}
+
+        # Compare ONLY the steps that actually carry persisted state —
+        # if the prior plan had {s1: "open notepad"} and the new plan
+        # has {s1: "launch chrome"}, we must NOT mark s1 done.  But if
+        # the new plan added new steps (s4, s5) that's fine; we just
+        # don't have state for them, which is correct.
+        compatible_ids: set[str] = set()
+        for sid, prior_goal in prior_shape.items():
+            new_goal = new_shape.get(sid)
+            if new_goal is not None and new_goal == prior_goal:
+                compatible_ids.add(sid)
+
+        # If NONE of the prior step ids match by goal, the persisted
+        # state is for a different plan — log the divergence and
+        # don't apply it.  This is the common case when the user
+        # re-runs the same /autogui prompt with the model producing a
+        # fresh plan.
+        if not compatible_ids:
+            logger.info(
+                "[agent] persisted plan_snapshot has no shape overlap with the "
+                "fresh plan (likely a different planning pass); starting fresh.  "
+                "task_id=%s prior_step_ids=%s new_step_ids=%s",
+                self._task_progress.task_id,
+                list(prior_shape.keys()),
+                list(new_shape.keys()),
+            )
+            return
+
+        for sid in self._task_progress.completed_step_ids:
+            if sid not in compatible_ids:
+                continue
+            step = self._plan.by_id(sid)
+            if step is not None and step.status == StepStatus.PENDING:
+                step.status = StepStatus.DONE
+        for sid in self._task_progress.failed_step_ids:
+            if sid not in compatible_ids:
+                continue
+            step = self._plan.by_id(sid)
+            if step is not None and step.status == StepStatus.PENDING:
+                step.status = StepStatus.FAILED
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
@@ -391,8 +942,16 @@ class Agent:
         writer and the optional event_sink before passing it to the caller,
         so observability / replay logging can be added without modifying
         each yield site individually.
+
+        Routes to the controller-driven loop when ``agent.controller.enabled``
+        is true; otherwise runs the legacy single-loop executor.
         """
-        async for event in self._run_inner(user_input):
+        if self._controller_enabled and self._planner is not None:
+            inner = self._run_with_controller(user_input)
+        else:
+            inner = self._run_inner(user_input)
+
+        async for event in inner:
             if self._trace is not None:
                 try:
                     self._trace.write_event(event)
@@ -404,6 +963,1198 @@ class Agent:
                 except Exception:
                     pass
             yield event
+
+    # ------------------------------------------------------------------
+    # Controller-driven path
+    # ------------------------------------------------------------------
+
+    async def _run_with_controller(self, user_input: str) -> AsyncIterator[AgentEvent]:
+        """
+        Plan -> critique -> preflight -> step-by-step execution.
+
+        For each PENDING step the controller composes a scoped prompt
+        (see controller.build_step_prompt), drives the executor loop in a
+        per-step history, and observes the step's STEP_DONE / STEP_BLOCKED
+        marker plus any tool failures.  Plan progress is persisted after
+        every step.  Cost telemetry, watchdog, predicate verification,
+        and visual diff are wired into the per-step loop.
+        """
+        # Fresh per-task budget tracker + watchdog so concurrent runs
+        # don't share state.
+        self._budget = BudgetTracker(
+            max_tool_calls=self._budget_max_tools,
+            max_chat_calls=self._budget_max_chats,
+            max_total_tokens=self._budget_max_tokens,
+            max_seconds=self._budget_max_seconds,
+        )
+        self._watchdog = (
+            Watchdog(stall_threshold=self._watchdog_threshold)
+            if self._watchdog_threshold > 0 else None
+        )
+        self._last_screenshot_hash = None
+
+        available_tools = set(self._registry.list_tools())
+        windows_json = ""
+        if "desktop_list_windows" in available_tools:
+            try:
+                windows_json = await self._registry.dispatch("desktop_list_windows", {})
+            except Exception:
+                pass
+
+        # --- Few-shot exemplars + memory hints ---------------------------
+        # Surface up to 3 successful skills with overlapping keywords as
+        # planning exemplars, plus per-app memory hints for any apps
+        # currently visible on the desktop.  Both are best-effort.
+        exemplars: list[dict] = []
+        if self._suggest_skills and self._skill_store is not None:
+            try:
+                exemplars = self._skill_store.search(user_input, limit=3)
+            except Exception:
+                exemplars = []
+
+        memory_hints: list[str] = []
+        if self._memory is not None and windows_json:
+            seen: set[str] = set()
+            try:
+                wins = json.loads(windows_json).get("windows") or []
+            except (json.JSONDecodeError, TypeError):
+                wins = []
+            for w in wins:
+                app = (w.get("app") or "").strip()
+                if not app or app in seen:
+                    continue
+                seen.add(app)
+                hint = self._memory.hint_for_planner(app)
+                if hint:
+                    memory_hints.append(hint)
+                if len(memory_hints) >= 4:
+                    break
+
+        # --- Plan acquisition: typed first, free-text fallback ----------
+        os_label = _platform.system()
+        browser_avail = any(t.startswith("browser_") for t in available_tools)
+        a11y_avail = "desktop_click_element" in available_tools
+        plan_text = ""
+        try:
+            plan_text = await self._planner.plan_typed(
+                task=user_input,
+                os_label=os_label,
+                vision=self._vision_screenshots,
+                browser_available=browser_avail,
+                a11y_available=a11y_avail,
+                windows_summary=windows_json,
+                exemplars=exemplars,
+                memory_hints=memory_hints,
+            )
+            # Plan_typed wraps an internal client.chat call we can't
+            # otherwise observe; count it for the budget tracker.
+            if self._budget is not None:
+                self._budget.chat_calls += 1
+        except Exception as e:
+            logger.warning("[agent] typed planner failed: %s", e)
+
+        # --- Critique pass: one extra LLM call to review the plan ------
+        if self._critique_enabled and plan_text and plan_text.strip().startswith("{"):
+            try:
+                verdict = await self._planner.critique(task=user_input, plan_json=plan_text)
+                if self._budget is not None:
+                    self._budget.chat_calls += 1
+            except Exception as e:
+                logger.warning("[agent] critique failed: %s", e)
+                verdict = {"approve": True, "issues": [], "revised_plan_json": None}
+            if verdict.get("issues"):
+                yield AgentEvent(
+                    kind="plan_critique",
+                    content="critique issues: " + " | ".join(verdict["issues"][:5]),
+                    data={"issues": verdict["issues"], "approve": verdict.get("approve")},
+                )
+            if not verdict.get("approve") and verdict.get("revised_plan_json"):
+                plan_text = verdict["revised_plan_json"]
+                yield AgentEvent(
+                    kind="plan_revised",
+                    content="critique replaced plan",
+                    data={"source": "critique"},
+                )
+
+        plan = parse_plan(plan_text)
+        if not plan.steps:
+            yield AgentEvent(
+                kind="error",
+                content="Planner produced no steps; falling back to legacy loop.",
+                data={"raw": plan_text[:200]},
+            )
+            async for event in self._run_inner(user_input):
+                yield event
+            return
+
+        self._plan = plan
+        if self._progress is not None:
+            self._task_progress = self._progress.open_task(user_input)
+            if self._auto_resume:
+                self._resume_plan_state()
+            self._persist_progress()
+
+        yield AgentEvent(
+            kind="plan",
+            content=plan.render_for_prompt(),
+            data={"plan": plan.to_dict()},
+        )
+
+        # --- Preflight: resource gates BEFORE the executor touches UI -----
+        if self._preflight_enabled:
+            checks = preflight.infer_checks_from_plan(plan.to_dict(), registry=self._registry)
+            if checks:
+                report = await preflight.run_preflight(checks, registry=self._registry)
+                yield AgentEvent(
+                    kind="preflight",
+                    content=("preflight passed" if report.all_passed
+                             else f"preflight failed ({len(report.failures())} of {len(report.results)})"),
+                    data=report.to_dict(),
+                )
+                if not report.all_passed:
+                    # The preflight event above already announced the
+                    # failure (with per-check details).  Skip the
+                    # follow-up step_escalate yield — both rendered the
+                    # same "preflight failed" line in the TUI, which
+                    # made it look like the agent aborted twice for
+                    # different reasons.  The done event below carries
+                    # the same report under data["report"] for any
+                    # consumer that wanted it.
+                    if self._task_progress is not None:
+                        self._progress.finalize(self._task_progress, status="failed")
+                    yield AgentEvent(
+                        kind="done",
+                        content="Controller aborted (preflight)",
+                        data={
+                            "plan": plan.to_dict(),
+                            "status": "preflight_failed",
+                            # Surface a real iteration count even on early
+                            # exits so the TUI's "done (?, ? iterations)"
+                            # render shows 0 instead of "?", which made it
+                            # look like the controller never ran at all.
+                            "iterations": 0,
+                            "finish_reason": "preflight_failed",
+                            # Carried forward from the preflight event so
+                            # programmatic consumers (replay, dashboards)
+                            # can still see what the actual checks were.
+                            "report": report.to_dict(),
+                        },
+                    )
+                    return
+
+        # --- Step loop ---------------------------------------------------
+        global_iter = 0
+        while True:
+            step = plan.next_runnable()
+            if step is None:
+                break
+
+            # Check the global iteration ceiling so a runaway plan can't
+            # exceed the same overall budget the legacy loop enforces.
+            if global_iter >= self._max_iterations:
+                yield AgentEvent(
+                    kind="error",
+                    content=f"Global iteration ceiling ({self._max_iterations}) reached; "
+                            "remaining plan steps abandoned.",
+                    data={"plan": plan.to_dict()},
+                )
+                break
+
+            # Pre-step budget check: bail BEFORE starting a new step when
+            # the previous step blew through the ceiling.  Mirror check
+            # at the bottom catches mid-step overflow as well.
+            if self._budget is not None and self._budget.exceeded:
+                yield AgentEvent(
+                    kind="budget_exceeded",
+                    content=f"Budget exceeded: {self._budget.reason()}",
+                    data=self._budget.snapshot(note="exceeded").__dict__,
+                )
+                if self._task_progress is not None:
+                    self._progress.finalize(self._task_progress, status="failed")
+                yield AgentEvent(
+                    kind="done",
+                    content="Controller stopped (budget)",
+                    data={
+                        "plan": plan.to_dict(),
+                        "status": "budget_exceeded",
+                        "iterations": global_iter,
+                        "finish_reason": "budget_exceeded",
+                    },
+                )
+                return
+
+            step.status = StepStatus.RUNNING
+            step.attempts += 1
+            self._step_retry_counts[step.id] = self._step_retry_counts.get(step.id, 0)
+            self._persist_progress()
+            yield AgentEvent(
+                kind="step_start",
+                content=f"→ ({step.id}) {step.goal}",
+                data={"step": step.to_public(), "attempts": step.attempts},
+            )
+
+            verdict, reason, used_iters, failure = await self._run_step(
+                user_input=user_input,
+                step=step,
+                event_yield=None,  # we re-yield via the queue below
+            )
+            global_iter += used_iters
+
+            # Predicate verification: when the step declared a typed
+            # predicate, check it deterministically before accepting
+            # STEP_DONE.  A miss demotes the verdict to BLOCKED and
+            # routes through the standard failure-classification path.
+            predicate_failure_detail = ""
+            if (
+                verdict == StepVerdict.DONE
+                and self._predicate_check_enabled
+                and step.predicate
+            ):
+                # Sanity-check the predicate kind BEFORE running it.  The
+                # model occasionally invents kinds like
+                # "window_exists_with_partial_match" or
+                # "element_has_focus_and_is_editable" that aren't in
+                # PREDICATE_KINDS.  predicates.normalize() returns None for
+                # those, and check_predicate would then return ok=False
+                # with "predicate normalised to None" — treating an
+                # invalid kind as a verified failure, demoting STEP_DONE
+                # to BLOCKED and forcing a replan.  But the model's action
+                # may have actually succeeded!  Treat invalid-kind as
+                # "skip the check, accept STEP_DONE", log a warning so
+                # the planner authoring is visible, and move on.
+                predicate_skipped = False
+                if predicates.normalize(step.predicate) is None:
+                    logger.warning(
+                        "[agent] step %s predicate kind %r is not a recognised "
+                        "PREDICATE_KIND — skipping verification and accepting "
+                        "STEP_DONE.  Tell the planner to use one of: %s",
+                        step.id,
+                        step.predicate.get("kind") or step.predicate.get("type"),
+                        ", ".join(predicates.PREDICATE_KINDS),
+                    )
+                    p_result = predicates.PredicateResult(
+                        ok=True, kind="(skipped)",
+                        detail=(
+                            "invalid predicate kind "
+                            f"{step.predicate.get('kind') or step.predicate.get('type')!r}"
+                            " — verification skipped (the model's STEP_DONE is authoritative)"
+                        ),
+                    )
+                    predicate_skipped = True
+                else:
+                    # Race-tolerant predicate verification: process_running
+                    # / text_visible / window_title_contains all probe GUI
+                    # state that lags the action by hundreds of
+                    # milliseconds (Notepad needs a tick to show up in
+                    # tasklist; OCR can't read a half-painted window).
+                    # Retry up to predicate_retry_count times with a small
+                    # gap so the model's STEP_DONE doesn't get demoted to
+                    # BLOCKED just because we checked too soon.  The
+                    # FIRST attempt runs immediately; backoff only fires
+                    # between retries, not before the initial check.
+                    attempt_total = 1 + self._predicate_retry_count
+                    p_result = predicates.PredicateResult(
+                        ok=False, kind=str(step.predicate.get("kind", "?")),
+                        detail="predicate not yet checked",
+                    )
+                    for attempt in range(1, attempt_total + 1):
+                        try:
+                            p_result = await predicates.check_predicate(
+                                step.predicate, self._registry,
+                            )
+                        except Exception as e:
+                            logger.warning("[agent] predicate check raised: %s", e)
+                            p_result = predicates.PredicateResult(
+                                ok=False, kind=str(step.predicate.get("kind", "?")),
+                                detail=f"check raised: {e}",
+                            )
+                        if p_result.ok or attempt >= attempt_total:
+                            break
+                        await asyncio.sleep(self._predicate_retry_delay)
+                yield AgentEvent(
+                    kind="predicate",
+                    content=("predicate ok: " if p_result.ok else "predicate FAILED: ")
+                            + predicates.render(step.predicate),
+                    data={
+                        "step": step.id, "ok": p_result.ok,
+                        "detail": p_result.detail,
+                        "predicate": step.predicate,
+                    },
+                )
+                if not p_result.ok:
+                    verdict = StepVerdict.BLOCKED
+                    predicate_failure_detail = p_result.detail
+                    reason = (
+                        f"predicate {predicates.render(step.predicate)} "
+                        f"did not hold ({p_result.detail})"
+                    )
+
+            # Process the verdict.
+            if verdict == StepVerdict.DONE:
+                step.status = StepStatus.DONE
+                step.last_error = ""
+                # Record per-app success so the planner can prefer the
+                # tools that worked next time.  Skipped when memory
+                # creation is disabled — the call would no-op anyway,
+                # but cheaper not to make it.
+                if self._memory is not None and self._memory_enabled:
+                    try:
+                        active_app = await self._best_effort_active_app()
+                        if active_app:
+                            for tool in step.tools_hint or []:
+                                self._memory.record_success(app=active_app, tool=tool)
+                    except Exception:
+                        pass
+                if self._task_progress is not None:
+                    self._progress.mark_done(self._task_progress, step.id)
+                self._persist_progress()
+                yield AgentEvent(
+                    kind="step_done",
+                    content=f"✓ ({step.id}) {reason[:160]}",
+                    data={"step": step.to_public(), "iterations": used_iters},
+                )
+
+                # Budget check — if the user set ceilings, surface usage
+                # after each successful step and bail when exceeded.
+                if self._budget is not None and self._budget.exceeded:
+                    yield AgentEvent(
+                        kind="budget_exceeded",
+                        content=f"Budget exceeded: {self._budget.reason()}",
+                        data=self._budget.snapshot(note="exceeded").__dict__,
+                    )
+                    if self._task_progress is not None:
+                        self._progress.finalize(self._task_progress, status="failed")
+                    yield AgentEvent(
+                        kind="done",
+                        content="Controller stopped (budget)",
+                        data={
+                            "plan": plan.to_dict(),
+                            "status": "budget_exceeded",
+                            "iterations": global_iter,
+                            "finish_reason": "budget_exceeded",
+                        },
+                    )
+                    return
+                continue
+
+            # Failed / blocked / exhausted — classify and decide.
+            self._step_retry_counts[step.id] += 1
+            retry_count = self._step_retry_counts[step.id]
+            verdict_failure = failure or classify(
+                tool_name="(none)",
+                error_message=reason,
+                predicate_failed=verdict == StepVerdict.BLOCKED,
+            )
+
+            # Record the failure against the active app's memory so the
+            # next plan can warn about it.  Same gate as success-record
+            # above: skipped entirely when memory creation is disabled.
+            if self._memory is not None and self._memory_enabled:
+                try:
+                    active_app = await self._best_effort_active_app()
+                    if active_app:
+                        self._memory.record_failure(
+                            app=active_app,
+                            tool=", ".join(step.tools_hint) or "(none)",
+                            failure_class=verdict_failure.cls.value,
+                            reason=predicate_failure_detail or reason[:120],
+                        )
+                except Exception:
+                    pass
+            action = escalate_action(
+                verdict_failure,
+                retry_count=retry_count,
+                max_retries=self._step_max_retries,
+            )
+
+            yield AgentEvent(
+                kind="step_failure",
+                content=f"✗ ({step.id}) {verdict.value}: {reason[:160]} → {action.value}",
+                data={
+                    "step": step.to_public(),
+                    "verdict": verdict.value,
+                    "reason": reason,
+                    "failure_class": verdict_failure.cls.value,
+                    "recovery_action": action.value,
+                    "retry_count": retry_count,
+                },
+            )
+
+            if action == RecoveryAction.WAIT_AND_RETRY and verdict_failure.wait_seconds > 0:
+                await asyncio.sleep(verdict_failure.wait_seconds)
+                step.status = StepStatus.PENDING  # try again next iteration
+                step.last_error = reason[:200]
+                self._persist_progress()
+                continue
+
+            if action == RecoveryAction.RETRY:
+                step.status = StepStatus.PENDING
+                step.last_error = reason[:200]
+                self._persist_progress()
+                continue
+
+            if action == RecoveryAction.REPLAN and self._replan_on_block:
+                # Mark this step blocked; ask the planner to revise.
+                step.status = StepStatus.BLOCKED
+                step.last_error = reason[:200]
+                self._persist_progress()
+                revised = await self._replan(user_input, plan, blocked_step=step)
+                if revised is not None and revised.steps:
+                    plan = merge_revised_plan(plan, revised)
+                    self._plan = plan
+                    self._persist_progress()
+                    yield AgentEvent(
+                        kind="plan_revised",
+                        content=plan.render_for_prompt(),
+                        data={"plan": plan.to_dict(), "revision": plan.revision},
+                    )
+                    continue
+                # Replan failed — fall through to escalation.
+
+            # ESCALATE / ABORT or replan-disabled.
+            step.status = StepStatus.FAILED
+            step.last_error = reason[:200]
+            if self._task_progress is not None:
+                self._progress.mark_failed(self._task_progress, step.id)
+            self._persist_progress()
+            yield AgentEvent(
+                kind="step_escalate",
+                content=f"Step ({step.id}) needs user attention: {reason[:160]}",
+                data={
+                    "step": step.to_public(),
+                    "failure_class": verdict_failure.cls.value,
+                    "recovery_action": action.value,
+                },
+            )
+            break
+
+        # --- Final summary ----------------------------------------------
+        all_done = all(s.status == StepStatus.DONE for s in plan.steps)
+        final_status = "done" if all_done else "failed"
+        if self._task_progress is not None:
+            self._progress.finalize(self._task_progress, status=final_status)
+        yield AgentEvent(
+            kind="done",
+            content=f"Controller {final_status} — {plan.progress_summary()}",
+            data={
+                "plan": plan.to_dict(),
+                "iterations": global_iter,
+                "status": final_status,
+                "finish_reason": final_status,
+            },
+        )
+
+    async def _replan(
+        self, user_input: str, plan: Plan, *, blocked_step: PlanStep
+    ) -> Plan | None:
+        """Ask the planner for a revised plan that takes the failure into account."""
+        if self._planner is None:
+            return None
+        context = (
+            f"PREVIOUS PLAN STATUS\n--------------------\n{plan.render_for_prompt()}\n\n"
+            f"BLOCKED STEP\n------------\nid: {blocked_step.id}\n"
+            f"goal: {blocked_step.goal}\nreason: {blocked_step.last_error}"
+        )
+        try:
+            revised_text = await self._planner.plan_typed(
+                task=user_input + "\n\n" + context,
+                os_label=_platform.system(),
+                vision=self._vision_screenshots,
+            )
+        except Exception as e:
+            logger.warning("[agent] replan failed: %s", e)
+            return None
+        return parse_plan(revised_text)
+
+    async def _run_step(
+        self,
+        *,
+        user_input: str,
+        step: PlanStep,
+        event_yield,
+    ) -> tuple[StepVerdict, str, int, Any]:
+        """
+        Drive a scoped per-step executor loop.
+
+        Returns ``(verdict, reason, iterations_used, failure_verdict_or_None)``.
+        Per-step history is constructed fresh from the system prompt + the
+        scoped step prompt — it does NOT touch ``self._history``, so steps
+        don't contaminate each other's context.
+        """
+        # Watchdog history is per-step: a "stuck on step X" signal must
+        # not bleed into step Y, even when both legitimately repeat the
+        # same set of preliminary read-only tools.
+        if self._watchdog is not None:
+            self._watchdog.reset()
+
+        # Build artifact summary for the step prompt (one-line per artifact,
+        # capped) so the executor knows what's already in the artifact store.
+        artifact_summary = ""
+        if self._artifacts is not None:
+            recent = self._artifacts.list_recent(limit=8)
+            if recent:
+                artifact_summary = "\n".join(
+                    f"  {a.id}  [{a.kind}] {a.summary[:100]}" for a in recent
+                )
+        completed_summary = ""
+        if self._plan is not None:
+            done_steps = [s for s in self._plan.steps if s.status == StepStatus.DONE]
+            if done_steps:
+                completed_summary = "\n".join(
+                    f"  ({s.id}) {s.goal}" for s in done_steps[-6:]
+                )
+
+        step_prompt = build_step_prompt(
+            user_input=user_input,
+            plan=self._plan,
+            step=step,
+            artifact_index_summary=artifact_summary,
+            completed_actions_summary=completed_summary,
+        )
+
+        local_history: list[dict] = [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "user", "content": step_prompt},
+        ]
+
+        # Pre-step baseline screenshot — give the model accurate visual
+        # ground truth before its first action so it doesn't assume
+        # state from the prompt text alone.  Without this the model
+        # tends to treat the step's `expected outcome` as already true
+        # and skip straight to STEP_DONE, or duplicate work that's
+        # already been done (extra Notepad windows on retry).  Skipped
+        # silently when vision is off, the screenshot tool isn't
+        # registered, or the capture fails — we never want a baseline
+        # screenshot failure to abort the step.
+        if (
+            self._vision_screenshots
+            and "desktop_screenshot" in self._registry.list_tools()
+        ):
+            try:
+                baseline_json = await self._registry.dispatch("desktop_screenshot", {})
+                baseline_obj = json.loads(baseline_json)
+                baseline_b64 = baseline_obj.pop("base64_png", None)
+                if baseline_b64 and not baseline_obj.get("error"):
+                    local_history.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"[Baseline screenshot for step {step.id} — "
+                                    "this is the WORLD STATE BEFORE you act.  "
+                                    "Inspect the windows, layout, and any visible "
+                                    "text first; only call tools whose effect is "
+                                    "needed to satisfy the CURRENT STEP's expected "
+                                    "outcome.  If the expected outcome already "
+                                    "appears to hold here, finish with STEP_DONE "
+                                    "WITHOUT taking redundant actions.]"
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64," + baseline_b64},
+                            },
+                        ],
+                    })
+                elif baseline_obj.get("error"):
+                    logger.warning(
+                        "[agent] step %s baseline screenshot failed: %s",
+                        step.id, str(baseline_obj.get("error"))[:200],
+                    )
+            except Exception as e:
+                logger.warning("[agent] step %s baseline screenshot raised: %s", step.id, e)
+
+        last_text = ""
+        last_failure = None
+        iterations = 0
+        # BLOCKED retry guard: once we've fed the model a "does this
+        # screenshot change your mind?" reminder we don't want to do it
+        # again every iteration — that becomes a loop where the model
+        # alternates STEP_BLOCKED + screenshot reminder until iterations
+        # exhaust.  One chance, then accept the second STEP_BLOCKED.
+        blocked_screenshot_retry_used = False
+        # Same idea for the Gemma "tool-call syntax leaked into text"
+        # reminder — re-prompt once, then accept the next bad turn so a
+        # genuinely-stuck model still escalates.
+        _gemma_format_reminder_used = False
+
+        while iterations < self._step_max_iterations:
+            iterations += 1
+
+            # Hard ceiling: refuse to make further chat calls when the
+            # task budget is already over.  The outer loop will translate
+            # this into a budget_exceeded event.
+            if self._budget is not None and self._budget.exceeded:
+                last_text = f"budget exceeded: {self._budget.reason()}"
+                last_failure = classify(
+                    tool_name="(budget)", error_message=last_text,
+                )
+                break
+
+            try:
+                response = await self._client.chat(
+                    messages=local_history,
+                    tools=self._registry.schemas,
+                )
+                if self._budget is not None:
+                    self._budget.record_chat(response)
+            except Exception as e:
+                last_text = f"chat call failed: {e}"
+                last_failure = classify(tool_name="(chat)", error_message=str(e))
+                break
+
+            try:
+                message = self._client.extract_message(response)
+            except Exception as e:
+                last_text = f"extract_message failed: {e}"
+                last_failure = classify(tool_name="(extract)", error_message=str(e))
+                break
+
+            local_history.append(message)
+            text = self._client.extract_text(message) or ""
+            tool_calls = self._client.extract_tool_calls(message) or []
+            if text:
+                last_text = text
+
+            if not tool_calls:
+                # Detect Gemma 3/4-style tool-call syntax that leaked
+                # into the assistant TEXT instead of being parsed as a
+                # real tool_call (`action:tool_name{...}<tool_call|>` or
+                # similar).  The model intended to invoke a tool but the
+                # client's tool-call extractor missed it.  Treating this
+                # as STEP_BLOCKED triggers a costly replan; instead,
+                # re-prompt the model with a format reminder so it tries
+                # the proper tool_call format on the next iteration.
+                # Gated by a flag so we only do this once per step (a
+                # second leak after the reminder genuinely IS a stuck
+                # model and should escalate).
+                if (
+                    not _gemma_format_reminder_used
+                    and self._looks_like_leaked_tool_call(text)
+                ):
+                    _gemma_format_reminder_used = True
+                    logger.warning(
+                        "[agent] step %s: model emitted tool-call syntax as text "
+                        "instead of a real tool_call (%s); injecting format "
+                        "reminder and continuing.",
+                        step.id, text[:80],
+                    )
+                    local_history.append({
+                        "role": "user",
+                        "content": (
+                            "[CONTROLLER] Your last response contained tool-call "
+                            "syntax INSIDE the assistant message text instead of "
+                            "emitting it as a proper tool_call.  The runtime "
+                            "cannot dispatch tools written that way.  For your "
+                            "next turn, invoke the tool through the assistant's "
+                            "tool_calls mechanism (the API field), not in the "
+                            "message body.  If you meant to finish the step, "
+                            "use STEP_DONE: <proof> or STEP_BLOCKED: <reason>."
+                        ),
+                    })
+                    continue
+
+                # Final assistant message — parse the marker.
+                verdict, reason = parse_step_outcome(text)
+                # On the FIRST STEP_BLOCKED in a step, give the model
+                # one more chance with a fresh screenshot.  Models
+                # frequently issue STEP_BLOCKED prematurely — the action
+                # actually succeeded, the OCR / window-list check just
+                # didn't fire correctly, OR the screen genuinely shows
+                # the post-condition holds and the model didn't notice.
+                # Feed the current screen back as visual evidence and
+                # ask "does this change your assessment?".  Only one
+                # such retry per step; a second STEP_BLOCKED is honoured.
+                if (
+                    verdict == StepVerdict.BLOCKED
+                    and not blocked_screenshot_retry_used
+                    and self._vision_screenshots
+                    and "desktop_screenshot" in self._registry.list_tools()
+                ):
+                    blocked_screenshot_retry_used = True
+                    try:
+                        review_json = await self._registry.dispatch("desktop_screenshot", {})
+                        review_obj = json.loads(review_json)
+                        review_b64 = review_obj.pop("base64_png", None)
+                        if review_b64 and not review_obj.get("error"):
+                            local_history.append({
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            f"[STEP_BLOCKED reconsider — before the "
+                                            f"controller replans step {step.id}, look at "
+                                            f"the CURRENT desktop state captured just "
+                                            f"now.  Does this screenshot show the step's "
+                                            f"expected outcome ({step.expected!r}) "
+                                            f"already holding?  If YES, finish with "
+                                            f"`STEP_DONE: <proof from this screenshot>`.  "
+                                            f"If the post-condition genuinely doesn't "
+                                            f"hold, repeat your `STEP_BLOCKED: <reason>` "
+                                            f"so the controller knows to replan.]"
+                                        ),
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": "data:image/png;base64," + review_b64},
+                                    },
+                                ],
+                            })
+                            # Don't return yet — let the loop run another
+                            # iteration so the model can react to the
+                            # screenshot.
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            "[agent] step %s STEP_BLOCKED screenshot retry raised: %s",
+                            step.id, e,
+                        )
+                return verdict, reason or text[:200], iterations, last_failure
+
+            # Watchdog: hash (state + first proposed tool/args) and bail
+            # if the same signature recurs ``stall_threshold`` times.
+            if self._watchdog is not None and tool_calls:
+                first = tool_calls[0]
+                first_name = first.get("function", {}).get("name", "")
+                try:
+                    first_args = json.loads(first.get("function", {}).get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    first_args = {}
+                wd_state = await self._snapshot_watchdog_state()
+                sig = self._watchdog.signature(
+                    windows=wd_state["windows"],
+                    active_window=wd_state["active"],
+                    pending_tool=first_name,
+                    pending_args=first_args,
+                )
+                status = self._watchdog.observe(sig)
+                if status.stuck:
+                    last_failure = classify(
+                        tool_name=first_name,
+                        error_message="watchdog: no progress over "
+                                      f"{status.repeats} iterations",
+                        predicate_failed=True,
+                    )
+                    return (
+                        StepVerdict.BLOCKED,
+                        f"watchdog: same state+action signature {sig} "
+                        f"observed {status.repeats}× — step appears stuck.",
+                        iterations, last_failure,
+                    )
+
+            # Dispatch each tool call.
+            step_failure_seen = False
+            for tc in tool_calls:
+                tool_name = tc.get("function", {}).get("name", "")
+                call_id = tc.get("id", "")
+                try:
+                    args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result_json = await self._registry.dispatch(tool_name, args)
+                if self._budget is not None:
+                    self._budget.record_tool()
+
+                # Default verifier: enrich the result with a structured
+                # post-condition check so the model reads it before deciding
+                # the action succeeded.
+                result_json = await self._apply_default_verifier(
+                    tool_name, args, result_json,
+                )
+
+                # Maybe store large results as artifacts to keep history small.
+                history_content = self._maybe_store_artifact(tool_name, args, result_json)
+
+                # Track session step for skill_save (only on success).
+                if not self._result_is_error(result_json) and tool_name not in (
+                    "skill_save", "skill_list", "skill_run",
+                    "desktop_screenshot", "desktop_screenshot_marked",
+                    "desktop_list_windows", "desktop_get_active_window",
+                    "fs_read", "fs_list", "get_artifact", "list_artifacts",
+                    "plan_get", "plan_update_step", "checkpoint", "ask_subagent",
+                ):
+                    step_record: dict = {"tool": tool_name, "args": dict(args)}
+                    anchor = await self._capture_drift_anchor()
+                    if anchor:
+                        step_record["drift_anchor"] = anchor
+                    self._session_steps.append(step_record)
+
+                if self._result_is_error(result_json):
+                    step_failure_seen = True
+                    try:
+                        result_obj = json.loads(result_json)
+                        err_msg = result_obj.get("error") or result_obj.get("stderr") or ""
+                    except json.JSONDecodeError:
+                        result_obj = {}
+                        err_msg = result_json[:200]
+                    last_failure = classify(
+                        tool_name=tool_name,
+                        error_message=err_msg,
+                        result=result_obj,
+                    )
+                    history_content = (
+                        "[TOOL FAILED: " + tool_name + "] "
+                        f"(class={last_failure.cls.value} action={last_failure.action.value})\n"
+                        + history_content
+                    )
+
+                local_history.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": history_content,
+                })
+
+            # Auto-screenshot after state-changing desktop actions —
+            # mirrors the legacy _run_inner behaviour so the model can
+            # SEE the consequences of its action before deciding the
+            # step is done.  Skipped when the model already called
+            # desktop_screenshot itself this iteration (the result is
+            # already in local_history) and when none of the called
+            # tools were state-changing (read-only steps don't need a
+            # post-action screenshot).
+            called_names = {tc.get("function", {}).get("name", "") for tc in tool_calls}
+            state_changing = {
+                n for n in called_names
+                if n.startswith("desktop_")
+                and n not in (
+                    "desktop_screenshot", "desktop_screenshot_marked",
+                    "desktop_list_windows", "desktop_get_active_window",
+                    "desktop_get_cursor_pos", "desktop_get_window_text",
+                    "desktop_get_window_tree", "desktop_find_element",
+                    "desktop_find_text",
+                )
+                or n.startswith("browser_") and n not in (
+                    "browser_get_text", "browser_screenshot",
+                )
+            }
+            if (
+                state_changing
+                and "desktop_screenshot" in self._registry.list_tools()
+                and "desktop_screenshot" not in called_names
+                and "desktop_screenshot_marked" not in called_names
+            ):
+                try:
+                    shot_json = await self._registry.dispatch("desktop_screenshot", {})
+                    shot_obj = json.loads(shot_json)
+                    shot_b64 = shot_obj.pop("base64_png", None)
+                    if shot_obj.get("error"):
+                        # Make sure the user (and the model) sees why
+                        # screenshots aren't being saved.  Three places
+                        # surface the failure: the model's local_history
+                        # (so the next turn can diagnose), a logger.warning
+                        # (which the TUI's WARNING-level log bridge picks
+                        # up and renders in the conversation pane), and
+                        # the agent log file.
+                        err_msg = str(shot_obj.get("error"))[:200]
+                        logger.warning(
+                            "[agent] step %s auto-screenshot after %s FAILED: %s",
+                            step.id, ", ".join(sorted(state_changing)), err_msg,
+                        )
+                        local_history.append({
+                            "role": "user",
+                            "content": (
+                                f"[Auto-screenshot after {', '.join(sorted(state_changing))} "
+                                f"FAILED: {err_msg}]"
+                            ),
+                        })
+                    elif self._vision_screenshots and shot_b64:
+                        local_history.append({
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"[Auto-screenshot AFTER "
+                                        f"{', '.join(sorted(state_changing))} — "
+                                        f"compare this to the step's expected "
+                                        f"outcome ({step.expected!r}).  Issue "
+                                        f"STEP_DONE only if the screen confirms "
+                                        f"the action took effect; if you can't "
+                                        f"tell from the image, call "
+                                        f"desktop_find_text or desktop_get_window_text "
+                                        f"to verify before finishing.  Do NOT issue "
+                                        f"STEP_DONE on assumed success.]"
+                                    ),
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "data:image/png;base64," + shot_b64},
+                                },
+                            ],
+                        })
+                    else:
+                        # Vision off OR no base64: still surface the
+                        # path so the user has a saved file to inspect
+                        # and the model knows the screenshot ran.
+                        path_str = shot_obj.get("path", "?")
+                        dims = f"{shot_obj.get('width')}×{shot_obj.get('height')}"
+                        local_history.append({
+                            "role": "user",
+                            "content": f"[Auto-screenshot saved: {path_str} ({dims})]",
+                        })
+                except Exception as e:
+                    logger.warning("[agent] controller auto-screenshot failed: %s", e)
+
+            if step_failure_seen:
+                local_history.append({
+                    "role": "user",
+                    "content": (
+                        "[CONTROLLER] At least one tool failed in this iteration. "
+                        "Diagnose the failure, choose a different approach, and try "
+                        "again — do not give up after one failed attempt. When the "
+                        "step's expected outcome is satisfied, finish with "
+                        "STEP_DONE: <one-line proof>. If you cannot proceed, finish "
+                        "with STEP_BLOCKED: <reason>."
+                    ),
+                })
+
+        # Iteration ceiling reached without a marker.
+        return StepVerdict.EXHAUSTED, last_text[:200] or "step iteration ceiling reached", iterations, last_failure
+
+    def _maybe_store_artifact(self, tool_name: str, args: dict, result_json: str) -> str:
+        """
+        For tools whose results are large bodies (fs_read, browser_get_text,
+        desktop_get_window_text), store the body as an artifact and return a
+        slimmed-down history payload.  Other results pass through unchanged.
+        """
+        if self._artifacts is None:
+            return result_json
+        try:
+            result = json.loads(result_json)
+        except json.JSONDecodeError:
+            return result_json
+        if "error" in result:
+            return result_json
+
+        body_field, source = None, ""
+        if tool_name == "fs_read":
+            body_field = "content"
+            source = str(args.get("path", ""))
+        elif tool_name == "desktop_get_window_text":
+            body_field = "text"
+        elif tool_name == "browser_get_text":
+            body_field = "text"
+            source = str(args.get("selector", "") or "page")
+        elif tool_name == "shell_run":
+            # Stdout only when it's large enough to bloat history.
+            stdout = result.get("stdout") or ""
+            if isinstance(stdout, str) and len(stdout) > 4096:
+                aid = self._artifacts.put(
+                    stdout, kind="shell_stdout",
+                    source=str(args.get("command", ""))[:120],
+                )
+                preview = stdout[:400] + "\n...\n[stored as " + aid + "]"
+                result["stdout"] = preview
+                result["stdout_artifact_id"] = aid
+                return json.dumps(result, default=str)
+            return result_json
+
+        if body_field is not None:
+            body = result.get(body_field)
+            if isinstance(body, str) and len(body) > 4096:
+                aid = self._artifacts.put(
+                    body, kind=tool_name, source=source,
+                )
+                preview = body[:600] + "\n...\n[truncated; full content stored as " + aid + "]"
+                result[body_field] = preview
+                result[body_field + "_artifact_id"] = aid
+                return json.dumps(result, default=str)
+        return result_json
+
+    async def _snapshot_watchdog_state(self) -> dict:
+        """Cheap state snapshot for the watchdog signature.  Best-effort —
+        any failure produces empty fields so the watchdog still works."""
+        windows: list = []
+        active: dict = {}
+        tools = set(self._registry.list_tools())
+        if "desktop_list_windows" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_list_windows", {})
+                windows = json.loads(raw).get("windows") or []
+            except Exception:
+                windows = []
+        if "desktop_get_active_window" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_get_active_window", {})
+                active = json.loads(raw) or {}
+            except Exception:
+                active = {}
+        return {"windows": windows, "active": active}
+
+    async def _capture_drift_anchor(self) -> dict:
+        """Cheap post-action world snapshot for replay --drift-check.
+
+        Captures the visible window titles (always when enabled — these
+        are essentially free) and, when ``drift_anchor.capture_phash`` is
+        on, a perceptual hash of the screen for visual drift detection.
+        Best-effort: any failure yields a partial / empty dict so a
+        recording session never breaks because the anchor couldn't be
+        captured.  The shape mirrors what replay._check_drift expects.
+        """
+        if not self._drift_anchor_enabled:
+            return {}
+        anchor: dict = {}
+        tools = set(self._registry.list_tools())
+        if "desktop_list_windows" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_list_windows", {})
+                wins = json.loads(raw).get("windows") or []
+                titles = [str(w.get("title", "")) for w in wins if w.get("title")]
+                if titles:
+                    anchor["window_titles"] = titles
+            except Exception:
+                pass
+        if self._drift_anchor_phash and "desktop_screenshot" in tools:
+            try:
+                from visual_diff import hash_b64 as _vhash
+                import base64 as _b64
+                raw = await self._registry.dispatch("desktop_screenshot", {})
+                shot = json.loads(raw)
+                h = _vhash(shot.get("base64_png", ""))
+                if h:
+                    anchor["screen_phash_b64"] = _b64.b64encode(h).decode("ascii")
+            except Exception:
+                pass
+        return anchor
+
+    async def _best_effort_active_app(self) -> str:
+        """Return a normalised app slug for the active window, or '' on miss."""
+        if "desktop_get_active_window" not in self._registry.list_tools():
+            return ""
+        try:
+            raw = await self._registry.dispatch("desktop_get_active_window", {})
+            info = json.loads(raw)
+            win = info.get("window") or info or {}
+            return _normalize_app(str(win.get("app") or win.get("title") or ""))
+        except Exception:
+            return ""
+
+    async def _apply_default_verifier(
+        self, tool_name: str, args: dict, result_json: str,
+    ) -> str:
+        """
+        For tool calls that have an obvious, cheap, post-condition check,
+        run it inline and tag the result with a ``verifier`` field so the
+        model reads structured evidence rather than trusting the tool's
+        self-reported success.
+
+        Currently covers:
+          * fs_write       — read back, confirm content matches
+          * browser_navigate — confirm window.location.href matches the URL
+          * desktop_launch — verify a window appeared in the listing
+          * any state-changing desktop tool, when vision is on — check
+            that the screen perceptual hash actually moved
+        """
+        try:
+            result = json.loads(result_json)
+        except json.JSONDecodeError:
+            return result_json
+        if "error" in result:
+            return result_json
+
+        verifier: dict = {}
+
+        if tool_name == "fs_write":
+            path = str(args.get("path") or result.get("path") or "")
+            wanted = args.get("content")
+            if path and isinstance(wanted, str):
+                try:
+                    raw = await self._registry.dispatch(
+                        "fs_read", {"path": path, "max_bytes": min(8192, len(wanted) + 16)},
+                    )
+                    parsed = json.loads(raw)
+                    body = parsed.get("content") or ""
+                    if wanted.strip() and wanted[:200] in body:
+                        verifier = {"ok": True, "kind": "fs_write_readback"}
+                    else:
+                        verifier = {
+                            "ok": False, "kind": "fs_write_readback",
+                            "detail": "read-back body does not contain written content",
+                        }
+                except Exception as e:
+                    verifier = {"ok": False, "kind": "fs_write_readback",
+                                "detail": f"read-back failed: {e}"}
+
+        elif tool_name == "browser_navigate":
+            wanted_url = str(args.get("url") or "")
+            if wanted_url and "browser_eval" in self._registry.list_tools():
+                try:
+                    raw = await self._registry.dispatch(
+                        "browser_eval", {"expression": "window.location.href"},
+                    )
+                    parsed = json.loads(raw)
+                    href = str(parsed.get("value") or "")
+                    if wanted_url in href or href in wanted_url:
+                        verifier = {"ok": True, "kind": "browser_url",
+                                    "current_url": href}
+                    else:
+                        verifier = {"ok": False, "kind": "browser_url",
+                                    "current_url": href,
+                                    "detail": "current URL does not match request"}
+                except Exception as e:
+                    verifier = {"ok": False, "kind": "browser_url",
+                                "detail": f"browser_eval failed: {e}"}
+
+        elif tool_name == "desktop_launch":
+            target = str(args.get("application") or "").rsplit(".", 1)[0].lower()
+            if target and "desktop_list_windows" in self._registry.list_tools():
+                try:
+                    raw = await self._registry.dispatch("desktop_list_windows", {})
+                    wins = json.loads(raw).get("windows") or []
+                    matched = any(
+                        target in (w.get("title", "") or "").lower()
+                        or target in (w.get("app", "") or "").lower()
+                        for w in wins
+                    )
+                    verifier = {
+                        "ok": matched, "kind": "desktop_launch_window",
+                        "detail": ("window with matching title/app found"
+                                   if matched else
+                                   f"no visible window matches {target!r}"),
+                    }
+                except Exception as e:
+                    verifier = {"ok": False, "kind": "desktop_launch_window",
+                                "detail": f"window listing failed: {e}"}
+
+        # Visual diff: applies to any state-changing desktop tool when
+        # vision is on AND the previous step's screenshot hash is on hand.
+        if (
+            self._visual_diff_enabled
+            and self._vision_screenshots
+            and tool_name in (
+                "desktop_click", "desktop_click_mark", "desktop_click_text",
+                "desktop_click_element", "desktop_type", "desktop_hotkey",
+                "desktop_scroll",
+            )
+            and "desktop_screenshot" in self._registry.list_tools()
+        ):
+            try:
+                raw = await self._registry.dispatch("desktop_screenshot", {})
+                shot = json.loads(raw)
+                b64 = shot.get("base64_png")
+                curr_hash = visual_diff.hash_b64(b64) if b64 else None
+                if curr_hash is not None:
+                    diff = visual_diff.diff(self._last_screenshot_hash, curr_hash)
+                    self._last_screenshot_hash = curr_hash
+                    if self._last_screenshot_hash is not None and diff.likely_no_change:
+                        verifier.setdefault("ok", False)
+                        verifier["visual_diff"] = {
+                            "hamming": diff.hamming,
+                            "fraction_changed": diff.fraction_changed,
+                            "note": "screen pixels barely changed; action may have been a no-op",
+                        }
+                        verifier.setdefault("kind", "visual_diff")
+                        verifier.setdefault("detail",
+                                            "perceptual hash stayed nearly identical")
+            except Exception:
+                pass
+
+        if verifier:
+            result["verifier"] = verifier
+            return json.dumps(result, default=str)
+        return result_json
 
     async def _run_inner(self, user_input: str) -> AsyncIterator[AgentEvent]:
         """
@@ -872,7 +2623,11 @@ class Agent:
                         "desktop_find_text",
                         "fs_read", "fs_list",
                     ):
-                        self._session_steps.append({"tool": tool_name, "args": dict(args)})
+                        step_record: dict = {"tool": tool_name, "args": dict(args)}
+                        anchor = await self._capture_drift_anchor()
+                        if anchor:
+                            step_record["drift_anchor"] = anchor
+                        self._session_steps.append(step_record)
 
                 # ---- Error injection: fail loud, not quiet -----------------
                 # Prepend a header inside the tool result AND track the failure
@@ -1051,7 +2806,19 @@ class Agent:
                         path_str = result_obj.get("path", "?")
                         dims = f"{result_obj.get('width')}×{result_obj.get('height')}"
 
-                        if self._vision_screenshots and b64:
+                        # Detect a screenshot-tool failure first: the base
+                        # backend returns {"error": ...} (no path/base64)
+                        # when PIL is missing or ImageGrab raises.  Without
+                        # this branch, the message below would mislead with
+                        # "saved" + path "?" + "None×None".
+                        shot_error = result_obj.get("error")
+                        if shot_error:
+                            yield AgentEvent(
+                                kind="tool_result",
+                                content=f"Auto-screenshot FAILED: {str(shot_error)[:200]}",
+                                data={"tool_name": "desktop_screenshot", "iteration": iteration, "error": shot_error},
+                            )
+                        elif self._vision_screenshots and b64:
                             self._history.append({
                                 "role": "user",
                                 "content": [
@@ -1074,10 +2841,21 @@ class Agent:
                                 data={"tool_name": "desktop_screenshot", "iteration": iteration},
                             )
                         else:
-                            # Vision off: file is saved to disk but not shown to the model.
+                            # Vision branch skipped: clarify which of the two
+                            # possible reasons fired so the user isn't told
+                            # "vision off" when their config has it on.
+                            if not self._vision_screenshots:
+                                why = "vision off in config (agent.vision_screenshots)"
+                            elif not b64:
+                                why = (
+                                    "vision on but screenshot tool returned no "
+                                    "base64_png (backend may have failed silently)"
+                                )
+                            else:
+                                why = "skipped"
                             yield AgentEvent(
                                 kind="tool_result",
-                                content=f"Auto-screenshot saved (vision off): {path_str} ({dims})",
+                                content=f"Auto-screenshot saved ({why}): {path_str} ({dims})",
                                 data={"tool_name": "desktop_screenshot", "iteration": iteration},
                             )
                     except Exception:
@@ -1225,6 +3003,32 @@ class Agent:
         """Return True when the model's stop-response sounds like it is giving up."""
         lower = text.lower()
         return any(re.search(pat, lower) for pat in cls._GIVING_UP_PATTERNS)
+
+    # Compiled once at class scope so the per-iteration check is cheap.
+    # Patterns intentionally cover the multiple Gemma 3/4 / Llama / Qwen
+    # tool-call leak shapes we've seen in user reports rather than
+    # matching one provider's format exactly.
+    _LEAKED_TOOL_CALL_PATTERNS = (
+        re.compile(r"<\|?tool_call\|?>", re.IGNORECASE),
+        re.compile(r"<tool_call\|>", re.IGNORECASE),
+        re.compile(r"<\|tool_call\|>", re.IGNORECASE),
+        re.compile(r"^\s*action\s*:\s*\w", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"<function_call>|</function_call>", re.IGNORECASE),
+    )
+
+    @classmethod
+    def _looks_like_leaked_tool_call(cls, text: str) -> bool:
+        """True when the assistant text contains tool-call syntax that
+        should have been emitted as a real tool_call.
+
+        Used by _run_step to inject a one-shot format reminder instead
+        of marking the step BLOCKED — the model intended to invoke a
+        tool, the API just didn't parse it.  See the call site for the
+        reminder copy.
+        """
+        if not text:
+            return False
+        return any(p.search(text) for p in cls._LEAKED_TOOL_CALL_PATTERNS)
 
     # ------------------------------------------------------------------
     # Best-of-N sampling (Phase 7)

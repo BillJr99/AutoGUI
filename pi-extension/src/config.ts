@@ -16,7 +16,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export interface ExtensionConfig {
-  /** Where saved skills (replayable macros) live. */
+  /** Creation gate ONLY (mirrors memoryEnabled).  When true, skill_save
+   *  is registered so new skills can be persisted.  When false (the
+   *  default), skill_save is omitted and the controller never writes a
+   *  skills file — but skill_list / skill_run register whenever a
+   *  SkillStore is constructed (it always is, lazily, with no disk
+   *  side effects), so any pre-existing library at skillsPath remains
+   *  readable and replayable. */
+  skillsEnabled: boolean;
+  /** Where saved skills (replayable macros) live.  Empty string resolves
+   *  to <extensionRoot>/runtime/skills/skills.jsonl, intentionally
+   *  distinct from the standalone Python agent's ./skills/skills.jsonl
+   *  so the two libraries don't shadow each other.  The file is
+   *  created lazily on first write (only when skillsEnabled is true). */
   skillsPath: string;
   /** When true, the extension records a JSONL trace of every tool call. */
   recordTrace: boolean;
@@ -42,6 +54,42 @@ export interface ExtensionConfig {
   blockedWindowTitles: string[];
   /** When true, plan-first behaviour is included in the AUTOGUI_PROMPT. */
   plannerEnabled: boolean;
+  /** When true, the typed-plan controller protocol is injected into the prompt
+   *  and plan_set / plan_update_step / plan_get tools are wired to the plan slot. */
+  controllerEnabled: boolean;
+  /** When true, large tool outputs (file bodies, page text, big stdout)
+   *  are auto-captured into the on-disk artifact store and replaced
+   *  inline with a short preview + id.  Default true.  Set false to
+   *  disable the store entirely; ``artifactsDir`` then has no effect. */
+  artifactsEnabled: boolean;
+  /** Directory for the artifact store.  When empty, resolves to
+   *  ``<extensionRoot>/runtime/artifacts``.  Has no effect when
+   *  ``artifactsEnabled`` is false. */
+  artifactsDir: string;
+  /** When true, per-task progress markers are persisted under
+   *  ``progressDir`` and re-running the same task text resumes from
+   *  the previous attempt.  Default true.  Set false to disable. */
+  progressEnabled: boolean;
+  /** Directory for persistent task progress records.  Empty resolves
+   *  to ``<extensionRoot>/runtime/progress``.  Has no effect when
+   *  ``progressEnabled`` is false. */
+  progressDir: string;
+  /** Directory for the per-app memory store (failure histograms, success
+   *  counts, free-form notes).  Empty resolves to
+   *  ``<extensionRoot>/runtime/memory`` so reads via memory_get keep
+   *  working; ``memoryEnabled`` is the actual on/off gate (writes only). */
+  memoryDir: string;
+  /** When true, memory_note registers and the controller persists
+   *  recordFailure / recordSuccess / addNote calls.  Default false:
+   *  memory_get and the planner's app-memory hints continue to read
+   *  whatever is already on disk, but the extension itself never
+   *  creates a memory file. */
+  memoryEnabled: boolean;
+  /** Hard ceilings for the per-task budget tracker.  0 = no ceiling. */
+  budget: {
+    maxToolCalls: number;
+    maxSeconds: number;
+  };
   screenRecord: {
     enabled: boolean;
     fps: number;
@@ -51,9 +99,15 @@ export interface ExtensionConfig {
   };
   /** When false, desktop_screenshot returns only the file path (no inline image). */
   visionEnabled: boolean;
+  /** When true, /autogui auto-spawns a read-only tmux validator pane after the
+   *  task completes naturally (stopReason=stop).  Replaces the old
+   *  /autogui-validate manual command — flip to false to suppress the
+   *  follow-up validation entirely. */
+  validateAfterAutogui: boolean;
 }
 
 const DEFAULTS: ExtensionConfig = {
+  skillsEnabled: false,
   skillsPath: "",  // resolved to <extensionRoot>/runtime/skills/skills.jsonl in loadConfig
   recordTrace: true,
   traceDir: "",    // resolved to <extensionRoot>/runtime/traces in loadConfig
@@ -70,6 +124,17 @@ const DEFAULTS: ExtensionConfig = {
   allowedApps: [],
   blockedWindowTitles: [],
   plannerEnabled: true,
+  controllerEnabled: true,
+  artifactsEnabled: true,
+  artifactsDir: "",       // resolved to <extensionRoot>/runtime/artifacts when enabled
+  progressEnabled: true,
+  progressDir: "",        // resolved to <extensionRoot>/runtime/progress when enabled
+  memoryDir: "",          // resolved to <extensionRoot>/runtime/memory when enabled
+  memoryEnabled: false,
+  budget: {
+    maxToolCalls: 0,
+    maxSeconds: 0,
+  },
   screenRecord: {
     enabled: true,
     fps: 5,
@@ -78,6 +143,7 @@ const DEFAULTS: ExtensionConfig = {
     outDir: "",
   },
   visionEnabled: true,
+  validateAfterAutogui: true,
 };
 
 function deepMerge<T>(base: T, patch: unknown): T {
@@ -151,6 +217,25 @@ export async function loadConfig(extensionRoot: string): Promise<ExtensionConfig
   }
   if (!merged.screenRecord.outDir) {
     merged.screenRecord.outDir = join(extensionRoot, "runtime", "failures");
+  }
+  // Only fill in runtime defaults when the store is enabled.  When the
+  // user disables a store via its *Enabled flag, leaving the dir
+  // empty is the deliberate "no path needed" signal — index.ts will
+  // not construct that store at all.  This is the behaviour the
+  // README documents, replacing the old "empty string disables"
+  // (which was never actually honoured because the default was
+  // always reapplied here).
+  if (merged.artifactsEnabled && !merged.artifactsDir) {
+    merged.artifactsDir = join(extensionRoot, "runtime", "artifacts");
+  }
+  if (merged.progressEnabled && !merged.progressDir) {
+    merged.progressDir = join(extensionRoot, "runtime", "progress");
+  }
+  if (!merged.memoryDir) {
+    // memoryEnabled is the creation gate (writes-only); reads of an
+    // existing store still want a default location, so always resolve
+    // a runtime path here regardless of memoryEnabled.
+    merged.memoryDir = join(extensionRoot, "runtime", "memory");
   }
 
   return merged;

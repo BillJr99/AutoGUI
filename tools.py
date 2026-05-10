@@ -934,6 +934,62 @@ class ToolRegistry:
                 lambda: bb_.close(),
             )
 
+        # ── desktop_wait_for ──────────────────────────────────────────
+        # Available whenever a desktop backend exists, regardless of
+        # which other tools the agent gates.  The polling cost is low —
+        # listing windows and consulting the a11y tree at 0.5 s cadence.
+        if desk_ok:
+            from wait_for import wait_for as _wait_for_impl
+            backend_ref = self._backend
+
+            async def _desktop_wait_for(
+                window_title: str = "",
+                element_name: str = "",
+                text: str = "",
+                window_id: str = "",
+                timeout: float | None = None,
+            ) -> dict:
+                # ``timeout=None`` (or omitted) takes the wait_for default
+                # of 15.0 s.  An explicit ``timeout=0`` is preserved and
+                # passed through so wait_for can clamp it to its 0.5 s
+                # floor (one quick poll); the previous ``or 15.0``
+                # fallback silently turned 0 into 15 and made an
+                # immediate-poll request impossible.
+                effective_timeout = 15.0 if timeout is None else float(timeout)
+                return await _wait_for_impl(
+                    backend=backend_ref,
+                    window_title=str(window_title or ""),
+                    element_name=str(element_name or ""),
+                    text=str(text or ""),
+                    window_id=str(window_id or ""),
+                    timeout=effective_timeout,
+                )
+
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_wait_for",
+                    "description": (
+                        "Block until a target becomes observable on the desktop, "
+                        "or the timeout elapses.  Use this after desktop_launch / "
+                        "browser_navigate / any action that triggers a slow UI "
+                        "transition, instead of immediately clicking on something "
+                        "that might not be drawn yet.  Provide one or more of: "
+                        "window_title (substring), element_name (a11y name), "
+                        "text (visible label via OCR), window_id.  When multiple "
+                        "are given, the wait succeeds as soon as any one matches."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "window_title": {"type": "string"},
+                        "element_name": {"type": "string"},
+                        "text": {"type": "string"},
+                        "window_id": {"type": "string"},
+                        "timeout": {"type": "number",
+                                    "description": "Seconds to wait (default 15)."},
+                    }},
+                }},
+                _desktop_wait_for,
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

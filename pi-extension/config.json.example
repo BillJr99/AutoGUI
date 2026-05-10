@@ -1,7 +1,8 @@
 {
   "_comment": "Optional config file for the AutoGUI Pi extension. Copy to pi-extension/config.json (or ~/.autogui/pi-extension.json) and edit. Every key has a sensible default — leave a key out to keep its default. The extension also boots cleanly with no config file at all.",
 
-  "_skills_section": "Skills (replayable macros) are stored in pi-extension/runtime/skills/skills.jsonl by default. The directory is created automatically and is git-ignored (covered by pi-extension/runtime/).",
+  "_skills_section": "skillsEnabled controls CREATION ONLY. When false (the default) skill_save is NOT registered and the extension never writes a skills.jsonl on disk — but skill_list, skill_run, and the candidate-skills suggestion that /autogui prepends to the prompt are always available, so any skills already at skillsPath remain readable and replayable. Set skillsEnabled=true to allow new skills to be recorded. Default storage is pi-extension/runtime/skills/skills.jsonl — its own library, separate from the standalone Python agent's ./skills/skills.jsonl, so the two don't shadow each other. Leave skillsPath empty to use the default; supply an absolute path to override (point both sides at the same path if you want a shared library). The directory is created lazily on first save and is git-ignored under pi-extension/runtime/.",
+  "skillsEnabled": false,
   "skillsPath": "",
 
   "recordTrace": true,
@@ -29,8 +30,32 @@
   "_planner_section": "When plannerEnabled is true (default), /autogui injects instructions telling the model to produce a numbered plan as its FIRST assistant message before executing.",
   "plannerEnabled": true,
 
+  "_controller_section": "controllerEnabled (default true) injects the typed-plan protocol into /autogui's prompt: the model issues plan_set with a JSON plan, calls check_predicate / preflight where appropriate, and marks each step done via plan_update_step. Set false to fall back to the free-text planner protocol.",
+  "controllerEnabled": true,
+
+  "_artifacts_section": "Stable-id artifact store (large file bodies, page text, command stdout > 4KB) so big observations don't bloat history. artifactsEnabled (default true) gates the store; set false to disable. artifactsDir overrides the default path of pi-extension/runtime/artifacts; leave empty to use the runtime default.",
+  "artifactsEnabled": true,
+  "artifactsDir": "",
+
+  "_progress_section": "Persistent task progress markers under pi-extension/runtime/progress. Re-running the same task text resumes where the previous attempt stopped. progressEnabled (default true) gates the store; set false to disable. progressDir overrides the default path; leave empty to use the runtime default.",
+  "progressEnabled": true,
+  "progressDir": "",
+
+  "_memory_section": "Per-app memory store (failure histograms, success counts, free-form notes). memoryEnabled controls CREATION ONLY (mirrors skillsEnabled): when false (the default) memory_get and the planner's app-memory hints continue to read whatever is already at memoryDir, but memory_note is NOT registered and the controller does not persist new records. Default storage is pi-extension/runtime/memory — separate from the standalone Python agent's ./memory directory so each side has its own quirk database. memoryDir overrides the default location; leave empty to use the runtime default.",
+  "memoryEnabled": false,
+  "memoryDir": "",
+
+  "_budget_section": "Per-task ceilings consulted by the budget_status tool. 0 = no ceiling. Pi owns the LLM loop, so the extension only counts tool calls + wall time directly; the model is expected to call budget_status periodically and wrap up early when the fraction is high.",
+  "budget": {
+    "maxToolCalls": 0,
+    "maxSeconds": 0
+  },
+
   "_vision_section": "When visionEnabled is true (default), desktop_screenshot results include the inline PNG image so the model can see the screen. Set false to return only the file path (useful if the provider struggles with image payloads).",
   "visionEnabled": true,
+
+  "_validate_section": "When validateAfterAutogui is true (default), an /autogui task that completes naturally (stopReason=stop) auto-spawns a read-only Pi validator in a fresh tmux session — only screenshot + window-listing tools active — to double-check the desktop matches the requested task. Aborted runs skip the validator. Set false to suppress the follow-up entirely (saves a model request per completed task).",
+  "validateAfterAutogui": true,
 
   "_record_section": "Rolling screen buffer. On any tool failure the buffer is concatenated into a GIF under outDir for post-mortem.",
   "screenRecord": {

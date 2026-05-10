@@ -6,9 +6,8 @@ This extension is decoupled from OpenWebUI. It does not create a model client, m
 
 ## What It Adds
 
-- `/autogui <task>`: sends a prepared desktop-automation prompt into Pi's normal agent loop.
+- `/autogui <task>`: sends a prepared desktop-automation prompt into Pi's normal agent loop.  When the task completes naturally and `validateAfterAutogui` is on (default), a read-only Pi validator is auto-spawned in a fresh tmux pane to double-check the desktop state.
 - `/autogui-abort`: aborts the current AutoGUI/Pi agent operation.
-- `/autogui-validate <task>`: spawns a separate read-only Pi validator in tmux.
 - `/desktop-status`: reports the detected backend, capabilities, and config snapshot.
 - Desktop tools (all platforms):
   - `desktop_screenshot`, `desktop_screenshot_marked`
@@ -18,8 +17,9 @@ This extension is decoupled from OpenWebUI. It does not create a model client, m
   - `desktop_list_windows`, `desktop_active_window`, `desktop_focus_window`
   - `desktop_launch`, `desktop_get_cursor_pos`, `desktop_mouse_move`
   - `desktop_get_window_text`
-- Skill library (replayable macros):
-  - `skill_save`, `skill_list`, `skill_run`
+- Skill library (replayable macros — `skillsEnabled` gates *creation* only; reads are always available):
+  - `skill_list`, `skill_run` — always registered, so existing libraries are usable.
+  - `skill_save` — registered only when `skillsEnabled=true` (default false).
 - Browser tools (registered when `allowedBrowser=true` in config; uses Playwright+Chromium):
   - `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`
   - `browser_click`, `browser_fill`, `browser_press`
@@ -42,7 +42,7 @@ Each step gracefully degrades: if Tesseract isn't installed `desktop_click_text`
 ## Other Features
 
 - **Planner**: when `plannerEnabled=true` (default) the `/autogui` system prompt instructs the model to produce a numbered plan as its first message before executing. No separate LLM call — Pi owns the model loop.
-- **Skill library**: `skill_save` snapshots the recipe of "what worked" in this session as a JSONL record at `pi-extension/runtime/skills/skills.jsonl` (git-ignored, created automatically). `/autogui` retrieves the top-3 candidate skills for the current task and lists them in the prompt; `skill_run` replays one deterministically through the same backend. Override with `skillsPath` in config.
+- **Skill library**: `skillsEnabled` controls *creation* only. When false (the default) the extension does NOT register `skill_save` and never writes a skills file to disk — but `skill_list`, `skill_run`, and the candidate-skills block that `/autogui` prepends to the prompt are always available, so any existing skills at `skillsPath` remain readable and replayable. Set `skillsEnabled: true` in `pi-extension/config.json` to allow creation. When skills are written they go to **`pi-extension/runtime/skills/skills.jsonl`** — its own private library, deliberately separate from the standalone Python agent's `./skills/skills.jsonl` so the two don't shadow each other. Override the path with `skillsPath` (absolute) — leave it empty to use the runtime default; point it at the same path as the mainline if you want a shared library. The directory is created lazily on first save and is git-ignored.
 - **Trajectory log**: every tool call (start, success, failure) is appended to `pi-extension/runtime/traces/<session>.jsonl` for post-hoc inspection.
 - **Failure recording**: a daemon thread maintains a 5-second rolling screen buffer; on any tool failure it dumps the frames as an animated GIF (via ImageMagick) into `runtime/failures/` so you can see *how* the agent got into trouble.
 - **Action scoping & dry-run**: `allowedApps`, `blockedWindowTitles`, and `dryRun` config flags gate every state-changing tool. Default is unrestricted; turn them on for sensitive contexts.
@@ -64,7 +64,28 @@ Every key has a sensible default — leave the file out and everything works. Se
 - `visionEnabled`: when true (default), `desktop_screenshot` includes the inline PNG image in the tool result so the model can see the screen. Set false if the provider struggles with image payloads.
 - `dryRun` / `allowedApps` / `blockedWindowTitles`: safety gates.
 - `plannerEnabled`: planner-first protocol in the system prompt.
+- `controllerEnabled` (default `true`): typed-plan + step-by-step protocol; injects the `plan_set` / `plan_update_step` / `checkpoint` workflow into the prompt and wires the plan slot to the new meta-tools. Set false for the legacy free-text planner.
+- `skillsEnabled` (default `false`): creation gate. False blocks `skill_save`; `skill_list`, `skill_run`, and the candidate-skills suggestion are always available so any existing library at `skillsPath` stays usable. Override the path with `skillsPath` (absolute).
+- `artifactsEnabled` (default `true`) / `progressEnabled` (default `true`): explicit on/off for the artifact and progress stores. Set either to false to disable that store entirely. `artifactsDir` / `progressDir` override the runtime-default path (`runtime/artifacts/` / `runtime/progress/`); leave them empty to use the default. Empty string alone no longer disables a store — set the corresponding `*Enabled` flag.
+- `memoryEnabled` (default `false`): creation gate for the per-app quirk database (mirrors `skillsEnabled`). False blocks `memory_note` and the controller's auto-recording; `memory_get` and the planner's app-memory hints continue to read whatever is already at `memoryDir`. Set true to allow new records.
+- `memoryDir`: location for the per-app quirk database. Empty string resolves to `runtime/memory/` (so `memory_get` and the planner's app-memory hints can still serve reads); `memoryEnabled` is the actual on/off gate for *writes*. The pi-extension uses its own memory dir, separate from the standalone agent's `./memory/` so they don't shadow each other.
+- `budget.maxToolCalls` / `budget.maxSeconds`: hard ceilings consulted by the `budget_status` tool. 0 = no ceiling.
 - `screenRecord.*`: rolling screen buffer for failure post-mortem.
+
+### Verification & robustness tools (always available when the supporting store is constructed)
+
+| Tool | What it does |
+|------|--------------|
+| `desktop_wait_for(window_title \| element_name \| text \| window_id, timeout)` | Block until the target appears; never click on a not-yet-drawn window. |
+| `check_predicate(kind, value/path/command/...)` | Verify a typed post-condition deterministically (window/file/URL/text/process/shell). Use after a step's expected outcome should hold. |
+| `preflight(checks?)` | Verify required apps / files / URLs / tools / commands are available. With no `checks` arg, derives the list from the active plan's `tools_hint` + predicate paths + explicit `preflight` block. |
+| `classify_failure(tool_name, error_message)` | Maps an error to one of `{transient_io, app_not_ready, missing_element, permission, predicate_not_met, user_input_needed, unknown}` and recommends `retry` / `wait_and_retry` / `replan` / `escalate`. |
+| `memory_get(app)` | Always available. Read the per-app quirk database under `runtime/memory/`. Empty `app` lists every recorded app. |
+| `memory_note(app, text, tag?)` | Registered only when `memoryEnabled=true` (default false). Persists a free-form note into the quirk database so future tasks against the same app see the warning. |
+| `budget_status()` | Return tool-call / wall-time counters and the fraction of any configured ceiling consumed. |
+| `plan_set` / `plan_get` / `plan_update_step` | Manage the typed plan from inside the loop; wire `plan_update_step(id, status="done")` after each verified step. |
+| `checkpoint(label, data?)` | Persist a free-form progress marker so the task can resume after a crash or abort. |
+| `get_artifact` / `list_artifacts` | Fetch / enumerate large bodies (file content, page text, command stdout > 4KB) the wrap helper auto-stored. |
 
 Optional system dependencies for graceful-degrade features (all
 installed by `scripts/install-dependencies.*`):
@@ -194,27 +215,21 @@ AutoGUI also has an outer retry loop for these provider statuses. If Pi's own re
 
 After repeated `404`/`429` provider failures, AutoGUI enters screenshot degrade mode. Screenshots are still captured and saved to `runtime/screenshots`, but future `desktop_screenshot` results omit the inline image payload and the context hook strips earlier screenshot image payloads before provider calls. This lets the agent continue with window bounds, active-window detection, explicit window focusing, screenshot paths, and non-visual tools when the selected provider route struggles with image payloads.
 
-## Optional tmux Validator
+## Auto-Spawned tmux Validator
 
-Use `/autogui-validate <task>` to launch a separate Pi process in a detached tmux session:
-
-```text
-/autogui-validate Confirm the browser is open on the expected page
-```
-
-The validator is intentionally read-only. It starts Pi with only:
+When an `/autogui` task ends naturally (assistant `stopReason="stop"`) and `validateAfterAutogui` is `true` in `config.json` (the default), the extension auto-spawns a read-only Pi validator in a fresh detached tmux session.  The validator gets only:
 
 - `desktop_screenshot`
 - `desktop_list_windows`
 - `desktop_active_window`
 
-The spawned tmux session is named `autogui-validator-<timestamp>`. Attach to it with:
+…and the same task description as the original run, plus a "validator mode" rider that tells the model not to click/type/launch.  The spawned session is named `autogui-validator-<timestamp>`; attach with:
 
 ```bash
 tmux attach -t autogui-validator-<timestamp>
 ```
 
-This is useful when you want a second model pass to inspect the desktop state without giving that pass click/type/launch tools. It is opt-in because spawning another Pi can consume another model request and should be visible to the user.
+Use this when you want a second model pass to inspect the desktop state without giving that pass click/type/launch tools.  Aborted tasks (`/autogui-abort`) skip the validator.  Set `validateAfterAutogui: false` in `config.json` to disable the auto-spawn entirely — the cost is a separate Pi process per completed task, which means another model request, so users on tight token budgets will want to flip it off.
 
 ## Runtime Files
 
@@ -222,12 +237,17 @@ All runtime output lives under `pi-extension/runtime/` (git-ignored):
 
 | Path | Contents |
 |------|----------|
-| `runtime/skills/skills.jsonl` | **Skill library** — saved with `skill_save`, replayed with `skill_run` |
+| `runtime/skills/skills.jsonl` | **Skill library** — created the first time `skill_save` runs (which requires `skillsEnabled=true`); reads via `skill_list`/`skill_run` work regardless of the flag |
 | `runtime/traces/` | Per-session JSONL trajectory logs |
+| `runtime/artifacts/` | Artifact bodies + `index.jsonl` — stable-id store (each capture gets a fresh `artifact://<id>`; identical bodies are not deduped). |
+| `runtime/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
+| `runtime/memory/` | Per-app quirk store — `<app>.json` + `index.jsonl`. Only created when `memoryEnabled=true` and a write fires; reads via `memory_get` work regardless. |
 | `runtime/screenshots/` | Ad-hoc screenshots taken by the agent |
 | `runtime/failures/` | Animated GIF failure recordings |
 | `runtime/browser/` | Playwright browser screenshots |
 | `runtime/logs/autogui.log` | Verbose JSON-lines event log |
+
+The pi extension's skills library lives at `pi-extension/runtime/skills/skills.jsonl` and is **distinct** from the standalone Python agent's `./skills/skills.jsonl` — each side keeps its own library so they don't shadow each other.  Point `skillsPath` at a shared absolute path if you want to merge them.
 
 The extension creates these directories recursively as needed.
 
