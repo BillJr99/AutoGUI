@@ -76,7 +76,11 @@ def normalize(predicate: Any) -> dict | None:
     if not isinstance(predicate, dict):
         return None
     kind = predicate.get("kind") or predicate.get("type")
-    if kind not in _KNOWN_KINDS:
+    # The model can return non-string `kind` values (a dict, a list,
+    # None) when output is malformed.  ``in _KNOWN_KINDS`` would raise
+    # TypeError on an unhashable list/dict and crash the caller, so
+    # gate on isinstance first.
+    if not isinstance(kind, str) or kind not in _KNOWN_KINDS:
         return None
     out = dict(predicate)
     out["kind"] = kind
