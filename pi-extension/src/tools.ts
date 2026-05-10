@@ -48,9 +48,11 @@ export interface DesktopToolOptions {
   omitScreenshotImages?: () => boolean;
   config: ExtensionConfig;
   cache: PerceptionCache;
-  /** Optional — only present when config.skillsEnabled=true.  When
-   *  undefined, skill_save / skill_list / skill_run are not registered
-   *  and sessionSteps stays in memory but is never persisted. */
+  /** Optional.  When defined, skill_list and skill_run register
+   *  unconditionally so existing libraries remain usable; skill_save
+   *  registers only when config.skillsEnabled is also true.  When
+   *  undefined, none of the skill_* tools register and sessionSteps
+   *  stays in memory only. */
   skillStore?: SkillStore;
   trace: TraceWriter;
   recorder?: ScreenRecorder;
@@ -59,7 +61,9 @@ export interface DesktopToolOptions {
   sessionSteps: SkillStep[];
   /** Mutable last-marks list for desktop_click_mark resolution. */
   lastMarks: { value: Mark[] };
-  /** Optional content-addressed store for large observations. */
+  /** Optional stable-id store for large observations.  Each capture
+   *  receives a fresh `artifact://<id>`; identical bodies are NOT
+   *  deduplicated — see artifacts.ts for the rationale. */
   artifactStore?: ArtifactStore;
   /** Optional persistent task progress store. */
   progressStore?: ProgressStore;

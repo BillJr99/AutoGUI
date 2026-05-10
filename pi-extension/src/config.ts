@@ -70,7 +70,9 @@ export interface ExtensionConfig {
    *  ``progressEnabled`` is false. */
   progressDir: string;
   /** Directory for the per-app memory store (failure histograms, success
-   *  counts, free-form notes).  Empty string disables app memory. */
+   *  counts, free-form notes).  Empty resolves to
+   *  ``<extensionRoot>/runtime/memory`` so reads via memory_get keep
+   *  working; ``memoryEnabled`` is the actual on/off gate (writes only). */
   memoryDir: string;
   /** When true, memory_note registers and the controller persists
    *  recordFailure / recordSuccess / addNote calls.  Default false:

@@ -11,7 +11,7 @@ Checks supported
 ----------------
   app           — `which`/`where` an executable resolves
   file          — a file exists at a path
-  url           — a URL responds with HTTP < 500 (HEAD only)
+  url           — the URL's host:port is TCP-reachable (no HTTP request issued)
   tool          — a tool name is registered with the registry
   command       — a shell command exits 0
 
@@ -228,8 +228,11 @@ def infer_checks_from_plan(plan_dict: dict, *, registry=None) -> list[PreflightC
             tname = str(hint)
             if not tname or (("tool", tname) in seen):
                 continue
-            # Only worth checking when we have a registry to verify against.
-            if available_tools and tname not in available_tools:
+            # Worth checking whenever we have any registry — even an
+            # empty one — so the truthiness of available_tools doesn't
+            # silently drop hinted tools when the caller's registry
+            # happens to expose nothing yet.
+            if registry is not None and tname not in available_tools:
                 seen.add(("tool", tname))
                 out.append(PreflightCheck("tool", tname,
                                           note=f"step {step.get('id')} hints {tname}"))
