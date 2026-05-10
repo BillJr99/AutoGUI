@@ -96,11 +96,17 @@ on toLower(s)
   return out
 end toLower
 
--- Escape " and \\ so the concatenated JSON string is always valid.
--- AppleScript has no string escape sequences; use ASCII character codes instead.
+-- Escape characters that are forbidden or special in JSON strings:
+-- backslash, double-quote, and all control characters (code < 32).
+-- AppleScript has no string escape sequences; use ASCII character codes
+-- and 'id of' for character code comparisons instead.
 on jsonEscape(s)
   set bslash to (ASCII character 92)
   set dquote to (ASCII character 34)
+  set nl to (ASCII character 10)
+  set cr to (ASCII character 13)
+  set tab to (ASCII character 9)
+  set hexChars to "0123456789abcdef"
   set out to ""
   repeat with ch in characters of s
     set c to ch as string
@@ -108,8 +114,22 @@ on jsonEscape(s)
       set out to out & bslash & bslash
     else if c is dquote then
       set out to out & bslash & dquote
+    else if c is nl then
+      set out to out & bslash & "n"
+    else if c is cr then
+      set out to out & bslash & "r"
+    else if c is tab then
+      set out to out & bslash & "t"
     else
-      set out to out & c
+      set code to id of c
+      if code < 32 then
+        -- Remaining control characters: emit as unicode escape u00XX
+        set hi to (code div 16) + 1
+        set lo to (code mod 16) + 1
+        set out to out & bslash & "u00" & (character hi of hexChars) & (character lo of hexChars)
+      else
+        set out to out & c
+      end if
     end if
   end repeat
   return out
