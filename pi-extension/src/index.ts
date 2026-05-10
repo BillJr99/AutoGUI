@@ -36,8 +36,13 @@ function buildAutoGuiPrompt(cfg: ExtensionConfig, backend: DesktopBackend | unde
   const a11yOn = backend?.capabilities?.findElement === true;
   const planner = cfg.plannerEnabled;
   const controllerOn = cfg.controllerEnabled;
-  const artifactsOn = !!cfg.artifactsDir;
-  const progressOn = !!cfg.progressDir;
+  // Match the prompt to runtime behaviour: a non-empty `*Dir` is not
+  // sufficient because index.ts only constructs the store when the
+  // corresponding `*Enabled` flag is also true.  Advertising the
+  // artifact / progress workflow when the store isn't actually
+  // running just makes the model call tools that aren't registered.
+  const artifactsOn = cfg.artifactsEnabled && !!cfg.artifactsDir;
+  const progressOn = cfg.progressEnabled && !!cfg.progressDir;
   return `You are using the AutoGUI desktop automation extension.
 
 Goal: complete the user's desktop task using Pi's normal agent workflow and the registered desktop_*${browserOn ? "/browser_*" : ""} tools.

@@ -148,9 +148,27 @@ class Subagent:
                 break
 
             for tc in tool_calls:
-                if tool_calls_made >= self._max_tool_calls:
-                    break
                 tool_name = tc.get("function", {}).get("name", "")
+                # Most tool-calling APIs require every tool_call to be
+                # answered with a role="tool" message; breaking out of
+                # the loop without responding leaves dangling
+                # tool_call_ids and the next chat() can stall or 400.
+                # When the budget is exhausted we still emit a
+                # synthetic error result so the conversation stays
+                # well-formed.
+                if tool_calls_made >= self._max_tool_calls:
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": json.dumps({
+                            "error": (
+                                f"subagent tool budget exhausted "
+                                f"({self._max_tool_calls}); call {tool_name!r} "
+                                "skipped without execution."
+                            ),
+                        }),
+                    })
+                    continue
                 if tool_name not in self._allowed:
                     history.append({
                         "role": "tool",

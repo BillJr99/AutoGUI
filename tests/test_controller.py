@@ -75,6 +75,39 @@ def test_merge_revised_preserves_done_steps():
     assert "s2" not in statuses
 
 
+def test_merge_revised_carries_preflight():
+    current = Plan(
+        steps=[PlanStep(id="s1", goal="")],
+        preflight=[{"kind": "app", "target": "vim"}],
+    )
+    # Revised plan without preflight: current's checks must survive.
+    revised = Plan(steps=[PlanStep(id="s1", goal="re-attempt")])
+    merged = merge_revised_plan(current, revised)
+    assert merged.preflight == [{"kind": "app", "target": "vim"}]
+
+    # Revised plan with its own preflight: revised wins.
+    revised2 = Plan(
+        steps=[PlanStep(id="s1", goal="x")],
+        preflight=[{"kind": "url", "target": "https://example.com"}],
+    )
+    merged2 = merge_revised_plan(current, revised2)
+    assert merged2.preflight == [{"kind": "url", "target": "https://example.com"}]
+
+
+def test_merge_revised_does_not_preserve_failed_steps():
+    """The whole point of a replan is to re-attempt FAILED steps with a new
+    approach; FAILED status must NOT be carried over from current."""
+    current = Plan(steps=[
+        PlanStep(id="s1", goal="old", status=StepStatus.FAILED, last_error="oops"),
+    ])
+    revised = Plan(steps=[PlanStep(id="s1", goal="new approach")])
+    merged = merge_revised_plan(current, revised)
+    only = merged.steps[0]
+    assert only.status == StepStatus.PENDING
+    assert only.goal == "new approach"
+    assert only.last_error == ""
+
+
 def test_step_outcome_parses_done_marker():
     verdict, reason = parse_step_outcome("Some prose\nSTEP_DONE: editor open")
     assert verdict == StepVerdict.DONE

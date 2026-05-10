@@ -336,10 +336,18 @@ def merge_revised_plan(current: Plan, revised: Plan) -> Plan:
     """
     Combine an existing plan with a revised one returned by the planner.
 
-    Preserves DONE / SKIPPED / FAILED step states from ``current`` when
-    the same id appears in ``revised``.  New ids from ``revised`` are
-    appended.  The revision counter increments so the executor can tell
-    plans apart in the trace.
+    Preserves DONE / SKIPPED step states from ``current`` when the same
+    id appears in ``revised``.  FAILED steps are NOT preserved on
+    purpose: the planner's whole job in a replan is to propose a new
+    approach to a step that just failed, so we accept the revised
+    step as-is.  New ids from ``revised`` are appended.  The revision
+    counter increments so the executor can tell plans apart in the
+    trace.
+
+    Plan-level preflight checks are carried forward — the revised
+    plan's preflight wins when it supplies one, otherwise the current
+    plan's checks are kept so a replan that doesn't restate them
+    doesn't silently lose them.  Mirrors the TS ``mergeRevisedPlan``.
     """
     by_id = {s.id: s for s in current.steps}
     merged_steps: list[PlanStep] = []
@@ -358,8 +366,10 @@ def merge_revised_plan(current: Plan, revised: Plan) -> Plan:
         if old.id not in seen_ids and old.status == StepStatus.DONE:
             merged_steps.append(old)
 
+    preflight = list(revised.preflight) if revised.preflight else list(current.preflight)
     return Plan(
         steps=merged_steps,
         created=current.created,
         revision=current.revision + 1,
+        preflight=preflight,
     )
