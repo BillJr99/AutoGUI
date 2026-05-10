@@ -90,19 +90,29 @@ async function checkUrl(target: string): Promise<PreflightResult> {
   }
   if (!host) return { check: { kind: "url", target }, ok: false, detail: "no host" };
   return await new Promise<PreflightResult>((resolve_) => {
-    const sock = connect({ host, port, timeout: 4000 });
+    // Node's `connect({ timeout })` only sets a SOCKET-INACTIVITY
+    // timer that fires AFTER the socket is connected — it does not
+    // cap the connect handshake itself, so an unroutable host can
+    // hang for the OS-level default (often tens of seconds).  Drive
+    // the cap from a manual setTimeout that destroys the socket;
+    // the `error` event then fires our finish() with a clear detail.
+    const sock = connect({ host, port });
     let settled = false;
     const finish = (result: PreflightResult) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       try { sock.destroy(); } catch { /* ignore */ }
       resolve_(result);
     };
+    const timer = setTimeout(() => {
+      finish({
+        check: { kind: "url", target }, ok: false,
+        detail: "tcp timeout (4s connect cap)",
+      });
+    }, 4000);
     sock.once("connect", () => finish({
       check: { kind: "url", target }, ok: true, detail: `${host}:${port} reachable`,
-    }));
-    sock.once("timeout", () => finish({
-      check: { kind: "url", target }, ok: false, detail: "tcp timeout",
     }));
     sock.once("error", (e) => finish({
       check: { kind: "url", target }, ok: false, detail: `unreachable: ${e.message}`,
