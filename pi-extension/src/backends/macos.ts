@@ -22,7 +22,10 @@ export class MacBackend implements DesktopBackend {
     // Walk frontmost process's UI element tree.  System Events exposes
     // descriptions/names/roles plus position+size we can use as a rect.
     const script = `
-on findInElem(elem, target, role, count)
+-- Collect every matching element into |results| (a list passed by reference).
+-- AppleScript lists are reference types, so mutations inside the handler are
+-- visible to the caller — this avoids the by-value counter bug.
+on collectMatches(elem, target, role, results)
   try
     set elemRole to (role of elem) as string
   on error
@@ -49,29 +52,23 @@ on findInElem(elem, target, role, count)
   set nameHit to (target is "" or haystack contains target)
   set roleHit to (role is "" or roleHay contains role)
   if nameHit and roleHit then
-    set count to count + 1
-    if count = ${idx} then
-      try
-        set p to position of elem
-        set s to size of elem
-        return "{\\\"name\\\":\\\"" & elemName & "\\\",\\\"controlType\\\":\\\"" & elemRole & "\\\",\\\"rect\\\":{\\\"x\\\":" & item 1 of p & ",\\\"y\\\":" & item 2 of p & ",\\\"width\\\":" & item 1 of s & ",\\\"height\\\":" & item 2 of s & "}}"
-      on error
-        return "{\\\"error\\\":\\\"matched element has no position/size.\\\"}"
-      end try
-    end if
+    try
+      set p to position of elem
+      set s to size of elem
+      set end of results to "{\\\"name\\\":\\\"" & elemName & "\\\",\\\"controlType\\\":\\\"" & elemRole & "\\\",\\\"rect\\\":{\\\"x\\\":" & item 1 of p & ",\\\"y\\\":" & item 2 of p & ",\\\"width\\\":" & item 1 of s & ",\\\"height\\\":" & item 2 of s & "}}"
+    on error
+      -- Element matched but has no geometry; skip it.
+    end try
   end if
   try
     set kids to UI elements of elem
   on error
-    return ""
+    return
   end try
   repeat with k in kids
-    set out to my findInElem(k, target, role, count)
-    if out is not "" then return out
-    set count to count + (my elementMatchCount(k, target, role))
+    my collectMatches(k, target, role, results)
   end repeat
-  return ""
-end findInElem
+end collectMatches
 
 on toLower(s)
   set chars to {"A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z"}
@@ -91,13 +88,11 @@ on toLower(s)
   return out
 end toLower
 
-on elementMatchCount(elem, target, role)
-  return 0
-end elementMatchCount
-
 set targetName to "${name}"
 set targetRole to "${role}"
 set winNeedle to "${winTitle}"
+set matchIdx to ${idx}
+set results to {}
 tell application "System Events"
   set frontProc to first process whose frontmost is true
   if winNeedle is "" then
@@ -106,10 +101,12 @@ tell application "System Events"
     set candidates to (every window of frontProc whose name contains winNeedle)
   end if
   repeat with w in candidates
-    set out to my findInElem(w, my toLower(targetName), my toLower(targetRole), 0)
-    if out is not "" then return out
+    my collectMatches(w, my toLower(targetName), my toLower(targetRole), results)
   end repeat
 end tell
+if (count of results) >= matchIdx then
+  return item matchIdx of results
+end if
 return "{\\\"error\\\":\\\"No matching AX element found.\\\"}"
 `;
     const r = await execFile("osascript", ["-e", script], { timeoutMs: 15000, signal });

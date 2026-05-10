@@ -29,7 +29,7 @@ is configured to use and exposes desktop tools plus `/autogui`.
 | **Shell** | Run any shell command with timeout, destructive-pattern guard, and confirmation delay |
 | **Filesystem** | Read, write (or append), and list files/directories; optional pre-overwrite snapshots |
 | **Desktop (pixel)** | Screenshot, click, double-click, type text, hotkeys, scroll, launch apps, list windows |
-| **Desktop (a11y-first)** | `desktop_click_element(name, …)` clicks real UI controls via UIAutomation (Windows), AT-SPI (Linux), and AppleScript (macOS) — no pixel guessing |
+| **Desktop (a11y-first)** | `desktop_click_element(name, …)` clicks real UI controls via UIAutomation (Windows) and AT-SPI (Linux) — no pixel guessing; macOS AX supported in the Pi extension only |
 | **Set-of-Mark grounding** | Numbered overlay on detected elements; the model clicks by id (`desktop_click_mark`) instead of pixel coords |
 | **Click-by-text** | OCR-anchored click (`desktop_click_text`); install Tesseract via `scripts/install-dependencies.*` |
 | **Browser (Playwright)** | First-class Chromium driver: real DOM/ARIA selectors, `browser_click`, `browser_fill`, `browser_eval` — opt-in via `allowed_browser` |
@@ -264,7 +264,7 @@ window moves, and async UI redraws.
 | Platform     | Backend used                        | Install                                                |
 |--------------|-------------------------------------|--------------------------------------------------------|
 | Windows      | UIAutomation (`uiautomation` pkg)   | `pip install uiautomation pywin32`                     |
-| macOS        | AppleScript / AX (`pyobjc`)         | `pip install pyobjc-framework-Quartz pyobjc-framework-AppKit` (built-in if installed) |
+| macOS        | Not available (Pi extension only)   | Use Pi extension for macOS AX element clicking                                         |
 | Linux X11    | AT-SPI 2 (`pyatspi`)                | `sudo apt install python3-pyatspi gir1.2-atspi-2.0`    |
 | Linux Wayland| AT-SPI 2 (`pyatspi`)                | same as X11                                             |
 

@@ -11,7 +11,7 @@
  */
 
 import { mkdir, appendFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export class TraceWriter {
@@ -34,7 +34,7 @@ export class TraceWriter {
 
   private async write(record: Record<string, unknown>): Promise<void> {
     if (!this.headerWritten) {
-      await mkdir(this.path.replace(/\/[^/]+$/, ""), { recursive: true });
+      await mkdir(dirname(this.path), { recursive: true });
       this.headerWritten = true;
     }
     const line = JSON.stringify({
