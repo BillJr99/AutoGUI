@@ -1,6 +1,6 @@
 ---
 name: babysit-pr-copilot
-description: Poll a GitHub PR for new (unaddressed) Copilot review comments, address them, push fixes, and request a fresh Copilot review on a fixed cadence. Default cadence is every 2 minutes for 24 minutes (12 ticks) with a 30-minute persistence cap. Reopens the PR off main if it has been closed/merged.
+description: Poll a GitHub PR for new (unaddressed) Copilot review comments, address them, push fixes, and request a fresh Copilot review on a fixed cadence. Default cadence is every 3 minutes for 2 hours (40 ticks) with a 150-minute persistence cap. Reopens the PR off main if it has been closed/merged.
 ---
 
 # babysit-pr-copilot
@@ -25,10 +25,12 @@ If `<repo>` is missing, ask the user. Don't guess.
 
 ## Defaults
 
-- **Tick cadence:** 2 minutes between polls.
-- **Tick count:** 12 ticks (≈ 24 minutes of polling).
-- **Persistence cap:** 30 minutes — stop the monitor at that wall-clock
-  budget regardless of remaining ticks.
+- **Tick cadence:** 3 minutes between polls.
+- **Tick count:** 40 ticks (≈ 2 hours of polling).
+- **Persistence cap:** 150 minutes — stop the monitor at that wall-clock
+  budget regardless of remaining ticks.  The 30-minute buffer over the
+  120-minute polling window covers tick-processing time (each fix-and-
+  push iteration spends a couple of minutes outside `sleep 180`).
 - **Branch:** the PR's head branch. Never push to `main`/`master`.
 
 The user can override any of these in the invocation prompt.
@@ -81,7 +83,7 @@ End the loop and report when **any** of these is true:
 
 - Natural loop completion — the monitor emits `loop-done` after the
   configured number of ticks.
-- Persistence cap hit (30 min wall clock).
+- Persistence cap hit (150 min / 2.5 h wall clock).
 - A push fails with a non-network error (auth/permission/branch
   protection) — surface the error and stop instead of retrying blindly.
 - Tests or typecheck fail and you can't repair them within the tick —
@@ -97,7 +99,7 @@ monitor short; it always runs to completion.
 Use the **Monitor** tool, NOT `Bash sleep`. Pattern:
 
 ```
-Monitor(command="for i in $(seq 1 12); do echo \"tick-$i $(date -u +%H:%M:%SZ)\"; sleep 120; done; echo loop-done", description="PR #<n> 2-minute poll ticks (12 iterations)", timeout=1800000)
+Monitor(command="for i in $(seq 1 40); do echo \"tick-$i $(date -u +%H:%M:%SZ)\"; sleep 180; done; echo loop-done", description="PR #<n> 3-minute poll ticks (40 iterations)", timeout=9000000)
 ```
 
 Each `tick-N` line wakes you up; do one full pass through the loop
