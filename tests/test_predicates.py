@@ -68,13 +68,22 @@ def test_file_absent_pass(tmp_path):
 
 
 def test_file_exists_rejects_directory(tmp_path):
-    """A directory at the path should NOT satisfy file_exists — the kind
-    is named for *files*, and the README documents that semantic."""
+    """A directory at the path should NOT satisfy file_exists, and the
+    failure detail must say "directory" (not generic "absent") so the
+    caller can disambiguate from a missing path."""
     d = tmp_path / "a_dir"
     d.mkdir()
     res = check_filesystem_predicate_sync({"kind": "file_exists", "path": str(d)})
     assert res.ok is False
-    assert "directory" in res.detail.lower() or "absent" in res.detail.lower()
+    assert "directory" in res.detail.lower()
+    # A truly missing path should NOT mention 'directory' — confirm the
+    # two failure modes are reported differently.
+    res_missing = check_filesystem_predicate_sync(
+        {"kind": "file_exists", "path": str(tmp_path / "really-not-there")},
+    )
+    assert res_missing.ok is False
+    assert "directory" not in res_missing.detail.lower()
+    assert "not found" in res_missing.detail.lower() or "missing" in res_missing.detail.lower()
 
 
 def test_file_absent_passes_for_directory(tmp_path):

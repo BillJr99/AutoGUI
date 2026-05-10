@@ -131,9 +131,11 @@ async def _check_url(target: str) -> PreflightResult:
         return PreflightResult(PreflightCheck("url", target), False, "no host")
     # We only verify TCP reachability — a successful connect is good
     # enough; we don't want to perform a full HTTP request from here.
-    loop = asyncio.get_event_loop()
+    # Use asyncio.to_thread (Py3.9+) instead of get_event_loop() —
+    # the latter is deprecated and can pick the wrong loop under
+    # alternative loop policies.
     try:
-        await loop.run_in_executor(None, lambda: _tcp_probe(host, port, 4.0))
+        await asyncio.to_thread(_tcp_probe, host, port, 4.0)
     except OSError as e:
         return PreflightResult(PreflightCheck("url", target), False,
                                f"unreachable: {e}")

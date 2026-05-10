@@ -163,11 +163,22 @@ async def _check_window_title(p: dict, registry) -> PredicateResult:
     needle = str(p.get("value") or "")
     if not needle:
         return PredicateResult(False, p["kind"], "empty value")
+    if "desktop_list_windows" not in set(registry.list_tools()):
+        return PredicateResult(False, p["kind"], "backend has no list_windows")
     raw = await registry.dispatch("desktop_list_windows", {})
     try:
-        wins = json.loads(raw).get("windows") or []
+        result = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return PredicateResult(False, p["kind"], "window listing unparsable")
+    # Surface dispatch-level errors directly so the model sees a clear
+    # diagnostic instead of "no window contains …" when the real issue
+    # is "tool returned an error".
+    if isinstance(result, dict) and "error" in result:
+        return PredicateResult(False, p["kind"],
+                               f"list_windows error: {result['error']}",
+                               result)
+    wins = result.get("windows") if isinstance(result, dict) else []
+    wins = wins or []
     for w in wins:
         title = str(w.get("title", "") or "")
         if needle.lower() in title.lower():
@@ -207,12 +218,23 @@ def _check_file_presence(p: dict, *, must_exist: bool) -> PredicateResult:
     # at the path should NOT satisfy file_exists, and a directory should
     # NOT make file_absent fail.  Use is_file so both cases ignore
     # directories the same way callers naturally read the kind name.
-    is_file = Path(path).expanduser().is_file()
+    expanded = Path(path).expanduser()
+    is_file = expanded.is_file()
     if is_file == must_exist:
         return PredicateResult(True, p["kind"],
                                f"file_{'exists' if is_file else 'absent'} satisfied", path)
-    return PredicateResult(False, p["kind"],
-                           f"unexpectedly {'absent' if not is_file else 'present (or directory)'}: {path}")
+    # Distinguish "missing" from "is a directory" so the failure detail
+    # tells the caller which of those is actually true; a generic
+    # "unexpectedly absent" message hides the latter case.
+    if must_exist:
+        if expanded.is_dir():
+            detail = f"path is a directory, not a file: {path}"
+        else:
+            detail = f"file not found: {path}"
+    else:
+        # must_exist=False but is_file=True
+        detail = f"file unexpectedly present: {path}"
+    return PredicateResult(False, p["kind"], detail)
 
 
 def _check_file_contains(p: dict) -> PredicateResult:

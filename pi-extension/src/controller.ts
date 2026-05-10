@@ -62,14 +62,21 @@ export function planFromDict(data: Record<string, unknown>): Plan {
     // Only treat the value as a predicate when it's a non-empty object
     // with a recognisable kind.  An empty `{}` is truthy in JS, so
     // accepting it would trigger spurious renderForPrompt output and
-    // a spurious check_predicate request from the model.
+    // a spurious check_predicate request from the model.  We also
+    // require `kind` to be a non-empty string — every supported
+    // predicate (window_title_contains, file_exists, etc.) carries
+    // one, so anything without it is either malformed or a forward-
+    // version payload we shouldn't try to render.
     const rawPred = sd["predicate"];
     let predicate: PlanPredicate | undefined;
     if (
       rawPred && typeof rawPred === "object" && !Array.isArray(rawPred)
       && Object.keys(rawPred).length > 0
     ) {
-      predicate = rawPred as PlanPredicate;
+      const kindVal = (rawPred as Record<string, unknown>)["kind"];
+      if (typeof kindVal === "string" && kindVal.length > 0) {
+        predicate = rawPred as PlanPredicate;
+      }
     }
     const risks = Array.isArray(sd["risks"])
       ? (sd["risks"] as unknown[]).map((r) => String(r))
