@@ -20,6 +20,11 @@
     "skills_enabled": false,
     "suggest_skills": true,
     "skills_path": "skills/skills.jsonl",
+    "_drift_anchor_comment": "Post-action world snapshot attached to each session step so 'replay --drift-check' can flag steps whose live state has shifted vs. the recording. window_titles capture is essentially free; capture_phash adds a screenshot per step (a few percent overhead) and is opt-in.",
+    "drift_anchor": {
+      "enabled": true,
+      "capture_phash": false
+    },
     "planner": {
       "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces.",
       "enabled": true

@@ -31,7 +31,6 @@ the Plan.to_dict() round-trip and replay.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re

@@ -184,21 +184,42 @@ class Subagent:
                 tool_calls_made += 1
 
                 if self._artifacts is not None:
+                    # Different read tools surface their large bodies under
+                    # different keys: fs_read uses "content", browser_get_text
+                    # and desktop_get_window_text use "text", shell_run uses
+                    # "stdout".  Probe each key so the auto-capture works
+                    # regardless of which read tool the subagent invoked.
                     try:
                         result_obj = json.loads(result_json)
-                        body = result_obj.get("content")
-                        if isinstance(body, str) and len(body) > 256:
-                            aid = self._artifacts.put(
-                                body,
-                                kind=tool_name,
-                                source=str(args.get("path", "")) or tool_name,
-                            )
-                            captured_ids.append(aid)
-                            # Replace inline body with artifact reference for the subagent's context.
-                            result_obj["content"] = f"<stored as {aid}; use parent's get_artifact to fetch>"
-                            result_json = json.dumps(result_obj)
                     except Exception:
-                        pass
+                        result_obj = None
+                    if isinstance(result_obj, dict):
+                        body_field, source = None, ""
+                        for field, src in (
+                            ("content", str(args.get("path", "")) or tool_name),
+                            ("text", str(args.get("selector", "") or args.get("window_title", "")) or tool_name),
+                            ("stdout", str(args.get("command", ""))[:120] or tool_name),
+                        ):
+                            body = result_obj.get(field)
+                            if isinstance(body, str) and len(body) > 256:
+                                body_field, source = field, src
+                                break
+                        if body_field is not None:
+                            try:
+                                aid = self._artifacts.put(
+                                    result_obj[body_field],
+                                    kind=tool_name,
+                                    source=source,
+                                )
+                                captured_ids.append(aid)
+                                # Replace inline body with artifact reference for the subagent's context.
+                                result_obj[body_field] = (
+                                    f"<stored as {aid}; use parent's get_artifact to fetch>"
+                                )
+                                result_obj[body_field + "_artifact_id"] = aid
+                                result_json = json.dumps(result_obj)
+                            except Exception:
+                                pass
 
                 history.append({
                     "role": "tool",

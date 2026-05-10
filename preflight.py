@@ -30,7 +30,6 @@ import platform as _platform
 import shutil
 import socket
 from dataclasses import dataclass, field
-from typing import Any
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)

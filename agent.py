@@ -229,6 +229,16 @@ class Agent:
         self._skills_enabled: bool = bool(self._agent_cfg.get("skills_enabled", False))
         self._suggest_skills: bool = bool(self._agent_cfg.get("suggest_skills", True))
         self._record_trace: bool = bool(self._agent_cfg.get("record_trace", True))
+        # Drift anchors are the post-action snapshots (window titles + an
+        # optional perceptual screen hash) attached to each session step
+        # so `replay --drift-check` can flag steps whose live world state
+        # has shifted vs. the recording.  Anchoring is on by default
+        # because window titles are essentially free; the perceptual
+        # screenshot hash is gated separately because it requires a
+        # screenshot per step.
+        drift_cfg = self._agent_cfg.get("drift_anchor", {}) or {}
+        self._drift_anchor_enabled: bool = bool(drift_cfg.get("enabled", True))
+        self._drift_anchor_phash: bool = bool(drift_cfg.get("capture_phash", False))
 
         try:
             self._trace = TraceWriter(trace_dir) if self._record_trace else None
@@ -1446,7 +1456,11 @@ class Agent:
                     "fs_read", "fs_list", "get_artifact", "list_artifacts",
                     "plan_get", "plan_update_step", "checkpoint", "ask_subagent",
                 ):
-                    self._session_steps.append({"tool": tool_name, "args": dict(args)})
+                    step_record: dict = {"tool": tool_name, "args": dict(args)}
+                    anchor = await self._capture_drift_anchor()
+                    if anchor:
+                        step_record["drift_anchor"] = anchor
+                    self._session_steps.append(step_record)
 
                 if self._result_is_error(result_json):
                     step_failure_seen = True
@@ -1558,6 +1572,42 @@ class Agent:
             except Exception:
                 active = {}
         return {"windows": windows, "active": active}
+
+    async def _capture_drift_anchor(self) -> dict:
+        """Cheap post-action world snapshot for replay --drift-check.
+
+        Captures the visible window titles (always when enabled — these
+        are essentially free) and, when ``drift_anchor.capture_phash`` is
+        on, a perceptual hash of the screen for visual drift detection.
+        Best-effort: any failure yields a partial / empty dict so a
+        recording session never breaks because the anchor couldn't be
+        captured.  The shape mirrors what replay._check_drift expects.
+        """
+        if not self._drift_anchor_enabled:
+            return {}
+        anchor: dict = {}
+        tools = set(self._registry.list_tools())
+        if "desktop_list_windows" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_list_windows", {})
+                wins = json.loads(raw).get("windows") or []
+                titles = [str(w.get("title", "")) for w in wins if w.get("title")]
+                if titles:
+                    anchor["window_titles"] = titles
+            except Exception:
+                pass
+        if self._drift_anchor_phash and "desktop_screenshot" in tools:
+            try:
+                from visual_diff import hash_b64 as _vhash
+                import base64 as _b64
+                raw = await self._registry.dispatch("desktop_screenshot", {})
+                shot = json.loads(raw)
+                h = _vhash(shot.get("base64_png", ""))
+                if h:
+                    anchor["screen_phash_b64"] = _b64.b64encode(h).decode("ascii")
+            except Exception:
+                pass
+        return anchor
 
     async def _best_effort_active_app(self) -> str:
         """Return a normalised app slug for the active window, or '' on miss."""
@@ -2163,7 +2213,11 @@ class Agent:
                         "desktop_find_text",
                         "fs_read", "fs_list",
                     ):
-                        self._session_steps.append({"tool": tool_name, "args": dict(args)})
+                        step_record: dict = {"tool": tool_name, "args": dict(args)}
+                        anchor = await self._capture_drift_anchor()
+                        if anchor:
+                            step_record["drift_anchor"] = anchor
+                        self._session_steps.append(step_record)
 
                 # ---- Error injection: fail loud, not quiet -----------------
                 # Prepend a header inside the tool result AND track the failure
