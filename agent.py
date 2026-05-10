@@ -2419,10 +2419,21 @@ class Agent:
                                 data={"tool_name": "desktop_screenshot", "iteration": iteration},
                             )
                         else:
-                            # Vision off: file is saved to disk but not shown to the model.
+                            # Vision branch skipped: clarify which of the two
+                            # possible reasons fired so the user isn't told
+                            # "vision off" when their config has it on.
+                            if not self._vision_screenshots:
+                                why = "vision off in config (agent.vision_screenshots)"
+                            elif not b64:
+                                why = (
+                                    "vision on but screenshot tool returned no "
+                                    "base64_png (backend may have failed silently)"
+                                )
+                            else:
+                                why = "skipped"
                             yield AgentEvent(
                                 kind="tool_result",
-                                content=f"Auto-screenshot saved (vision off): {path_str} ({dims})",
+                                content=f"Auto-screenshot saved ({why}): {path_str} ({dims})",
                                 data={"tool_name": "desktop_screenshot", "iteration": iteration},
                             )
                     except Exception:

@@ -30,6 +30,7 @@ Key bindings
 import asyncio
 import json
 import logging
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -273,6 +274,57 @@ class _AgentCommands(Provider):
 
 
 # ---------------------------------------------------------------------------
+# Logging bridge
+# ---------------------------------------------------------------------------
+
+class _TUILogHandler(logging.Handler):
+    """Logging handler that writes records into the TUI's conversation
+    pane via Textual's thread-safe ``call_from_thread``.
+
+    main.py installs a stderr StreamHandler at WARNING; under the TUI
+    that paints raw ``[WARNING] …`` lines over the layout.  We attach
+    this handler on mount and detach the stderr handler so warnings
+    coming from our own code or from libraries (urllib3 retry, asyncio,
+    pyautogui fail-safe, etc.) land in the visible conversation log
+    instead.
+    """
+
+    def __init__(self, app: "AgentTUI") -> None:
+        super().__init__(level=logging.WARNING)
+        self._app = app
+        self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            return
+        # Color the line by severity so a stray WARNING in the middle of
+        # a conversation is easy to spot but not alarming, while ERROR/
+        # CRITICAL stand out as red.
+        colour = (
+            "red" if record.levelno >= logging.ERROR
+            else "yellow" if record.levelno >= logging.WARNING
+            else "dim"
+        )
+        line = f"[{colour}]{msg}[/{colour}]"
+        try:
+            # call_from_thread is safe whether emit() runs on the
+            # event-loop thread or a worker thread.
+            self._app.call_from_thread(self._write_to_log, line)
+        except Exception:
+            # Late teardown / app already exiting — drop the record.
+            pass
+
+    def _write_to_log(self, line: str) -> None:
+        try:
+            log = self._app.query_one("#conversation", RichLog)
+            log.write(line)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main TUI Application
 # ---------------------------------------------------------------------------
 
@@ -355,6 +407,11 @@ class AgentTUI(App):
         self.show_tools = self._tui_cfg.get("show_tool_calls", True)
         # Per-session log file — created on mount, one file per TUI invocation.
         self._session_log: Path | None = None
+        # Logging handler that routes WARNING+ records into the
+        # conversation pane so library warnings (urllib3, asyncio, etc.)
+        # don't paint over the TUI layout.  Installed on mount, removed
+        # on unmount.  See _install_log_handler for details.
+        self._log_handler: logging.Handler | None = None
 
     # ------------------------------------------------------------------
     # Composition
@@ -368,6 +425,11 @@ class AgentTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Install the logging bridge BEFORE anything that might warn —
+        # the agent has already initialized at this point but any
+        # subsequent library warning (urllib3 retry, pyautogui fail-safe,
+        # etc.) should land in the conversation pane, not stderr.
+        self._install_log_handler()
         log = self.query_one("#conversation", RichLog)
         model = self._cfg.get("openwebui", {}).get("model", "unknown")
         vision = self._agent._vision_screenshots
@@ -518,6 +580,7 @@ class AgentTUI(App):
     async def action_quit(self) -> None:
         if self._active_task and self._active_task.state in (WorkerState.PENDING, WorkerState.RUNNING):
             self._active_task.cancel()
+        self._uninstall_log_handler()
         self.exit()
 
     async def action_reset(self) -> None:
@@ -629,6 +692,38 @@ class AgentTUI(App):
                 f.write(f"[{ts}] {line}\n")
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Logging bridge — installed on mount so warnings land in the
+    # conversation pane instead of corrupting the TUI layout.
+    # ------------------------------------------------------------------
+
+    def _install_log_handler(self) -> None:
+        if self._log_handler is not None:
+            return
+        root = logging.getLogger()
+        # Drop any stderr StreamHandler main.py installed — those write
+        # ``[WARNING] …`` lines straight to the terminal which paints
+        # over the Textual layout.  The file handler stays so logs are
+        # still persisted to disk.
+        for h in list(root.handlers):
+            if isinstance(h, logging.StreamHandler) and not isinstance(
+                h, logging.FileHandler,
+            ) and h.stream in (sys.stderr, sys.stdout):
+                root.removeHandler(h)
+        handler = _TUILogHandler(self)
+        root.addHandler(handler)
+        self._log_handler = handler
+
+    def _uninstall_log_handler(self) -> None:
+        """Detach the TUI log handler.  Called from action_quit so root
+        logger state is clean if the agent is reused outside a TUI."""
+        if self._log_handler is not None:
+            try:
+                logging.getLogger().removeHandler(self._log_handler)
+            except Exception:
+                pass
+            self._log_handler = None
 
     # ------------------------------------------------------------------
     # Reactive watchers and helpers
