@@ -1513,6 +1513,10 @@ class Agent:
         # alternates STEP_BLOCKED + screenshot reminder until iterations
         # exhaust.  One chance, then accept the second STEP_BLOCKED.
         blocked_screenshot_retry_used = False
+        # Same idea for the Gemma "tool-call syntax leaked into text"
+        # reminder — re-prompt once, then accept the next bad turn so a
+        # genuinely-stuck model still escalates.
+        _gemma_format_reminder_used = False
 
         while iterations < self._step_max_iterations:
             iterations += 1
@@ -1553,6 +1557,43 @@ class Agent:
                 last_text = text
 
             if not tool_calls:
+                # Detect Gemma 3/4-style tool-call syntax that leaked
+                # into the assistant TEXT instead of being parsed as a
+                # real tool_call (`action:tool_name{...}<tool_call|>` or
+                # similar).  The model intended to invoke a tool but the
+                # client's tool-call extractor missed it.  Treating this
+                # as STEP_BLOCKED triggers a costly replan; instead,
+                # re-prompt the model with a format reminder so it tries
+                # the proper tool_call format on the next iteration.
+                # Gated by a flag so we only do this once per step (a
+                # second leak after the reminder genuinely IS a stuck
+                # model and should escalate).
+                if (
+                    not _gemma_format_reminder_used
+                    and self._looks_like_leaked_tool_call(text)
+                ):
+                    _gemma_format_reminder_used = True
+                    logger.warning(
+                        "[agent] step %s: model emitted tool-call syntax as text "
+                        "instead of a real tool_call (%s); injecting format "
+                        "reminder and continuing.",
+                        step.id, text[:80],
+                    )
+                    local_history.append({
+                        "role": "user",
+                        "content": (
+                            "[CONTROLLER] Your last response contained tool-call "
+                            "syntax INSIDE the assistant message text instead of "
+                            "emitting it as a proper tool_call.  The runtime "
+                            "cannot dispatch tools written that way.  For your "
+                            "next turn, invoke the tool through the assistant's "
+                            "tool_calls mechanism (the API field), not in the "
+                            "message body.  If you meant to finish the step, "
+                            "use STEP_DONE: <proof> or STEP_BLOCKED: <reason>."
+                        ),
+                    })
+                    continue
+
                 # Final assistant message — parse the marker.
                 verdict, reason = parse_step_outcome(text)
                 # On the FIRST STEP_BLOCKED in a step, give the model
@@ -2901,6 +2942,32 @@ class Agent:
         """Return True when the model's stop-response sounds like it is giving up."""
         lower = text.lower()
         return any(re.search(pat, lower) for pat in cls._GIVING_UP_PATTERNS)
+
+    # Compiled once at class scope so the per-iteration check is cheap.
+    # Patterns intentionally cover the multiple Gemma 3/4 / Llama / Qwen
+    # tool-call leak shapes we've seen in user reports rather than
+    # matching one provider's format exactly.
+    _LEAKED_TOOL_CALL_PATTERNS = (
+        re.compile(r"<\|?tool_call\|?>", re.IGNORECASE),
+        re.compile(r"<tool_call\|>", re.IGNORECASE),
+        re.compile(r"<\|tool_call\|>", re.IGNORECASE),
+        re.compile(r"^\s*action\s*:\s*\w", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"<function_call>|</function_call>", re.IGNORECASE),
+    )
+
+    @classmethod
+    def _looks_like_leaked_tool_call(cls, text: str) -> bool:
+        """True when the assistant text contains tool-call syntax that
+        should have been emitted as a real tool_call.
+
+        Used by _run_step to inject a one-shot format reminder instead
+        of marking the step BLOCKED — the model intended to invoke a
+        tool, the API just didn't parse it.  See the call site for the
+        reminder copy.
+        """
+        if not text:
+            return False
+        return any(p.search(text) for p in cls._LEAKED_TOOL_CALL_PATTERNS)
 
     # ------------------------------------------------------------------
     # Best-of-N sampling (Phase 7)

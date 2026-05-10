@@ -398,11 +398,30 @@ async def _check_process(p: dict, registry) -> PredicateResult:
                 False, p["kind"],
                 f"refusing to query process: needle {needle!r} contains shell metacharacters",
             )
-        # On Windows native, tasklist is on PATH and runs through cmd.
-        cmd = f'tasklist /FI "IMAGENAME eq {needle}*"'
+        # tasklist's /FI "IMAGENAME eq <name>" is an EXACT-MATCH filter,
+        # NOT a glob — appending '*' (as a previous version did) made
+        # the filter look for a literal process named "<name>*", which
+        # never exists.  So a launched notepad.exe failed the predicate
+        # even though it was running.  Try exact, then fall back to a
+        # findstr scan over the unfiltered list so the predicate
+        # tolerates either "notepad" or "notepad.exe" as the value.
+        candidates = [needle]
+        if not needle.lower().endswith(".exe"):
+            candidates.append(needle + ".exe")
+        out_head = ""
+        for cand in candidates:
+            cmd = f'tasklist /FI "IMAGENAME eq {cand}"'
+            found, out_head = await _run_process_query(needle, cmd, registry, p["kind"])
+            if found:
+                return PredicateResult(True, p["kind"], "process found", out_head)
+        # Fallback: full tasklist + findstr (case-insensitive) so values
+        # like "Spotify" (process name "Spotify.exe") still match when
+        # the needle case differs from the registered IMAGENAME.
+        cmd = f'tasklist | findstr /I "{needle}"'
         found, out_head = await _run_process_query(needle, cmd, registry, p["kind"])
         if found:
-            return PredicateResult(True, p["kind"], "process found", out_head)
+            return PredicateResult(True, p["kind"],
+                                   "process found (via findstr)", out_head)
         return PredicateResult(False, p["kind"],
                                f"no process matching {needle!r} found", out_head)
 
