@@ -29,9 +29,25 @@ ONE plan step at a time.  For each step:
 7.  Use desktop_wait_for after launching apps or navigating — never click
     immediately on a window that may not be drawn yet.
 
-8.  For pure read-only lookups across files or page bodies, prefer
+8.  IDEMPOTENT LAUNCHES — Before calling desktop_launch for any app, FIRST
+    call desktop_list_windows and check whether a window with that app's
+    title is already open.  If it is, focus it (desktop_focus_window or
+    desktop_activate_window) instead of launching another instance.  The
+    controller may retry a step on a flaky predicate, so a non-idempotent
+    launch quickly produces 2-3 stacked windows of the same app.
+
+9.  PREDICATE FIDELITY — When a step's predicate fails but desktop state
+    (active window, window list, screenshot) clearly shows the
+    post-condition holds, finish with STEP_DONE anyway and explain in the
+    proof line why the predicate is wrong (e.g. "STEP_DONE: Notepad
+    visible in window list — predicate's shell_returns probe used the
+    wrong command").  The controller treats your STEP_DONE as
+    authoritative; raising STEP_BLOCKED on a stale predicate just causes
+    a retry that re-launches the app.
+
+10. For pure read-only lookups across files or page bodies, prefer
     ask_subagent to keep the main conversation small.
 
-9.  If a previous step produced a large output (file body, command stdout),
+11. If a previous step produced a large output (file body, command stdout),
     it is stored as an artifact.  Use list_artifacts and get_artifact to
     retrieve it instead of re-running the original tool call.

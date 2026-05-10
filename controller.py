@@ -314,6 +314,18 @@ def build_step_prompt(
         parts.append(f"tools to consider: {', '.join(step.tools_hint)}")
     if step.depends_on:
         parts.append(f"depends on completed steps: {', '.join(step.depends_on)}")
+    if step.attempts > 1:
+        # Tell the model this is a retry so it doesn't blindly re-run
+        # the same launch / click / type and stack duplicate state
+        # (e.g. three Notepad windows from three retries).  The previous
+        # attempt's last_error gives the model a chance to diagnose
+        # before acting again.
+        parts.append(f"attempt: {step.attempts} (this is a RETRY — first verify "
+                     "the world isn't already in the desired state before re-running "
+                     "the same action; e.g. desktop_list_windows before another "
+                     "desktop_launch)")
+        if step.last_error:
+            parts.append(f"previous failure: {step.last_error[:200]}")
     if completed_actions_summary:
         parts.append("")
         parts.append("ALREADY DONE\n============")
