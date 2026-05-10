@@ -324,23 +324,28 @@ def build_step_prompt(
     """
     Compose the per-step prompt the controller sends to the executor.
 
-    The executor sees the full plan (so it can adapt) but is told to
-    focus on the current step.  When it succeeds it emits a final
-    assistant message containing the post-condition observation; the
-    controller then marks the step DONE.
+    The prompt is intentionally STEP-CENTRIC, not task-centric: the
+    full user input + full plan are surfaced as background reference,
+    NOT as the active goal.  The executor's only job this turn is to
+    satisfy the CURRENT STEP's post-condition and stop — without that
+    framing the model would routinely conflate the entire user task
+    into step 1, launching the app + focusing + typing in a single
+    iteration, then having nothing left to do for steps 2 and 3 (which
+    then exhaust their iteration budgets).  When the step's
+    post-condition holds, the model emits a final assistant message
+    containing the proof and the controller marks the step DONE.
     """
     parts = [
-        f"USER TASK\n=========\n{user_input}",
-        "",
-        "PLAN STATUS\n===========",
-        plan.render_for_prompt(),
-        "",
-        f"CURRENT STEP\n============\n"
+        # Lead with the current step so the model anchors on it before
+        # ever seeing the full task description.  The CURRENT STEP block
+        # is the active instruction; everything below is reference.
+        f"CURRENT STEP — DO THIS AND STOP\n"
+        f"================================\n"
         f"id: {step.id}\n"
         f"goal: {step.goal}",
     ]
     if step.expected:
-        parts.append(f"expected outcome: {step.expected}")
+        parts.append(f"expected outcome (the ONLY thing this step verifies): {step.expected}")
     if step.tools_hint:
         parts.append(f"tools to consider: {', '.join(step.tools_hint)}")
     if step.depends_on:
@@ -359,23 +364,39 @@ def build_step_prompt(
             parts.append(f"previous failure: {step.last_error[:200]}")
     if completed_actions_summary:
         parts.append("")
-        parts.append("ALREADY DONE\n============")
+        parts.append("ALREADY DONE (do not redo)\n==========================")
         parts.append(completed_actions_summary)
     if artifact_index_summary:
         parts.append("")
         parts.append("AVAILABLE ARTIFACTS\n===================")
         parts.append(artifact_index_summary)
 
+    # Background context — surfaced after the active instruction so the
+    # model doesn't read it first and decide to do "the whole thing".
     parts += [
+        "",
+        "BACKGROUND (reference only — NOT the goal this turn)",
+        "===================================================",
+        f"original user request: {user_input}",
+        "",
+        "full plan trajectory (your CURRENT STEP is one slice of this):",
+        plan.render_for_prompt(),
         "",
         "INSTRUCTIONS",
         "============",
-        "Work on the CURRENT STEP only — earlier DONE steps are settled, later",
-        "PENDING steps are not your concern this turn.  When the step's",
-        "expected outcome holds, finish with a final assistant message that",
-        "starts with `STEP_DONE: <one-line proof of post-condition>`.  If you",
-        "cannot complete the step, finish with `STEP_BLOCKED: <reason>` so the",
-        "controller can replan.  Do not narrate intent — call tools.",
+        "Work on the CURRENT STEP and ONLY the CURRENT STEP.  The full plan",
+        "and original request are shown above as background only — the",
+        "controller will hand you the next step automatically.  If you find",
+        "yourself launching the app AND focusing AND typing in the same",
+        "iteration, you are doing too much: stop after the action that",
+        "satisfies the CURRENT STEP's expected outcome.  Earlier DONE steps",
+        "are settled; later PENDING steps are not your concern this turn.",
+        "",
+        "When the step's expected outcome holds, finish with a final",
+        "assistant message that starts with `STEP_DONE: <one-line proof of",
+        "post-condition>`.  If you cannot complete the step, finish with",
+        "`STEP_BLOCKED: <reason>` so the controller can replan.  Do not",
+        "narrate intent — call tools.",
     ]
     return "\n".join(parts)
 

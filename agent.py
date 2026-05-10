@@ -1149,35 +1149,67 @@ class Agent:
                 and self._predicate_check_enabled
                 and step.predicate
             ):
-                # Race-tolerant predicate verification: process_running
-                # / text_visible / window_title_contains all probe GUI
-                # state that lags the action by hundreds of
-                # milliseconds (Notepad needs a tick to show up in
-                # tasklist; OCR can't read a half-painted window).
-                # Retry up to predicate_retry_count times with a small
-                # gap so the model's STEP_DONE doesn't get demoted to
-                # BLOCKED just because we checked too soon.  The
-                # FIRST attempt runs immediately; backoff only fires
-                # between retries, not before the initial check.
-                attempt_total = 1 + self._predicate_retry_count
-                p_result = predicates.PredicateResult(
-                    ok=False, kind=str(step.predicate.get("kind", "?")),
-                    detail="predicate not yet checked",
-                )
-                for attempt in range(1, attempt_total + 1):
-                    try:
-                        p_result = await predicates.check_predicate(
-                            step.predicate, self._registry,
-                        )
-                    except Exception as e:
-                        logger.warning("[agent] predicate check raised: %s", e)
-                        p_result = predicates.PredicateResult(
-                            ok=False, kind=str(step.predicate.get("kind", "?")),
-                            detail=f"check raised: {e}",
-                        )
-                    if p_result.ok or attempt >= attempt_total:
-                        break
-                    await asyncio.sleep(self._predicate_retry_delay)
+                # Sanity-check the predicate kind BEFORE running it.  The
+                # model occasionally invents kinds like
+                # "window_exists_with_partial_match" or
+                # "element_has_focus_and_is_editable" that aren't in
+                # PREDICATE_KINDS.  predicates.normalize() returns None for
+                # those, and check_predicate would then return ok=False
+                # with "predicate normalised to None" — treating an
+                # invalid kind as a verified failure, demoting STEP_DONE
+                # to BLOCKED and forcing a replan.  But the model's action
+                # may have actually succeeded!  Treat invalid-kind as
+                # "skip the check, accept STEP_DONE", log a warning so
+                # the planner authoring is visible, and move on.
+                predicate_skipped = False
+                if predicates.normalize(step.predicate) is None:
+                    logger.warning(
+                        "[agent] step %s predicate kind %r is not a recognised "
+                        "PREDICATE_KIND — skipping verification and accepting "
+                        "STEP_DONE.  Tell the planner to use one of: %s",
+                        step.id,
+                        step.predicate.get("kind") or step.predicate.get("type"),
+                        ", ".join(predicates.PREDICATE_KINDS),
+                    )
+                    p_result = predicates.PredicateResult(
+                        ok=True, kind="(skipped)",
+                        detail=(
+                            "invalid predicate kind "
+                            f"{step.predicate.get('kind') or step.predicate.get('type')!r}"
+                            " — verification skipped (the model's STEP_DONE is authoritative)"
+                        ),
+                    )
+                    predicate_skipped = True
+                else:
+                    # Race-tolerant predicate verification: process_running
+                    # / text_visible / window_title_contains all probe GUI
+                    # state that lags the action by hundreds of
+                    # milliseconds (Notepad needs a tick to show up in
+                    # tasklist; OCR can't read a half-painted window).
+                    # Retry up to predicate_retry_count times with a small
+                    # gap so the model's STEP_DONE doesn't get demoted to
+                    # BLOCKED just because we checked too soon.  The
+                    # FIRST attempt runs immediately; backoff only fires
+                    # between retries, not before the initial check.
+                    attempt_total = 1 + self._predicate_retry_count
+                    p_result = predicates.PredicateResult(
+                        ok=False, kind=str(step.predicate.get("kind", "?")),
+                        detail="predicate not yet checked",
+                    )
+                    for attempt in range(1, attempt_total + 1):
+                        try:
+                            p_result = await predicates.check_predicate(
+                                step.predicate, self._registry,
+                            )
+                        except Exception as e:
+                            logger.warning("[agent] predicate check raised: %s", e)
+                            p_result = predicates.PredicateResult(
+                                ok=False, kind=str(step.predicate.get("kind", "?")),
+                                detail=f"check raised: {e}",
+                            )
+                        if p_result.ok or attempt >= attempt_total:
+                            break
+                        await asyncio.sleep(self._predicate_retry_delay)
                 yield AgentEvent(
                     kind="predicate",
                     content=("predicate ok: " if p_result.ok else "predicate FAILED: ")
@@ -1599,14 +1631,22 @@ class Agent:
                     shot_b64 = shot_obj.pop("base64_png", None)
                     if shot_obj.get("error"):
                         # Make sure the user (and the model) sees why
-                        # screenshots aren't being saved.  Without this
-                        # the silent failure looks like "no screenshot
-                        # appeared after I clicked".
+                        # screenshots aren't being saved.  Three places
+                        # surface the failure: the model's local_history
+                        # (so the next turn can diagnose), a logger.warning
+                        # (which the TUI's WARNING-level log bridge picks
+                        # up and renders in the conversation pane), and
+                        # the agent log file.
+                        err_msg = str(shot_obj.get("error"))[:200]
+                        logger.warning(
+                            "[agent] step %s auto-screenshot after %s FAILED: %s",
+                            step.id, ", ".join(sorted(state_changing)), err_msg,
+                        )
                         local_history.append({
                             "role": "user",
                             "content": (
                                 f"[Auto-screenshot after {', '.join(sorted(state_changing))} "
-                                f"FAILED: {str(shot_obj.get('error'))[:200]}]"
+                                f"FAILED: {err_msg}]"
                             ),
                         })
                     elif self._vision_screenshots and shot_b64:
