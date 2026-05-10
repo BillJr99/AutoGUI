@@ -1456,9 +1456,63 @@ class Agent:
             {"role": "user", "content": step_prompt},
         ]
 
+        # Pre-step baseline screenshot — give the model accurate visual
+        # ground truth before its first action so it doesn't assume
+        # state from the prompt text alone.  Without this the model
+        # tends to treat the step's `expected outcome` as already true
+        # and skip straight to STEP_DONE, or duplicate work that's
+        # already been done (extra Notepad windows on retry).  Skipped
+        # silently when vision is off, the screenshot tool isn't
+        # registered, or the capture fails — we never want a baseline
+        # screenshot failure to abort the step.
+        if (
+            self._vision_screenshots
+            and "desktop_screenshot" in self._registry.list_tools()
+        ):
+            try:
+                baseline_json = await self._registry.dispatch("desktop_screenshot", {})
+                baseline_obj = json.loads(baseline_json)
+                baseline_b64 = baseline_obj.pop("base64_png", None)
+                if baseline_b64 and not baseline_obj.get("error"):
+                    local_history.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"[Baseline screenshot for step {step.id} — "
+                                    "this is the WORLD STATE BEFORE you act.  "
+                                    "Inspect the windows, layout, and any visible "
+                                    "text first; only call tools whose effect is "
+                                    "needed to satisfy the CURRENT STEP's expected "
+                                    "outcome.  If the expected outcome already "
+                                    "appears to hold here, finish with STEP_DONE "
+                                    "WITHOUT taking redundant actions.]"
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64," + baseline_b64},
+                            },
+                        ],
+                    })
+                elif baseline_obj.get("error"):
+                    logger.warning(
+                        "[agent] step %s baseline screenshot failed: %s",
+                        step.id, str(baseline_obj.get("error"))[:200],
+                    )
+            except Exception as e:
+                logger.warning("[agent] step %s baseline screenshot raised: %s", step.id, e)
+
         last_text = ""
         last_failure = None
         iterations = 0
+        # BLOCKED retry guard: once we've fed the model a "does this
+        # screenshot change your mind?" reminder we don't want to do it
+        # again every iteration — that becomes a loop where the model
+        # alternates STEP_BLOCKED + screenshot reminder until iterations
+        # exhaust.  One chance, then accept the second STEP_BLOCKED.
+        blocked_screenshot_retry_used = False
 
         while iterations < self._step_max_iterations:
             iterations += 1
@@ -1501,6 +1555,60 @@ class Agent:
             if not tool_calls:
                 # Final assistant message — parse the marker.
                 verdict, reason = parse_step_outcome(text)
+                # On the FIRST STEP_BLOCKED in a step, give the model
+                # one more chance with a fresh screenshot.  Models
+                # frequently issue STEP_BLOCKED prematurely — the action
+                # actually succeeded, the OCR / window-list check just
+                # didn't fire correctly, OR the screen genuinely shows
+                # the post-condition holds and the model didn't notice.
+                # Feed the current screen back as visual evidence and
+                # ask "does this change your assessment?".  Only one
+                # such retry per step; a second STEP_BLOCKED is honoured.
+                if (
+                    verdict == StepVerdict.BLOCKED
+                    and not blocked_screenshot_retry_used
+                    and self._vision_screenshots
+                    and "desktop_screenshot" in self._registry.list_tools()
+                ):
+                    blocked_screenshot_retry_used = True
+                    try:
+                        review_json = await self._registry.dispatch("desktop_screenshot", {})
+                        review_obj = json.loads(review_json)
+                        review_b64 = review_obj.pop("base64_png", None)
+                        if review_b64 and not review_obj.get("error"):
+                            local_history.append({
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            f"[STEP_BLOCKED reconsider — before the "
+                                            f"controller replans step {step.id}, look at "
+                                            f"the CURRENT desktop state captured just "
+                                            f"now.  Does this screenshot show the step's "
+                                            f"expected outcome ({step.expected!r}) "
+                                            f"already holding?  If YES, finish with "
+                                            f"`STEP_DONE: <proof from this screenshot>`.  "
+                                            f"If the post-condition genuinely doesn't "
+                                            f"hold, repeat your `STEP_BLOCKED: <reason>` "
+                                            f"so the controller knows to replan.]"
+                                        ),
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": "data:image/png;base64," + review_b64},
+                                    },
+                                ],
+                            })
+                            # Don't return yet — let the loop run another
+                            # iteration so the model can react to the
+                            # screenshot.
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            "[agent] step %s STEP_BLOCKED screenshot retry raised: %s",
+                            step.id, e,
+                        )
                 return verdict, reason or text[:200], iterations, last_failure
 
             # Watchdog: hash (state + first proposed tool/args) and bail
@@ -1656,9 +1764,16 @@ class Agent:
                                 {
                                     "type": "text",
                                     "text": (
-                                        f"[Auto-verify screenshot after "
+                                        f"[Auto-screenshot AFTER "
                                         f"{', '.join(sorted(state_changing))} — "
-                                        "examine before deciding STEP_DONE]"
+                                        f"compare this to the step's expected "
+                                        f"outcome ({step.expected!r}).  Issue "
+                                        f"STEP_DONE only if the screen confirms "
+                                        f"the action took effect; if you can't "
+                                        f"tell from the image, call "
+                                        f"desktop_find_text or desktop_get_window_text "
+                                        f"to verify before finishing.  Do NOT issue "
+                                        f"STEP_DONE on assumed success.]"
                                     ),
                                 },
                                 {
