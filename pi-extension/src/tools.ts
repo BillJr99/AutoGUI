@@ -642,40 +642,50 @@ export function createDesktopTools(
 
   ];
 
-  // ── Skills (only when skillsEnabled and a SkillStore exists) ─────────
+  // ── Skills ──────────────────────────────────────────────────────────
+  // skill_list and skill_run are read-only: registered whenever a
+  // SkillStore exists so an existing library remains usable even when
+  // creation is disabled.  skill_save is gated behind cfg.skillsEnabled
+  // because it writes new records to disk.
   if (options.skillStore) {
     const store = options.skillStore;
+
+    if (cfg.skillsEnabled) {
+      definitions.push(
+        defineTool({
+          name: "skill_save",
+          label: "Save Skill",
+          description: "Save the sequence of tool calls completed in this session as a named, replayable skill. Provide keywords describing when this skill applies. Call after the task has succeeded.",
+          promptSnippet: "skill_save: persist the recipe of what worked as a named skill.",
+          parameters: Type.Object({
+            name: Type.String(),
+            keywords: Type.Optional(Type.Array(Type.String())),
+            app: Type.Optional(Type.String()),
+          }),
+          executionMode: "sequential",
+          execute: wrap("skill_save", async (params, _signal) => {
+            if (!options.sessionSteps.length) {
+              return textResult("No successful steps in this session yet to save.", { error: "no steps" });
+            }
+            const skill = await store.save({
+              name: params.name,
+              keywords: params.keywords ?? [],
+              app: params.app ?? "",
+              steps: [...options.sessionSteps],
+            });
+            return textResult(`Saved skill ${JSON.stringify(skill.name)} with ${skill.steps.length} steps.`, {
+              name: skill.name,
+              keywords: skill.keywords,
+              app: skill.app,
+              step_count: skill.steps.length,
+              created: skill.created,
+            });
+          }),
+        }),
+      );
+    }
+
     definitions.push(
-      defineTool({
-        name: "skill_save",
-        label: "Save Skill",
-        description: "Save the sequence of tool calls completed in this session as a named, replayable skill. Provide keywords describing when this skill applies. Call after the task has succeeded.",
-        promptSnippet: "skill_save: persist the recipe of what worked as a named skill.",
-        parameters: Type.Object({
-          name: Type.String(),
-          keywords: Type.Optional(Type.Array(Type.String())),
-          app: Type.Optional(Type.String()),
-        }),
-        executionMode: "sequential",
-        execute: wrap("skill_save", async (params, _signal) => {
-          if (!options.sessionSteps.length) {
-            return textResult("No successful steps in this session yet to save.", { error: "no steps" });
-          }
-          const skill = await store.save({
-            name: params.name,
-            keywords: params.keywords ?? [],
-            app: params.app ?? "",
-            steps: [...options.sessionSteps],
-          });
-          return textResult(`Saved skill ${JSON.stringify(skill.name)} with ${skill.steps.length} steps.`, {
-            name: skill.name,
-            keywords: skill.keywords,
-            app: skill.app,
-            step_count: skill.steps.length,
-            created: skill.created,
-          });
-        }),
-      }),
       defineTool({
         name: "skill_list",
         label: "List Skills",

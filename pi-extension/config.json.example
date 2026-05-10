@@ -1,7 +1,7 @@
 {
   "_comment": "Optional config file for the AutoGUI Pi extension. Copy to pi-extension/config.json (or ~/.autogui/pi-extension.json) and edit. Every key has a sensible default — leave a key out to keep its default. The extension also boots cleanly with no config file at all.",
 
-  "_skills_section": "Skills (replayable macros) are OFF by default. Set skillsEnabled=true to register skill_save / skill_list / skill_run and persist successful tool sequences. When enabled, the pi-extension stores its skills in pi-extension/runtime/skills/skills.jsonl (its own library, separate from the standalone Python agent's ./skills/skills.jsonl). Leave skillsPath empty to use that default; supply an absolute path to override it. The directory is created automatically and is git-ignored (covered by pi-extension/runtime/).",
+  "_skills_section": "skillsEnabled controls CREATION ONLY. When false (the default) skill_save is NOT registered and the extension never writes a skills.jsonl on disk — but skill_list, skill_run, and the candidate-skills suggestion that /autogui prepends to the prompt are always available, so any skills already at skillsPath remain readable and replayable. Set skillsEnabled=true to allow new skills to be recorded. Default storage is pi-extension/runtime/skills/skills.jsonl — its own library, separate from the standalone Python agent's ./skills/skills.jsonl, so the two don't shadow each other. Leave skillsPath empty to use the default; supply an absolute path to override (point both sides at the same path if you want a shared library). The directory is created lazily on first save and is git-ignored under pi-extension/runtime/.",
   "skillsEnabled": false,
   "skillsPath": "",
 

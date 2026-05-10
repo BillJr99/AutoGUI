@@ -16,7 +16,7 @@
     "vision_screenshots": true,
     "record_trace": true,
     "trace_dir": "logs/traces",
-    "_skills_comment": "Skills (replayable macros) are OFF by default. Set skills_enabled=true to record successful tool sequences as named, replayable skills. When enabled, the standalone agent stores them in ./skills/skills.jsonl relative to the project root — separate from the pi-extension's own library at pi-extension/runtime/skills/skills.jsonl. The directory is git-ignored and created automatically on first save. suggest_skills controls whether matching skills are surfaced at task start; it has no effect when skills_enabled=false.",
+    "_skills_comment": "skills_enabled controls CREATION ONLY. When false (the default) the agent will NOT register skill_save and will NOT write a skills/ directory or skills.jsonl on disk — but skill_list, skill_run, and the candidate-skills suggestion at task start are always available, so any skills already on disk remain readable and replayable. Set skills_enabled=true to allow new skills to be recorded. The standalone agent uses ./skills/skills.jsonl relative to the project root, intentionally distinct from the pi-extension's pi-extension/runtime/skills/skills.jsonl so each side has its own library. The directory is git-ignored and created lazily the first time skill_save fires. suggest_skills toggles the candidate-skills block at task start regardless of skills_enabled.",
     "skills_enabled": false,
     "suggest_skills": true,
     "skills_path": "skills/skills.jsonl",

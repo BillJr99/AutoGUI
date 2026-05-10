@@ -18,8 +18,9 @@ This extension is decoupled from OpenWebUI. It does not create a model client, m
   - `desktop_list_windows`, `desktop_active_window`, `desktop_focus_window`
   - `desktop_launch`, `desktop_get_cursor_pos`, `desktop_mouse_move`
   - `desktop_get_window_text`
-- Skill library (replayable macros, **opt-in** — registered only when `skillsEnabled=true`):
-  - `skill_save`, `skill_list`, `skill_run`
+- Skill library (replayable macros — `skillsEnabled` gates *creation* only; reads are always available):
+  - `skill_list`, `skill_run` — always registered, so existing libraries are usable.
+  - `skill_save` — registered only when `skillsEnabled=true` (default false).
 - Browser tools (registered when `allowedBrowser=true` in config; uses Playwright+Chromium):
   - `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`
   - `browser_click`, `browser_fill`, `browser_press`
@@ -42,7 +43,7 @@ Each step gracefully degrades: if Tesseract isn't installed `desktop_click_text`
 ## Other Features
 
 - **Planner**: when `plannerEnabled=true` (default) the `/autogui` system prompt instructs the model to produce a numbered plan as its first message before executing. No separate LLM call — Pi owns the model loop.
-- **Skill library** (opt-in): off by default. Set `skillsEnabled: true` in `pi-extension/config.json` to register `skill_save` / `skill_list` / `skill_run` and persist successful tool sequences. When enabled, the extension snapshots them as JSONL at **`pi-extension/runtime/skills/skills.jsonl`** — its own private library, deliberately separate from the standalone Python agent's `./skills/skills.jsonl` so the two don't shadow each other. `/autogui` then retrieves the top-3 candidate skills for the current task and lists them in the prompt; `skill_run` replays one deterministically through the same backend. Override the path with `skillsPath` (absolute) — leave it empty to use the runtime default. Both the directory and the file are created automatically on first save and are git-ignored.
+- **Skill library**: `skillsEnabled` controls *creation* only. When false (the default) the extension does NOT register `skill_save` and never writes a skills file to disk — but `skill_list`, `skill_run`, and the candidate-skills block that `/autogui` prepends to the prompt are always available, so any existing skills at `skillsPath` remain readable and replayable. Set `skillsEnabled: true` in `pi-extension/config.json` to allow creation. When skills are written they go to **`pi-extension/runtime/skills/skills.jsonl`** — its own private library, deliberately separate from the standalone Python agent's `./skills/skills.jsonl` so the two don't shadow each other. Override the path with `skillsPath` (absolute) — leave it empty to use the runtime default; point it at the same path as the mainline if you want a shared library. The directory is created lazily on first save and is git-ignored.
 - **Trajectory log**: every tool call (start, success, failure) is appended to `pi-extension/runtime/traces/<session>.jsonl` for post-hoc inspection.
 - **Failure recording**: a daemon thread maintains a 5-second rolling screen buffer; on any tool failure it dumps the frames as an animated GIF (via ImageMagick) into `runtime/failures/` so you can see *how* the agent got into trouble.
 - **Action scoping & dry-run**: `allowedApps`, `blockedWindowTitles`, and `dryRun` config flags gate every state-changing tool. Default is unrestricted; turn them on for sensitive contexts.
@@ -65,7 +66,7 @@ Every key has a sensible default — leave the file out and everything works. Se
 - `dryRun` / `allowedApps` / `blockedWindowTitles`: safety gates.
 - `plannerEnabled`: planner-first protocol in the system prompt.
 - `controllerEnabled`: typed-plan + step-by-step protocol; injects the `plan_set` / `plan_update_step` / `checkpoint` workflow into the prompt and wires the plan slot to the new meta-tools.
-- `skillsEnabled` (default `false`): set true to register `skill_save` / `skill_list` / `skill_run` and start writing skills to `runtime/skills/skills.jsonl`.  Override the path with `skillsPath` (absolute).
+- `skillsEnabled` (default `false`): creation gate. False blocks `skill_save`; `skill_list`, `skill_run`, and the candidate-skills suggestion are always available so any existing library at `skillsPath` stays usable. Override the path with `skillsPath` (absolute).
 - `artifactsDir` / `progressDir`: locations for the artifact store and per-task progress records (default `runtime/artifacts/` and `runtime/progress/`; empty string disables that store entirely).
 - `screenRecord.*`: rolling screen buffer for failure post-mortem.
 
@@ -225,7 +226,7 @@ All runtime output lives under `pi-extension/runtime/` (git-ignored):
 
 | Path | Contents |
 |------|----------|
-| `runtime/skills/skills.jsonl` | **Skill library** — only when `skillsEnabled=true`; saved with `skill_save`, replayed with `skill_run` |
+| `runtime/skills/skills.jsonl` | **Skill library** — created the first time `skill_save` runs (which requires `skillsEnabled=true`); reads via `skill_list`/`skill_run` work regardless of the flag |
 | `runtime/traces/` | Per-session JSONL trajectory logs |
 | `runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
 | `runtime/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |

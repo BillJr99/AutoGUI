@@ -133,15 +133,14 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
     cfg = await getConfig();
     omitScreenshotImages = !cfg.visionEnabled;
     cache.configure(cfg.perceptionCacheTtlMs);
-    // Skills are OPT-IN: only construct the SkillStore when the user has
-    // explicitly enabled skill capture.  This keeps the extension from
-    // writing a skills.jsonl file on disk for users who don't want it,
-    // and gates skill_save / skill_list / skill_run registration in
-    // tools.ts via the same flag.
-    if (cfg.skillsEnabled) {
-      skillStore = new SkillStore(cfg.skillsPath);
-    } else {
-      await logger.log("init.skills_disabled", { reason: "skillsEnabled=false" });
+    // SkillStore is constructed unconditionally — its constructor does
+    // NOT touch the disk, so existing skill libraries remain readable
+    // and replayable while the extension never creates a skills.jsonl
+    // for users who don't opt in.  cfg.skillsEnabled gates only
+    // skill_save (creation) — skill_list and skill_run stay available.
+    skillStore = new SkillStore(cfg.skillsPath);
+    if (!cfg.skillsEnabled) {
+      await logger.log("init.skill_save_disabled", { reason: "skillsEnabled=false; reads still allowed" });
     }
     if (cfg.artifactsDir) {
       artifactStore = new ArtifactStore(cfg.artifactsDir);
@@ -261,9 +260,10 @@ ${autoGuiTask}`;
   // closures see the real config / skill store / browser.
   void init.then(async () => {
     if (!cfg) return;
-    // Skills only construct when enabled; otherwise skillStore stays
-    // undefined and tools.ts skips skill_save / skill_list / skill_run.
-    if (!skillStore && cfg.skillsEnabled) skillStore = new SkillStore(cfg.skillsPath);
+    // SkillStore is built unconditionally so existing skills can be
+    // listed and replayed; tools.ts uses cfg.skillsEnabled to decide
+    // whether to register the *creation* tool (skill_save).
+    if (!skillStore) skillStore = new SkillStore(cfg.skillsPath);
     if (!trace) trace = new TraceWriter(cfg.traceDir);
     const tools = createDesktopTools(getBackend, screenshotDir, logger, {
       omitScreenshotImages: () => omitScreenshotImages,
@@ -324,8 +324,10 @@ ${autoGuiTask}`;
       let prompt = buildAutoGuiPrompt(c, backend);
 
       // Skill suggestion: top-3 candidate skills whose keywords match the task.
-      // Skipped entirely when skills are disabled — no SkillStore, no
-      // candidate block, no on-disk state.
+      // Always runs (read-only) so an existing skill library is surfaced
+      // even when skill_save is disabled.  search() returns [] if the
+      // skills file does not exist, which keeps this a no-op for users
+      // who have never opted in to creation.
       if (skillStore) {
         try {
           const candidates = await skillStore.search(task, 3);

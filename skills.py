@@ -77,10 +77,14 @@ class SkillStore:
     """JSONL-backed skill library with simple keyword retrieval."""
 
     def __init__(self, path: str = "~/.autogui/skills.jsonl"):
+        # Lazy-create semantics: the constructor must NOT touch the disk.
+        # The skills/ directory and the JSONL file are only created the
+        # first time something is written (see _rewrite).  This means a
+        # SkillStore can be constructed read-only — if the file does not
+        # exist, .all() returns [] without leaving any artefacts on disk.
+        # New skills are only persisted when the agent calls save(), which
+        # requires the caller to have explicitly enabled creation.
         self.path = Path(path).expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.path.touch()
 
     # ------------------------------------------------------------------
     # Read
@@ -178,6 +182,10 @@ class SkillStore:
 
     def _rewrite(self, skills: list[dict]):
         # Atomic rewrite to avoid corrupting the file mid-write.
+        # Parent directory is created here, not at construction, so a
+        # read-only SkillStore that never saves leaves no skills/ folder
+        # behind.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             for s in skills:
