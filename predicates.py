@@ -307,6 +307,34 @@ async def _check_text_visible(p: dict, registry) -> PredicateResult:
                            "no OCR backend available for text-visible check")
 
 
+def _is_wsl_runtime() -> bool:
+    """True when running under WSL (kernel release contains 'microsoft')."""
+    import platform as _p
+    if _p.system() != "Linux":
+        return False
+    try:
+        with open("/proc/version", "r", encoding="utf-8") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+async def _run_process_query(needle: str, cmd: str, registry, kind: str) -> tuple[bool, str]:
+    """Dispatch ``cmd`` via shell_run and return (found, stdout_head).
+
+    Helper for _check_process so we can probe multiple shells (POSIX
+    pgrep + Windows tasklist via WSL interop) and stop at the first
+    success without duplicating the dispatch / parse logic.
+    """
+    raw = await registry.dispatch("shell_run", {"command": cmd})
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        return False, ""
+    out = (result.get("stdout") or "")
+    return needle.lower() in out.lower(), out[:160]
+
+
 async def _check_process(p: dict, registry) -> PredicateResult:
     needle = str(p.get("value") or "")
     if not needle:
@@ -320,28 +348,43 @@ async def _check_process(p: dict, registry) -> PredicateResult:
     # single-quote handling) and reject metacharacter-bearing needles
     # on Windows where tasklist's /FI takes a quoted string and there
     # is no portable single-quote-escaping equivalent.
+    has_meta = any(ch in needle for ch in '"&|<>%^')
+
     if _p.system() == "Windows":
-        if any(ch in needle for ch in '"&|<>%^'):
+        if has_meta:
             return PredicateResult(
                 False, p["kind"],
                 f"refusing to query process: needle {needle!r} contains shell metacharacters",
             )
+        # On Windows native, tasklist is on PATH and runs through cmd.
         cmd = f'tasklist /FI "IMAGENAME eq {needle}*"'
-    else:
-        # `--` defangs a needle that starts with `-` so pgrep treats it
-        # as a pattern instead of an unknown option.  shlex.quote still
-        # handles the value's metacharacters.
-        cmd = f"pgrep -lf -- {shlex.quote(needle)}"
-    raw = await registry.dispatch("shell_run", {"command": cmd})
-    try:
-        result = json.loads(raw)
-    except json.JSONDecodeError:
-        return PredicateResult(False, p["kind"], "shell result unparsable")
-    out = (result.get("stdout") or "")
-    if needle.lower() in out.lower():
-        return PredicateResult(True, p["kind"], "process found", out[:160])
+        found, out_head = await _run_process_query(needle, cmd, registry, p["kind"])
+        if found:
+            return PredicateResult(True, p["kind"], "process found", out_head)
+        return PredicateResult(False, p["kind"],
+                               f"no process matching {needle!r} found", out_head)
+
+    # POSIX (including WSL): start with pgrep against the Linux side.
+    pgrep_cmd = f"pgrep -lf -- {shlex.quote(needle)}"
+    found, pgrep_head = await _run_process_query(needle, pgrep_cmd, registry, p["kind"])
+    if found:
+        return PredicateResult(True, p["kind"], "process found (Linux)", pgrep_head)
+
+    # WSL: a Windows GUI app like notepad.exe doesn't appear in pgrep —
+    # it's a Windows process invisible to the Linux kernel.  Also probe
+    # tasklist.exe via interop so window-side processes register.
+    if _is_wsl_runtime() and not has_meta:
+        # Try plain tasklist first (works when appendWindowsPath=true);
+        # then fall back to the absolute /mnt/c path that interop
+        # always honours regardless of $PATH.
+        for tasklist_bin in ("tasklist.exe", "/mnt/c/Windows/System32/tasklist.exe"):
+            win_cmd = f'{tasklist_bin} /FI "IMAGENAME eq {needle}*"'
+            found, tl_head = await _run_process_query(needle, win_cmd, registry, p["kind"])
+            if found:
+                return PredicateResult(True, p["kind"], "process found (Windows via interop)", tl_head)
+
     return PredicateResult(False, p["kind"],
-                           f"no process matching {needle!r} found", out[:160])
+                           f"no process matching {needle!r} found", pgrep_head)
 
 
 async def _check_shell(p: dict, registry) -> PredicateResult:

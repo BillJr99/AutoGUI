@@ -320,6 +320,19 @@ class Agent:
         self._predicate_check_enabled: bool = bool(
             controller_cfg.get("predicate_check_enabled", True)
         )
+        # Predicate retries: GUI state (process_running, text_visible,
+        # window_title_contains) is racy — Notepad takes a moment to
+        # show up in tasklist after desktop_launch returns, OCR may
+        # fail to read text on a screen that hasn't repainted yet.
+        # Retry the check a few times with a short gap so a transient
+        # miss doesn't tank a step that actually succeeded.  Set
+        # predicate_retry_count=0 to disable.
+        self._predicate_retry_count: int = max(
+            0, int(controller_cfg.get("predicate_retry_count", 3))
+        )
+        self._predicate_retry_delay: float = max(
+            0.0, float(controller_cfg.get("predicate_retry_delay_seconds", 0.5))
+        )
         self._visual_diff_enabled: bool = bool(
             controller_cfg.get("visual_diff_enabled", True)
         )
@@ -1136,16 +1149,35 @@ class Agent:
                 and self._predicate_check_enabled
                 and step.predicate
             ):
-                try:
-                    p_result = await predicates.check_predicate(
-                        step.predicate, self._registry,
-                    )
-                except Exception as e:
-                    logger.warning("[agent] predicate check raised: %s", e)
-                    p_result = predicates.PredicateResult(
-                        ok=False, kind=str(step.predicate.get("kind", "?")),
-                        detail=f"check raised: {e}",
-                    )
+                # Race-tolerant predicate verification: process_running
+                # / text_visible / window_title_contains all probe GUI
+                # state that lags the action by hundreds of
+                # milliseconds (Notepad needs a tick to show up in
+                # tasklist; OCR can't read a half-painted window).
+                # Retry up to predicate_retry_count times with a small
+                # gap so the model's STEP_DONE doesn't get demoted to
+                # BLOCKED just because we checked too soon.  The
+                # FIRST attempt runs immediately; backoff only fires
+                # between retries, not before the initial check.
+                attempt_total = 1 + self._predicate_retry_count
+                p_result = predicates.PredicateResult(
+                    ok=False, kind=str(step.predicate.get("kind", "?")),
+                    detail="predicate not yet checked",
+                )
+                for attempt in range(1, attempt_total + 1):
+                    try:
+                        p_result = await predicates.check_predicate(
+                            step.predicate, self._registry,
+                        )
+                    except Exception as e:
+                        logger.warning("[agent] predicate check raised: %s", e)
+                        p_result = predicates.PredicateResult(
+                            ok=False, kind=str(step.predicate.get("kind", "?")),
+                            detail=f"check raised: {e}",
+                        )
+                    if p_result.ok or attempt >= attempt_total:
+                        break
+                    await asyncio.sleep(self._predicate_retry_delay)
                 yield AgentEvent(
                     kind="predicate",
                     content=("predicate ok: " if p_result.ok else "predicate FAILED: ")
@@ -1531,6 +1563,82 @@ class Agent:
                     "tool_call_id": call_id,
                     "content": history_content,
                 })
+
+            # Auto-screenshot after state-changing desktop actions —
+            # mirrors the legacy _run_inner behaviour so the model can
+            # SEE the consequences of its action before deciding the
+            # step is done.  Skipped when the model already called
+            # desktop_screenshot itself this iteration (the result is
+            # already in local_history) and when none of the called
+            # tools were state-changing (read-only steps don't need a
+            # post-action screenshot).
+            called_names = {tc.get("function", {}).get("name", "") for tc in tool_calls}
+            state_changing = {
+                n for n in called_names
+                if n.startswith("desktop_")
+                and n not in (
+                    "desktop_screenshot", "desktop_screenshot_marked",
+                    "desktop_list_windows", "desktop_get_active_window",
+                    "desktop_get_cursor_pos", "desktop_get_window_text",
+                    "desktop_get_window_tree", "desktop_find_element",
+                    "desktop_find_text",
+                )
+                or n.startswith("browser_") and n not in (
+                    "browser_get_text", "browser_screenshot",
+                )
+            }
+            if (
+                state_changing
+                and "desktop_screenshot" in self._registry.list_tools()
+                and "desktop_screenshot" not in called_names
+                and "desktop_screenshot_marked" not in called_names
+            ):
+                try:
+                    shot_json = await self._registry.dispatch("desktop_screenshot", {})
+                    shot_obj = json.loads(shot_json)
+                    shot_b64 = shot_obj.pop("base64_png", None)
+                    if shot_obj.get("error"):
+                        # Make sure the user (and the model) sees why
+                        # screenshots aren't being saved.  Without this
+                        # the silent failure looks like "no screenshot
+                        # appeared after I clicked".
+                        local_history.append({
+                            "role": "user",
+                            "content": (
+                                f"[Auto-screenshot after {', '.join(sorted(state_changing))} "
+                                f"FAILED: {str(shot_obj.get('error'))[:200]}]"
+                            ),
+                        })
+                    elif self._vision_screenshots and shot_b64:
+                        local_history.append({
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"[Auto-verify screenshot after "
+                                        f"{', '.join(sorted(state_changing))} — "
+                                        "examine before deciding STEP_DONE]"
+                                    ),
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "data:image/png;base64," + shot_b64},
+                                },
+                            ],
+                        })
+                    else:
+                        # Vision off OR no base64: still surface the
+                        # path so the user has a saved file to inspect
+                        # and the model knows the screenshot ran.
+                        path_str = shot_obj.get("path", "?")
+                        dims = f"{shot_obj.get('width')}×{shot_obj.get('height')}"
+                        local_history.append({
+                            "role": "user",
+                            "content": f"[Auto-screenshot saved: {path_str} ({dims})]",
+                        })
+                except Exception as e:
+                    logger.warning("[agent] controller auto-screenshot failed: %s", e)
 
             if step_failure_seen:
                 local_history.append({
