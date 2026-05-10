@@ -86,20 +86,63 @@ class PreflightReport:
 # Single-check implementations
 # ---------------------------------------------------------------------------
 
+def _is_wsl() -> bool:
+    """Linux kernel release advertises 'microsoft' under WSL2 / WSL1.
+
+    Cached at module level via lru_cache would be nicer but this runs at
+    most once per preflight check, so the read is cheap."""
+    if _platform.system() != "Linux":
+        return False
+    try:
+        with open("/proc/version", "r", encoding="utf-8") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
 async def _check_app(target: str) -> PreflightResult:
-    """Verify ``target`` resolves to an executable on PATH."""
+    """Verify ``target`` resolves to an executable on PATH.
+
+    On WSL the model often hints Windows-only apps (notepad, excel,
+    chrome) that don't appear on the Linux PATH but ARE reachable
+    through WSL interop.  We try shutil.which first, then fall back to
+    ``where.exe`` so a Windows-side resolution still passes the check.
+    """
     if not target:
         return PreflightResult(PreflightCheck("app", target), False, "empty target")
-    # On Windows, models often pass 'edge' instead of 'msedge.exe'; try
-    # a couple of common variants before giving up.
+    # Models often pass bare names like 'edge' / 'notepad' / 'excel';
+    # try the bare name first then the .exe variant on Windows AND WSL.
     candidates = [target]
-    if _platform.system() == "Windows" and not target.lower().endswith(".exe"):
+    is_windowsy = _platform.system() == "Windows" or _is_wsl()
+    if is_windowsy and not target.lower().endswith(".exe"):
         candidates.append(target + ".exe")
     for c in candidates:
         path = shutil.which(c)
         if path:
             return PreflightResult(PreflightCheck("app", target), True,
                                    f"resolved to {path}")
+    # WSL fallback: ask Windows where the executable lives.  This finds
+    # apps installed under C:\\Program Files / C:\\Windows that aren't
+    # on the WSL PATH but are perfectly launchable through interop.
+    if _is_wsl() and shutil.which("where.exe"):
+        for c in candidates:
+            try:
+                # Run synchronously in a thread so the event loop stays
+                # responsive even when 'where.exe' is slow.
+                import subprocess
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["where.exe", c],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    first = result.stdout.strip().splitlines()[0].strip()
+                    return PreflightResult(
+                        PreflightCheck("app", target), True,
+                        f"resolved via where.exe: {first}",
+                    )
+            except (OSError, subprocess.SubprocessError):
+                pass
     return PreflightResult(PreflightCheck("app", target), False,
                            "not on PATH")
 

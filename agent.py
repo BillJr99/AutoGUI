@@ -187,6 +187,19 @@ class Agent:
         self._vision_screenshots: bool = bool(self._agent_cfg.get("vision_screenshots", True))
         logger.info("[agent] vision_screenshots=%s", self._vision_screenshots)
 
+        # Pre-create the screenshots directory at startup so it's always
+        # there for the user to inspect, even if a backend's screenshot()
+        # later fails (PIL missing, ImageGrab raises, PowerShell hiccup,
+        # etc.).  Backends would otherwise create it lazily INSIDE the
+        # capture try-block — which never runs when the capture itself
+        # raises before reaching the mkdir call.
+        screenshots_dir = self._agent_cfg.get("screenshots_dir", "screenshots")
+        try:
+            from pathlib import Path as _P
+            _P(screenshots_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("[agent] could not pre-create %s: %s", screenshots_dir, e)
+
         # The message history is the single source of truth for the conversation.
         # It persists across multiple calls to run(), allowing multi-turn dialogue.
         self._history: list[dict] = [
