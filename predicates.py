@@ -65,6 +65,10 @@ _KNOWN_KINDS = frozenset({
     "process_running",
     "shell_returns",
 })
+# Public alias so external callers (agent.py, tests, dashboards) can
+# read the supported set without reaching into a single-underscore
+# private name.  Same frozenset object — no copy.
+PREDICATE_KINDS = _KNOWN_KINDS
 
 
 def normalize(predicate: Any) -> dict | None:
@@ -293,6 +297,8 @@ async def _check_text_visible(p: dict, registry) -> PredicateResult:
     if not needle:
         return PredicateResult(False, p["kind"], "empty value")
     tools = set(registry.list_tools())
+    needle_lc = needle.lower()
+    ocr_detail = ""
     if "desktop_find_text" in tools:
         raw = await registry.dispatch("desktop_find_text", {"text": needle})
         try:
@@ -300,11 +306,47 @@ async def _check_text_visible(p: dict, registry) -> PredicateResult:
         except json.JSONDecodeError:
             result = {}
         if result.get("found"):
-            return PredicateResult(True, p["kind"], f"text {needle!r} visible",
+            return PredicateResult(True, p["kind"], f"text {needle!r} visible (OCR)",
                                    result.get("match"))
-        return PredicateResult(False, p["kind"], f"text {needle!r} not on screen", result)
+        ocr_detail = "OCR did not find it"
+    # OCR fallback: a11y / Win32 GetWindowText reads the focused
+    # window's text directly, which is far more reliable than OCR for
+    # text fields (Notepad, Excel cells, browser address bars).
+    # Fires whether or not OCR was tried — both passes increase the
+    # chance of catching real "text on screen" cases that OCR misses.
+    if "desktop_get_window_text" in tools:
+        try:
+            raw = await registry.dispatch("desktop_get_window_text", {})
+            result = json.loads(raw)
+        except (json.JSONDecodeError, Exception):
+            result = {}
+        # The tool returns either {"text": "..."} or {"windows": [{"text": "..."}, ...]}
+        # depending on backend; check both shapes.
+        candidates: list[str] = []
+        if isinstance(result.get("text"), str):
+            candidates.append(result["text"])
+        for w in result.get("windows") or []:
+            if isinstance(w, dict) and isinstance(w.get("text"), str):
+                candidates.append(w["text"])
+        for body in candidates:
+            if needle_lc in body.lower():
+                return PredicateResult(
+                    True, p["kind"],
+                    f"text {needle!r} visible (read via desktop_get_window_text)",
+                    body[:160],
+                )
+        if not ocr_detail:
+            ocr_detail = "no OCR backend available"
+        return PredicateResult(
+            False, p["kind"],
+            f"text {needle!r} not on screen ({ocr_detail}; window-text read also missed)",
+            {"ocr": ocr_detail, "window_text_candidates": len(candidates)},
+        )
+    if ocr_detail:
+        return PredicateResult(False, p["kind"], f"text {needle!r} not on screen ({ocr_detail})",
+                               {"ocr": ocr_detail})
     return PredicateResult(False, p["kind"],
-                           "no OCR backend available for text-visible check")
+                           "no OCR or window-text backend available for text-visible check")
 
 
 def _is_wsl_runtime() -> bool:
@@ -431,4 +473,4 @@ def check_filesystem_predicate_sync(predicate: dict) -> PredicateResult:
 
 
 __all__ = ["PredicateResult", "normalize", "render", "check_predicate",
-           "check_filesystem_predicate_sync"]
+           "check_filesystem_predicate_sync", "PREDICATE_KINDS"]
