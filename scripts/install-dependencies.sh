@@ -262,14 +262,14 @@ fi
 
 if [ -d pi-extension ] && [ -f pi-extension/package.json ]; then
   if have_cmd npm; then
-    if [ ! -d pi-extension/node_modules ]; then
-      echo "[install] cd pi-extension && npm install"
-      ( cd pi-extension && run npm install --silent )
-    else
-      echo "[skip ] pi-extension/node_modules already present"
-    fi
+    # Always run npm install — it is idempotent and picks up any newly added
+    # optional deps (e.g. playwright) even when node_modules already exists.
+    echo "[install] cd pi-extension && npm install"
+    ( cd pi-extension && run npm install --silent )
     # Browser bindings for the pi-extension's Playwright.
-    ( cd pi-extension && run npx --yes playwright install chromium ) || true
+    # playwright is now in optionalDependencies so it lands in node_modules
+    # after npm install; npx uses the local copy without fetching it again.
+    ( cd pi-extension && run npx playwright install chromium ) || true
   else
     echo "[note ] npm not on PATH; skipping pi-extension node deps"
   fi

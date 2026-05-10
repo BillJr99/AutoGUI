@@ -46,6 +46,24 @@ import sys
 import traceback
 from pathlib import Path
 
+# Suppress the noisy "Exception ignored in: BaseSubprocessTransport.__del__"
+# traceback that asyncio emits on Ctrl+C when the event loop closes while
+# subprocess transports are still alive.  The process exits correctly; this
+# is purely cosmetic noise.
+_orig_unraisablehook = sys.unraisablehook
+
+
+def _quiet_unraisablehook(unraisable):
+    if (
+        isinstance(unraisable.exc_value, RuntimeError)
+        and "Event loop is closed" in str(unraisable.exc_value)
+    ):
+        return
+    _orig_unraisablehook(unraisable)
+
+
+sys.unraisablehook = _quiet_unraisablehook
+
 from agent import Agent
 from client import OpenWebUIClient
 from tools import ToolRegistry
@@ -235,7 +253,10 @@ async def _consume_agent_events(
     _last_was_countdown = False
 
     async for event in agent.run(command):
-        if event.kind == "text":
+        if event.kind == "plan":
+            print(f"{cyan}Plan:{reset}\n{event.content}\n")
+
+        elif event.kind == "text":
             if _last_was_countdown:
                 print()
                 _last_was_countdown = False

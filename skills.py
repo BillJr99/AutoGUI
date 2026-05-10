@@ -33,6 +33,46 @@ def _tokenize(text: str) -> list[str]:
     return [t for t in re.split(r"\W+", (text or "").lower()) if t and len(t) > 2]
 
 
+# ---------------------------------------------------------------------------
+# Step normalization
+# ---------------------------------------------------------------------------
+
+_ACTIVATE_TOOLS = frozenset({"desktop_launch", "desktop_activate_window"})
+_TYPE_TOOLS = frozenset({"desktop_type", "desktop_hotkey"})
+
+
+def normalize_skill_steps(steps: list[dict]) -> list[dict]:
+    """Remove pixel-coordinate focus clicks sandwiched between a window-activation
+    step and a type step.
+
+    Saved skills sometimes include a desktop_click(x, y) immediately after
+    desktop_activate_window or desktop_launch as a focus gesture.  On replay
+    the window may open at a different screen position, so the hardcoded
+    coordinates miss the window and steal focus before desktop_type fires.
+    Dropping the click is safe because the preceding activate step already
+    established focus.
+    """
+    drop: set[int] = set()
+    for i, step in enumerate(steps):
+        tool = step.get("tool", "")
+        args = step.get("args") or {}
+        if (
+            tool == "desktop_click"
+            and "x" in args and "y" in args
+            and i > 0
+            and i + 1 < len(steps)
+        ):
+            prev_tool = steps[i - 1].get("tool", "")
+            next_tool = steps[i + 1].get("tool", "")
+            if prev_tool in _ACTIVATE_TOOLS and next_tool in _TYPE_TOOLS:
+                drop.add(i)
+                logger.debug(
+                    "[skills] normalize: dropping pixel focus-click at step %d (x=%s, y=%s)",
+                    i, args.get("x"), args.get("y"),
+                )
+    return [s for i, s in enumerate(steps) if i not in drop]
+
+
 class SkillStore:
     """JSONL-backed skill library with simple keyword retrieval."""
 

@@ -192,7 +192,7 @@ Each script:
 - echoes every command before running it (loud by design);
 - installs the Python deps from `requirements.txt`, plus the optional ones (`pyperclip`, `pytesseract`, `playwright`, `pyobjc-framework-Quartz` on macOS, `uiautomation` + `pywin32` on Windows);
 - runs `python -m playwright install chromium`;
-- if `pi-extension/` exists, also runs `npm install` and `npx playwright install chromium` inside it.
+- if `pi-extension/` exists, also runs `npm install` (which picks up `playwright` from `optionalDependencies`) and `npx playwright install chromium` inside it.
 
 Either run the script manually before launch, or set this config flag and
 AutoGUI will invoke it once at startup before initialising the registry:
@@ -431,12 +431,29 @@ See `pi-extension/README.md` for the full extension details.
 
 The standalone Python agent creates runtime directories as needed:
 
-- `logs/` is created before `logs/agent.log` is opened.
-- The parent directory for `logs/history.jsonl` is created when TUI history is saved.
-- `screenshots/` is created by the active screenshot backend before saving a screenshot.
+| Path | Contents |
+|------|----------|
+| `logs/` | `agent.log` (rotating) + per-session `session_<ts>.log` files |
+| `logs/traces/` | Per-task JSONL trajectory logs |
+| `screenshots/` | Ad-hoc screenshots taken by the agent |
+| `screenshots/failures/` | Animated GIF failure recordings |
+| `skills/` | **Skill library** — `skills/skills.jsonl`, one record per saved skill |
 
-The Pi extension creates `pi-extension/runtime/screenshots/` recursively before
-saving screenshots. These runtime paths are ignored by git.
+`skills/` is git-ignored. Skills are replayable macros saved with `skill_save` and
+retrieved automatically at task start by keyword. They are shared with the Pi extension
+when both are run from the same project root (point `skillsPath` at the same file).
+
+The Pi extension writes runtime files under `pi-extension/runtime/`:
+
+| Path | Contents |
+|------|----------|
+| `pi-extension/runtime/skills/` | **Skill library** — `skills.jsonl` |
+| `pi-extension/runtime/traces/` | Per-session JSONL trajectory logs |
+| `pi-extension/runtime/screenshots/` | Ad-hoc screenshots |
+| `pi-extension/runtime/failures/` | Animated GIF failure recordings |
+| `pi-extension/runtime/logs/` | `autogui.log` |
+
+All `pi-extension/runtime/` paths are git-ignored.
 
 ### Interactive TUI
 
@@ -609,12 +626,12 @@ No configuration is needed.
     "record_trace": true,                // Persist every event to logs/traces/<session>.jsonl
     "trace_dir": "logs/traces",          // Where the JSONL trajectory log lives
     "suggest_skills": true,              // Offer top-K saved skills at task start
-    "skills_path": "~/.autogui/skills.jsonl",  // Skill library location
+    "skills_path": "skills/skills.jsonl",  // Skill library — git-ignored, created automatically
     "planner": {                          // Pre-execution planning pass
       "enabled": true                     // One extra LLM call up front (uses the primary client)
     },
     "bon": {                              // Best-of-N action sampling
-      "enabled": false,                   // Off by default — multiplies token cost on uncertain steps
+      "enabled": true,                    // Samples n completions, picks best on uncertain steps
       "n": 3,                             // Number of candidates to sample
       "temperature": 0.7,                 // Sampling temperature for diverse candidates
       "trigger_on_recent_failure": true,

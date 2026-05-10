@@ -380,6 +380,10 @@ class AgentTUI(App):
             f"[dim]Type a task and press Enter.  "
             f"Ctrl+P → commands (Change Model, Toggle Vision, …).  F1 for help.  Ctrl+C to exit.[/dim]\n"
         )
+        # Reactive watcher fires during init before the DOM exists (NoMatches
+        # caught silently), and then _update_status("Ready") below is a no-op
+        # because the reactive value is already "Ready".  Force a real render.
+        self._update_status("Initializing…")
         self._update_status("Ready")
         self.query_one("#input-bar", Input).focus()
 
@@ -442,6 +446,12 @@ class AgentTUI(App):
                     self._update_status(
                         f"[{bar}] {tool}: executing in {remaining}s… (Esc to cancel)"
                     )
+                    continue
+
+                if event.kind == "plan":
+                    self._update_status("Planning…")
+                    log.write(f"\n[bold cyan]Plan:[/bold cyan]\n[cyan]{event.content}[/cyan]")
+                    self._log_session(f"PLAN: {event.content}")
                     continue
 
                 iteration = event.data.get("iteration", "?")

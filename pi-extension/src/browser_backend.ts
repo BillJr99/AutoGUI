@@ -143,14 +143,45 @@ export class BrowserBackend {
     const err = await this.ensure();
     if (err) return { error: err };
     const sel = selector || "body";
-    const txt = (await this.page.innerText(sel, { timeout: 10000 })) ?? "";
-    const truncated = txt.length > maxChars;
-    return {
-      text: truncated ? txt.slice(0, maxChars) : txt,
-      length: truncated ? maxChars : txt.length,
-      truncated,
-      url: this.page.url(),
+
+    const pack = (txt: string, via?: string) => {
+      const truncated = txt.length > maxChars;
+      return {
+        text: truncated ? txt.slice(0, maxChars) : txt,
+        length: truncated ? maxChars : txt.length,
+        truncated,
+        url: this.page.url(),
+        ...(via ? { via } : {}),
+      };
     };
+
+    // Attempt 1: Playwright innerText — honours CSS visibility.
+    try {
+      const txt = (await this.page.innerText(sel, { timeout: 10000 })) ?? "";
+      return pack(txt);
+    } catch { /* fall through */ }
+
+    // Attempt 2: Clipboard — select all, copy, read via navigator.clipboard.
+    // Grant permissions first so readText() doesn't prompt or throw.
+    try {
+      await this.page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+      await this.page.keyboard.press("Control+a");
+      await this.page.keyboard.press("Control+c");
+      const txt: string = await this.page.evaluate(
+        async () => { try { return await navigator.clipboard.readText(); } catch { return ""; } }
+      );
+      if (txt) return pack(txt, "clipboard");
+    } catch { /* fall through */ }
+
+    // Attempt 3: Plain JS evaluate — works even when DOM is unconventional.
+    try {
+      const txt: string = await this.page.evaluate(
+        () => (document.body as HTMLElement).innerText || document.body.textContent || ""
+      );
+      return pack(txt, "evaluate");
+    } catch (e) {
+      return { error: `getText failed (all methods): ${e instanceof Error ? e.message : String(e)}`, url: this.page.url() };
+    }
   }
 
   async screenshot(fullPage = false): Promise<Record<string, unknown>> {

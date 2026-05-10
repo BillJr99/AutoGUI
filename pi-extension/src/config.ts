@@ -11,7 +11,7 @@
  * without a config file.
  */
 
-import { readFile } from "node:fs/promises";
+import { copyFile, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -49,12 +49,14 @@ export interface ExtensionConfig {
     maxWidth: number;
     outDir: string;
   };
+  /** When false, desktop_screenshot returns only the file path (no inline image). */
+  visionEnabled: boolean;
 }
 
 const DEFAULTS: ExtensionConfig = {
-  skillsPath: join(homedir(), ".autogui", "skills.jsonl"),
+  skillsPath: "",  // resolved to <extensionRoot>/runtime/skills/skills.jsonl in loadConfig
   recordTrace: true,
-  traceDir: join(homedir(), ".autogui", "traces"),
+  traceDir: "",    // resolved to <extensionRoot>/runtime/traces in loadConfig
   installDependencies: false,
   perceptionCacheTtlMs: 500,
   allowedBrowser: false,
@@ -75,6 +77,7 @@ const DEFAULTS: ExtensionConfig = {
     maxWidth: 960,
     outDir: "",
   },
+  visionEnabled: true,
 };
 
 function deepMerge<T>(base: T, patch: unknown): T {
@@ -95,19 +98,29 @@ function deepMerge<T>(base: T, patch: unknown): T {
 }
 
 export async function loadConfig(extensionRoot: string): Promise<ExtensionConfig> {
+  // Bootstrap: if config.json doesn't exist yet, seed it from the example file
+  // so users get sensible defaults (allowedBrowser=true, visionEnabled=true, etc.)
+  // without having to manually copy and edit the example.
+  const primaryConfig = join(extensionRoot, "config.json");
+  const exampleConfig = join(extensionRoot, "config.json.example");
+  try {
+    await readFile(primaryConfig, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      try {
+        await copyFile(exampleConfig, primaryConfig);
+      } catch {
+        // Example missing or unreadable — proceed with built-in defaults.
+      }
+    }
+  }
+
   const candidates = [
-    join(extensionRoot, "config.json"),
+    primaryConfig,
     join(homedir(), ".autogui", "pi-extension.json"),
   ];
 
   let merged: ExtensionConfig = { ...DEFAULTS };
-  // Plug in runtime-relative defaults that depend on extensionRoot.
-  if (!merged.browser.screenshotDir) {
-    merged.browser.screenshotDir = join(extensionRoot, "runtime", "browser");
-  }
-  if (!merged.screenRecord.outDir) {
-    merged.screenRecord.outDir = join(extensionRoot, "runtime", "failures");
-  }
 
   for (const path of candidates) {
     try {
@@ -122,5 +135,23 @@ export async function loadConfig(extensionRoot: string): Promise<ExtensionConfig
       }
     }
   }
+
+  // Resolve runtime-relative defaults AFTER merging all config files so that
+  // empty-string values from config.json don't silently override the absolute
+  // paths we would otherwise compute here.  A non-empty value in config.json
+  // is kept as-is (allowing deliberate user overrides).
+  if (!merged.skillsPath) {
+    merged.skillsPath = join(extensionRoot, "runtime", "skills", "skills.jsonl");
+  }
+  if (!merged.traceDir) {
+    merged.traceDir = join(extensionRoot, "runtime", "traces");
+  }
+  if (!merged.browser.screenshotDir) {
+    merged.browser.screenshotDir = join(extensionRoot, "runtime", "browser");
+  }
+  if (!merged.screenRecord.outDir) {
+    merged.screenRecord.outDir = join(extensionRoot, "runtime", "failures");
+  }
+
   return merged;
 }

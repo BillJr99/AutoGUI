@@ -51,7 +51,10 @@ def _load_trace_steps(trace_path: Path) -> list[dict]:
 
 
 async def _run_steps(steps: list[dict], speed: float = 1.0, continue_on_error: bool = False):
+    from skills import normalize_skill_steps
     from tools import ToolRegistry  # imported here to avoid circular import on module load
+
+    steps = normalize_skill_steps(steps)
 
     cfg = {
         "tools": {
@@ -102,7 +105,7 @@ def main(argv: list[str] | None = None):
     ap.add_argument("source", nargs="?", help="Path to trace JSONL")
     ap.add_argument("--skill", help="Replay a saved skill by name")
     ap.add_argument(
-        "--skills-path", default="~/.autogui/skills.jsonl",
+        "--skills-path", default="skills/skills.jsonl",
         help="Override skill store location",
     )
     ap.add_argument("--speed", type=float, default=1.0,

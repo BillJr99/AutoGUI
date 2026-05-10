@@ -4,7 +4,7 @@ import type { BrowserBackend } from "./browser_backend.js";
 import { PerceptionCache } from "./cache.js";
 import type { ExtensionConfig } from "./config.js";
 import { ScreenRecorder } from "./screen_record.js";
-import type { SkillStep, SkillStore } from "./skills.js";
+import { normalizeSkillSteps, type SkillStep, type SkillStore } from "./skills.js";
 import { annotateScreenshot } from "./som.js";
 import { findText } from "./tesseract.js";
 import type { TraceWriter } from "./trace.js";
@@ -668,7 +668,7 @@ export function createDesktopTools(
         if (!skill) return textResult(`No skill named ${JSON.stringify(params.name)}.`, { error: "not_found" });
         const backend = await getBackend();
         const executed: Array<{ tool: string; ok: boolean; error?: string }> = [];
-        for (const step of skill.steps) {
+        for (const step of normalizeSkillSteps(skill.steps)) {
           try {
             await replayStep(backend, options, step, signal);
             executed.push({ tool: step.tool, ok: true });

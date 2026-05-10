@@ -42,8 +42,8 @@ Each step gracefully degrades: if Tesseract isn't installed `desktop_click_text`
 ## Other Features
 
 - **Planner**: when `plannerEnabled=true` (default) the `/autogui` system prompt instructs the model to produce a numbered plan as its first message before executing. No separate LLM call — Pi owns the model loop.
-- **Skill library**: `skill_save` snapshots the recipe of "what worked" in this session as a JSONL record at `~/.autogui/skills.jsonl` (shared format with the mainline AutoGUI). `/autogui` retrieves the top-3 candidate skills for the current task and lists them in the prompt; `skill_run` replays one deterministically through the same backend.
-- **Trajectory log**: every tool call (start, success, failure) is appended to `~/.autogui/traces/<session>.jsonl` for post-hoc inspection.
+- **Skill library**: `skill_save` snapshots the recipe of "what worked" in this session as a JSONL record at `pi-extension/runtime/skills/skills.jsonl` (git-ignored, created automatically). `/autogui` retrieves the top-3 candidate skills for the current task and lists them in the prompt; `skill_run` replays one deterministically through the same backend. Override with `skillsPath` in config.
+- **Trajectory log**: every tool call (start, success, failure) is appended to `pi-extension/runtime/traces/<session>.jsonl` for post-hoc inspection.
 - **Failure recording**: a daemon thread maintains a 5-second rolling screen buffer; on any tool failure it dumps the frames as an animated GIF (via ImageMagick) into `runtime/failures/` so you can see *how* the agent got into trouble.
 - **Action scoping & dry-run**: `allowedApps`, `blockedWindowTitles`, and `dryRun` config flags gate every state-changing tool. Default is unrestricted; turn them on for sensitive contexts.
 - **Pre/post window-set diff**: every state-changing desktop tool emits an `unchanged: true` flag if the window list didn't change, plus an `unexpectedModal` field when a new window matches `/error|warning|sign in|password|allow|permission|are you sure|confirm|update available/i`.
@@ -61,6 +61,7 @@ Every key has a sensible default — leave the file out and everything works. Se
 
 - `installDependencies`: when true, the extension runs the same `scripts/install-dependencies.*` shell script as the mainline, once at session start. Default false.
 - `allowedBrowser`: set true to register the `browser_*` tools (requires Playwright + Chromium).
+- `visionEnabled`: when true (default), `desktop_screenshot` includes the inline PNG image in the tool result so the model can see the screen. Set false if the provider struggles with image payloads.
 - `dryRun` / `allowedApps` / `blockedWindowTitles`: safety gates.
 - `plannerEnabled`: planner-first protocol in the system prompt.
 - `screenRecord.*`: rolling screen buffer for failure post-mortem.
@@ -128,9 +129,10 @@ winget install ImageMagick.ImageMagick   # Windows
 # Linux a11y for desktop_click_element
 sudo apt install python3 python3-pyatspi gir1.2-atspi-2.0
 
-# Playwright + Chromium for browser_* tools (run inside pi-extension/)
+# Playwright + Chromium for browser_* tools (playwright is an optional dep;
+# npm install picks it up automatically, then install the browser binary)
 cd pi-extension
-npm install playwright
+npm install
 npx playwright install chromium
 ```
 
@@ -216,19 +218,18 @@ This is useful when you want a second model pass to inspect the desktop state wi
 
 ## Runtime Files
 
-Screenshots are saved under:
+All runtime output lives under `pi-extension/runtime/` (git-ignored):
 
-```text
-pi-extension/runtime/screenshots/
-```
+| Path | Contents |
+|------|----------|
+| `runtime/skills/skills.jsonl` | **Skill library** — saved with `skill_save`, replayed with `skill_run` |
+| `runtime/traces/` | Per-session JSONL trajectory logs |
+| `runtime/screenshots/` | Ad-hoc screenshots taken by the agent |
+| `runtime/failures/` | Animated GIF failure recordings |
+| `runtime/browser/` | Playwright browser screenshots |
+| `runtime/logs/autogui.log` | Verbose JSON-lines event log |
 
-Verbose logs are written as JSON lines under:
-
-```text
-pi-extension/runtime/logs/autogui.log
-```
-
-The extension creates these directories recursively as needed. Runtime files, local Pi metadata, and `node_modules` are ignored by git.
+The extension creates these directories recursively as needed.
 
 The log records command starts, tool starts, successes, failures, backend detection, PowerShell script attempts, PowerShell stdout/stderr, and provider response statuses. Large string fields are truncated in the log so screenshots are not written into logs wholesale.
 

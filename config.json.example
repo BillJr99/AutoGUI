@@ -17,14 +17,15 @@
     "record_trace": true,
     "trace_dir": "logs/traces",
     "suggest_skills": true,
-    "skills_path": "~/.autogui/skills.jsonl",
+    "_skills_comment": "Skills (replayable macros) are stored in ./skills/skills.jsonl relative to the project root. The directory is created automatically and is git-ignored.",
+    "skills_path": "skills/skills.jsonl",
     "planner": {
       "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces.",
       "enabled": true
     },
     "bon": {
-      "_comment": "Best-of-N action sampling. Multiplies token cost on uncertain steps.",
-      "enabled": false,
+      "_comment": "Best-of-N action sampling. Samples n completions and picks the best. Increases token cost on uncertain steps.",
+      "enabled": true,
       "n": 3,
       "temperature": 0.7,
       "trigger_on_recent_failure": true,
@@ -47,10 +48,10 @@
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,
-    "allowed_browser": false
+    "allowed_browser": true
   },
   "browser": {
-    "_comment": "Settings for the optional Playwright-driven browser backend.",
+    "_comment": "Settings for the Playwright-driven browser backend (used when allowed_browser=true).",
     "headless": false,
     "screenshot_dir": "screenshots/browser",
     "user_data_dir": "",
@@ -65,7 +66,7 @@
   "tui": {
     "theme": "dark",
     "show_tool_calls": true,
-    "show_token_counts": false,
+    "show_token_counts": true,
     "history_file": "logs/history.jsonl"
   },
   "safety": {

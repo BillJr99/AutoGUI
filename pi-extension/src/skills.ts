@@ -132,3 +132,44 @@ export class SkillStore {
     await rename(tmp, this.path);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Step normalization
+// ---------------------------------------------------------------------------
+
+const ACTIVATE_TOOLS = new Set([
+  "desktop_launch",
+  "desktop_focus_window",
+  "desktop_activate_window", // mainline name — cross-compat
+]);
+const TYPE_TOOLS = new Set(["desktop_type", "desktop_hotkey"]);
+
+/**
+ * Remove pixel-coordinate focus clicks sandwiched between a window-activation
+ * step and a type step.
+ *
+ * Saved skills sometimes include a desktop_click(x, y) immediately after a
+ * focus/launch step as a focus gesture. On replay the window may open at a
+ * different screen position, so the hardcoded coordinates miss the window and
+ * steal focus before desktop_type fires. The preceding activate step already
+ * established focus, so the click can be dropped safely.
+ */
+export function normalizeSkillSteps(steps: SkillStep[]): SkillStep[] {
+  const drop = new Set<number>();
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const args = step.args as Record<string, unknown>;
+    if (
+      step.tool === "desktop_click"
+      && typeof args["x"] === "number"
+      && typeof args["y"] === "number"
+      && i > 0
+      && i + 1 < steps.length
+      && ACTIVATE_TOOLS.has(steps[i - 1].tool)
+      && TYPE_TOOLS.has(steps[i + 1].tool)
+    ) {
+      drop.add(i);
+    }
+  }
+  return steps.filter((_, i) => !drop.has(i));
+}

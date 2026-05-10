@@ -231,7 +231,11 @@ $rect = $picked.Current.BoundingRectangle
       stderr: result.stderr,
     });
     if (result.code !== 0) {
-      throw new DesktopError("PowerShell command failed", { code: result.code, stderr: result.stderr, stdout: result.stdout, timedOut: result.timedOut });
+      const stderrPreview = result.stderr.trim().slice(0, 400);
+      throw new DesktopError(
+        stderrPreview ? `PowerShell command failed: ${stderrPreview}` : "PowerShell command failed",
+        { code: result.code, stderr: result.stderr, stdout: result.stdout, timedOut: result.timedOut },
+      );
     }
     return result.stdout.trim();
   }
@@ -456,7 +460,10 @@ if ($target.id) {
   $needle = ([string]$target.app).ToLowerInvariant()
   $candidates = @($candidates | Where-Object { $_.ProcessName.ToLowerInvariant().Contains($needle) })
 }
-if ($candidates.Count -lt 1) { throw "No matching window to focus." }
+if ($candidates.Count -lt 1) {
+  [PSCustomObject]@{ success = $false; reason = "no-match"; requested = $target } | ConvertTo-Json -Compress
+  exit 0
+}
 $p = $candidates | Select-Object -First 1
 $h = $p.MainWindowHandle
 [PiWindow]::ShowWindowAsync($h, 9) | Out-Null
@@ -515,10 +522,28 @@ if ($argsJson -and $argsJson -ne '[]') {
   if ($parsed -is [array]) { $argList = @($parsed | ForEach-Object { [string]$_ }) }
   elseif ($null -ne $parsed) { $argList = @([string]$parsed) }
 }
-if ($argList.Count -gt 0) {
-  Start-Process -FilePath $app -ArgumentList $argList
-} else {
-  Start-Process -FilePath $app
+# Resolve a bare name (e.g. "notepad") to its full executable path via PATH.
+$resolved = $app
+$cmd = Get-Command $app -ErrorAction SilentlyContinue -CommandType Application
+if ($cmd) { $resolved = $cmd.Source }
+# Attempt 1: direct Start-Process.
+$launched = $false
+$directError = ''
+try {
+  if ($argList.Count -gt 0) { Start-Process -FilePath $resolved -ArgumentList $argList }
+  else                       { Start-Process -FilePath $resolved }
+  $launched = $true
+} catch { $directError = $_.Exception.Message }
+# Attempt 2: UseShellExecute lets Windows find the app via App Paths registry,
+# file associations, and Start Menu entries — handles display names like "Notepad".
+if (-not $launched) {
+  try {
+    if ($argList.Count -gt 0) { Start-Process -FilePath $app -ArgumentList $argList -UseShellExecute:$true }
+    else                       { Start-Process -FilePath $app -UseShellExecute:$true }
+    $launched = $true
+  } catch {
+    throw "Cannot launch '$app': direct=$directError; shell=$($_.Exception.Message)"
+  }
 }
 `, signal);
   }

@@ -56,7 +56,9 @@ Rules:
 - Keep using Pi's built-in coding/filesystem tools for code and file work; use desktop_*${browserOn ? "/browser_*" : ""} tools only for desktop UI automation.
 - If a desktop tool reports a missing permission or dependency, tell the user exactly what is missing and stop that desktop action.
 - When you finish a task that worked well, consider calling skill_save with descriptive keywords so the procedure can be replayed via skill_run later.
-${browserOn ? "- Prefer browser_* tools for any task that lives on a web page.\n" : ""}`;
+${browserOn
+  ? "- For any task involving a web page or URL, prefer browser_navigate and browser_* tools over launching a browser via desktop_launch.\n- browser_navigate(url) navigates the Playwright-managed Chromium page in place; it does not open the user's existing browser window.\n"
+  : "- Browser tools are NOT enabled. Do NOT attempt desktop_launch with browser names (Edge, Chrome, Firefox, etc.) — those paths are unreliable. If a web task is requested, tell the user to set allowedBrowser=true in pi-extension/config.json and re-run the install script to set up Playwright + Chromium.\n"}`;
 }
 
 export default function autoGuiExtension(pi: ExtensionAPI) {
@@ -97,6 +99,7 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
 
   const init = (async () => {
     cfg = await getConfig();
+    omitScreenshotImages = !cfg.visionEnabled;
     cache.configure(cfg.perceptionCacheTtlMs);
     skillStore = new SkillStore(cfg.skillsPath);
     if (cfg.recordTrace) {

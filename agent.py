@@ -150,7 +150,8 @@ class Agent:
         self._confirm_delay: int = int(cfg.get("safety", {}).get("command_confirm_delay_seconds", 0))
         # When True, screenshot base64 is delivered as an image_url vision message
         # so vision-capable models can actually see it.  Set False for text-only models.
-        self._vision_screenshots: bool = self._agent_cfg.get("vision_screenshots", True)
+        self._vision_screenshots: bool = bool(self._agent_cfg.get("vision_screenshots", True))
+        logger.info("[agent] vision_screenshots=%s", self._vision_screenshots)
 
         # The message history is the single source of truth for the conversation.
         # It persists across multiple calls to run(), allowing multi-turn dialogue.
@@ -187,7 +188,7 @@ class Agent:
 
         # Trace + skill store wiring (Phase 2).
         trace_dir = self._agent_cfg.get("trace_dir", "logs/traces")
-        skills_path = self._agent_cfg.get("skills_path", "~/.autogui/skills.jsonl")
+        skills_path = self._agent_cfg.get("skills_path", "skills/skills.jsonl")
         self._suggest_skills: bool = bool(self._agent_cfg.get("suggest_skills", True))
         self._record_trace: bool = bool(self._agent_cfg.get("record_trace", True))
 
@@ -295,11 +296,12 @@ class Agent:
                 return {"error": str(e)}
 
         async def _skill_run(name: str) -> dict:
+            from skills import normalize_skill_steps
             skill = store.get(str(name))
             if not skill:
                 return {"error": f"No skill named {name!r}"}
             executed: list[dict] = []
-            for step in skill.get("steps", []):
+            for step in normalize_skill_steps(skill.get("steps", [])):
                 tool = step.get("tool")
                 args = step.get("args", {}) or {}
                 if not tool:
@@ -333,7 +335,10 @@ class Agent:
                     "Call this only after the task has succeeded — earlier failed "
                     "attempts in the same session are not included. "
                     "Saved skills can later be invoked by skill_run or replayed "
-                    "outside the agent via replay.py."
+                    "outside the agent via replay.py. "
+                    "NOTE: pixel-coordinate desktop_click steps used for window focus "
+                    "are automatically dropped on replay (coordinates change between runs). "
+                    "Prefer desktop_activate_window for focus — it is position-independent."
                 ),
                 "parameters": {"type": "object", "properties": {
                     "name": {"type": "string", "description": "Short unique identifier for the skill."},
@@ -461,6 +466,7 @@ class Agent:
             except Exception as e:
                 logger.warning("[agent] planner failed: %s", e)
             if plan_text:
+                logger.info("[agent] plan:\n%s", plan_text)
                 yield AgentEvent(
                     kind="plan",
                     content=plan_text,
@@ -939,13 +945,21 @@ class Agent:
             # has ground-truth desktop state rather than having to hallucinate it.
             # If vision is on and the model didn't already take a screenshot this
             # batch, also inject a screenshot so it can SEE the result.
+            # skill_run replays desktop actions internally so it also triggers
+            # the verify pass — otherwise the model never sees whether typing
+            # actually appeared in the target window.
             called_names = {tc.get("function", {}).get("name", "") for tc in tool_calls}
             desktop_actions_taken = {
                 n for n in called_names
                 if n.startswith("desktop_")
                 and n not in ("desktop_list_windows", "desktop_screenshot")
             }
-            if desktop_actions_taken:
+            verify_label = (
+                ", ".join(sorted(desktop_actions_taken))
+                if desktop_actions_taken
+                else "skill_run"
+            )
+            if desktop_actions_taken or "skill_run" in called_names:
                 if "desktop_list_windows" in available_tools:
                     try:
                         windows_json = await self._registry.dispatch("desktop_list_windows", {})
@@ -1007,7 +1021,7 @@ class Agent:
                         self._history.append({
                             "role": "user",
                             "content": (
-                                f"[Auto-verify after {', '.join(sorted(desktop_actions_taken))}] "
+                                f"[Auto-verify after {verify_label}] "
                                 f"Current desktop state: {windows_json}"
                                 + diff_banner
                                 + modal_banner
@@ -1044,8 +1058,7 @@ class Agent:
                                     {
                                         "type": "text",
                                         "text": (
-                                            f"[Auto-verify screenshot after "
-                                            f"{', '.join(sorted(desktop_actions_taken))}]\n"
+                                            f"[Auto-verify screenshot after {verify_label}]\n"
                                             + self._prompts.text("runtime_screenshot_verify")
                                         ),
                                     },

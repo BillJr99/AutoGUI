@@ -1,9 +1,11 @@
 {
   "_comment": "Optional config file for the AutoGUI Pi extension. Copy to pi-extension/config.json (or ~/.autogui/pi-extension.json) and edit. Every key has a sensible default — leave a key out to keep its default. The extension also boots cleanly with no config file at all.",
 
-  "skillsPath": "~/.autogui/skills.jsonl",
+  "_skills_section": "Skills (replayable macros) are stored in pi-extension/runtime/skills/skills.jsonl by default. The directory is created automatically and is git-ignored (covered by pi-extension/runtime/).",
+  "skillsPath": "",
+
   "recordTrace": true,
-  "traceDir": "~/.autogui/traces",
+  "traceDir": "",
 
   "_install_section": "Set installDependencies=true to run scripts/install-dependencies.* once at session_start. The same scripts can be run by hand: `bash scripts/install-dependencies.sh` (Linux/macOS/WSL) or `scripts\\install-dependencies.cmd` (Windows).",
   "installDependencies": false,
@@ -11,7 +13,7 @@
   "perceptionCacheTtlMs": 500,
 
   "_browser_section": "Browser tools (Playwright). When allowedBrowser=true the BrowserBackend lazy-imports playwright on first call. If it isn't installed, you'll get a clear error pointing at the install script — run that or set installDependencies=true.",
-  "allowedBrowser": false,
+  "allowedBrowser": true,
   "browser": {
     "headless": false,
     "screenshotDir": "",
@@ -26,6 +28,9 @@
 
   "_planner_section": "When plannerEnabled is true (default), /autogui injects instructions telling the model to produce a numbered plan as its FIRST assistant message before executing.",
   "plannerEnabled": true,
+
+  "_vision_section": "When visionEnabled is true (default), desktop_screenshot results include the inline PNG image so the model can see the screen. Set false to return only the file path (useful if the provider struggles with image payloads).",
+  "visionEnabled": true,
 
   "_record_section": "Rolling screen buffer. On any tool failure the buffer is concatenated into a GIF under outDir for post-mortem.",
   "screenRecord": {
