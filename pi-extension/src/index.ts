@@ -133,7 +133,16 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
     cfg = await getConfig();
     omitScreenshotImages = !cfg.visionEnabled;
     cache.configure(cfg.perceptionCacheTtlMs);
-    skillStore = new SkillStore(cfg.skillsPath);
+    // Skills are OPT-IN: only construct the SkillStore when the user has
+    // explicitly enabled skill capture.  This keeps the extension from
+    // writing a skills.jsonl file on disk for users who don't want it,
+    // and gates skill_save / skill_list / skill_run registration in
+    // tools.ts via the same flag.
+    if (cfg.skillsEnabled) {
+      skillStore = new SkillStore(cfg.skillsPath);
+    } else {
+      await logger.log("init.skills_disabled", { reason: "skillsEnabled=false" });
+    }
     if (cfg.artifactsDir) {
       artifactStore = new ArtifactStore(cfg.artifactsDir);
     }
@@ -252,7 +261,9 @@ ${autoGuiTask}`;
   // closures see the real config / skill store / browser.
   void init.then(async () => {
     if (!cfg) return;
-    if (!skillStore) skillStore = new SkillStore(cfg.skillsPath);
+    // Skills only construct when enabled; otherwise skillStore stays
+    // undefined and tools.ts skips skill_save / skill_list / skill_run.
+    if (!skillStore && cfg.skillsEnabled) skillStore = new SkillStore(cfg.skillsPath);
     if (!trace) trace = new TraceWriter(cfg.traceDir);
     const tools = createDesktopTools(getBackend, screenshotDir, logger, {
       omitScreenshotImages: () => omitScreenshotImages,
@@ -313,13 +324,17 @@ ${autoGuiTask}`;
       let prompt = buildAutoGuiPrompt(c, backend);
 
       // Skill suggestion: top-3 candidate skills whose keywords match the task.
-      try {
-        const candidates = (await (skillStore ?? new SkillStore(c.skillsPath)).search(task, 3));
-        if (candidates.length) {
-          const lines = candidates.map((s) => `- ${JSON.stringify(s.name)} (app=${s.app || "?"}, steps=${s.steps.length}, successes=${s.success_count})`);
-          prompt += `\n\nCandidate saved skills (call skill_run if one matches):\n${lines.join("\n")}`;
-        }
-      } catch { /* best-effort */ }
+      // Skipped entirely when skills are disabled — no SkillStore, no
+      // candidate block, no on-disk state.
+      if (skillStore) {
+        try {
+          const candidates = await skillStore.search(task, 3);
+          if (candidates.length) {
+            const lines = candidates.map((s) => `- ${JSON.stringify(s.name)} (app=${s.app || "?"}, steps=${s.steps.length}, successes=${s.success_count})`);
+            prompt += `\n\nCandidate saved skills (call skill_run if one matches):\n${lines.join("\n")}`;
+          }
+        } catch { /* best-effort */ }
+      }
 
       const message = `${prompt}\n\nUser desktop task:\n${task}`;
       if (ctx.isIdle()) {

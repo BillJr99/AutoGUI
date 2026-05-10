@@ -35,7 +35,10 @@ export interface DesktopToolOptions {
   omitScreenshotImages?: () => boolean;
   config: ExtensionConfig;
   cache: PerceptionCache;
-  skillStore: SkillStore;
+  /** Optional — only present when config.skillsEnabled=true.  When
+   *  undefined, skill_save / skill_list / skill_run are not registered
+   *  and sessionSteps stays in memory but is never persisted. */
+  skillStore?: SkillStore;
   trace: TraceWriter;
   recorder?: ScreenRecorder;
   browser?: BrowserBackend;
@@ -637,82 +640,86 @@ export function createDesktopTools(
       }),
     }),
 
-    // ── Skills ────────────────────────────────────────────────────────
-    defineTool({
-      name: "skill_save",
-      label: "Save Skill",
-      description: "Save the sequence of tool calls completed in this session as a named, replayable skill. Provide keywords describing when this skill applies. Call after the task has succeeded.",
-      promptSnippet: "skill_save: persist the recipe of what worked as a named skill.",
-      parameters: Type.Object({
-        name: Type.String(),
-        keywords: Type.Optional(Type.Array(Type.String())),
-        app: Type.Optional(Type.String()),
-      }),
-      executionMode: "sequential",
-      execute: wrap("skill_save", async (params, _signal) => {
-        if (!options.sessionSteps.length) {
-          return textResult("No successful steps in this session yet to save.", { error: "no steps" });
-        }
-        const skill = await options.skillStore.save({
-          name: params.name,
-          keywords: params.keywords ?? [],
-          app: params.app ?? "",
-          steps: [...options.sessionSteps],
-        });
-        return textResult(`Saved skill ${JSON.stringify(skill.name)} with ${skill.steps.length} steps.`, {
-          name: skill.name,
-          keywords: skill.keywords,
-          app: skill.app,
-          step_count: skill.steps.length,
-          created: skill.created,
-        });
-      }),
-    }),
-
-    defineTool({
-      name: "skill_list",
-      label: "List Skills",
-      description: "List saved skills, optionally filtered by a keyword query.",
-      promptSnippet: "skill_list: enumerate saved skills.",
-      parameters: Type.Object({
-        query: Type.Optional(Type.String()),
-        limit: Type.Optional(Type.Number()),
-      }),
-      executionMode: "sequential",
-      execute: wrap("skill_list", async (params, _signal) => {
-        const skills = await options.skillStore.search(params.query ?? "", params.limit ?? 5);
-        const summary = skills.map((s) => ({ name: s.name, app: s.app, keywords: s.keywords, step_count: s.steps.length, success_count: s.success_count }));
-        return textResult(`Found ${skills.length} skills.`, { skills: summary, count: skills.length });
-      }),
-    }),
-
-    defineTool({
-      name: "skill_run",
-      label: "Run Skill",
-      description: "Replay every step of a previously saved skill in order.",
-      promptSnippet: "skill_run: replay a saved skill by name.",
-      parameters: Type.Object({ name: Type.String() }),
-      executionMode: "sequential",
-      execute: wrap("skill_run", async (params, signal) => {
-        const skill = await options.skillStore.get(params.name);
-        if (!skill) return textResult(`No skill named ${JSON.stringify(params.name)}.`, { error: "not_found" });
-        const backend = await getBackend();
-        const executed: Array<{ tool: string; ok: boolean; error?: string }> = [];
-        for (const step of normalizeSkillSteps(skill.steps)) {
-          try {
-            await replayStep(backend, options, step, signal);
-            executed.push({ tool: step.tool, ok: true });
-          } catch (e) {
-            executed.push({ tool: step.tool, ok: false, error: (e as Error).message });
-            await options.trace.writeEvent("skill_run.fail", `${skill.name} stopped at ${step.tool}`, { skill: skill.name, step });
-            return textResult(`Skill ${skill.name} stopped at ${step.tool}: ${(e as Error).message}`, { executed, stopped_at: step.tool, error: (e as Error).message });
-          }
-        }
-        await options.skillStore.incrementSuccess(skill.name);
-        return textResult(`Replayed skill ${skill.name} (${executed.length} steps).`, { executed, success: true });
-      }),
-    }),
   ];
+
+  // ── Skills (only when skillsEnabled and a SkillStore exists) ─────────
+  if (options.skillStore) {
+    const store = options.skillStore;
+    definitions.push(
+      defineTool({
+        name: "skill_save",
+        label: "Save Skill",
+        description: "Save the sequence of tool calls completed in this session as a named, replayable skill. Provide keywords describing when this skill applies. Call after the task has succeeded.",
+        promptSnippet: "skill_save: persist the recipe of what worked as a named skill.",
+        parameters: Type.Object({
+          name: Type.String(),
+          keywords: Type.Optional(Type.Array(Type.String())),
+          app: Type.Optional(Type.String()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("skill_save", async (params, _signal) => {
+          if (!options.sessionSteps.length) {
+            return textResult("No successful steps in this session yet to save.", { error: "no steps" });
+          }
+          const skill = await store.save({
+            name: params.name,
+            keywords: params.keywords ?? [],
+            app: params.app ?? "",
+            steps: [...options.sessionSteps],
+          });
+          return textResult(`Saved skill ${JSON.stringify(skill.name)} with ${skill.steps.length} steps.`, {
+            name: skill.name,
+            keywords: skill.keywords,
+            app: skill.app,
+            step_count: skill.steps.length,
+            created: skill.created,
+          });
+        }),
+      }),
+      defineTool({
+        name: "skill_list",
+        label: "List Skills",
+        description: "List saved skills, optionally filtered by a keyword query.",
+        promptSnippet: "skill_list: enumerate saved skills.",
+        parameters: Type.Object({
+          query: Type.Optional(Type.String()),
+          limit: Type.Optional(Type.Number()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("skill_list", async (params, _signal) => {
+          const skills = await store.search(params.query ?? "", params.limit ?? 5);
+          const summary = skills.map((s) => ({ name: s.name, app: s.app, keywords: s.keywords, step_count: s.steps.length, success_count: s.success_count }));
+          return textResult(`Found ${skills.length} skills.`, { skills: summary, count: skills.length });
+        }),
+      }),
+      defineTool({
+        name: "skill_run",
+        label: "Run Skill",
+        description: "Replay every step of a previously saved skill in order.",
+        promptSnippet: "skill_run: replay a saved skill by name.",
+        parameters: Type.Object({ name: Type.String() }),
+        executionMode: "sequential",
+        execute: wrap("skill_run", async (params, signal) => {
+          const skill = await store.get(params.name);
+          if (!skill) return textResult(`No skill named ${JSON.stringify(params.name)}.`, { error: "not_found" });
+          const backend = await getBackend();
+          const executed: Array<{ tool: string; ok: boolean; error?: string }> = [];
+          for (const step of normalizeSkillSteps(skill.steps)) {
+            try {
+              await replayStep(backend, options, step, signal);
+              executed.push({ tool: step.tool, ok: true });
+            } catch (e) {
+              executed.push({ tool: step.tool, ok: false, error: (e as Error).message });
+              await options.trace.writeEvent("skill_run.fail", `${skill.name} stopped at ${step.tool}`, { skill: skill.name, step });
+              return textResult(`Skill ${skill.name} stopped at ${step.tool}: ${(e as Error).message}`, { executed, stopped_at: step.tool, error: (e as Error).message });
+            }
+          }
+          await store.incrementSuccess(skill.name);
+          return textResult(`Replayed skill ${skill.name} (${executed.length} steps).`, { executed, success: true });
+        }),
+      }),
+    );
+  }
 
   // ── Browser tools ────────────────────────────────────────────────────
   if (cfg.allowedBrowser && options.browser) {

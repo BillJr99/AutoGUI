@@ -16,8 +16,9 @@
     "vision_screenshots": true,
     "record_trace": true,
     "trace_dir": "logs/traces",
+    "_skills_comment": "Skills (replayable macros) are OFF by default. Set skills_enabled=true to record successful tool sequences as named, replayable skills. When enabled, the standalone agent stores them in ./skills/skills.jsonl relative to the project root — separate from the pi-extension's own library at pi-extension/runtime/skills/skills.jsonl. The directory is git-ignored and created automatically on first save. suggest_skills controls whether matching skills are surfaced at task start; it has no effect when skills_enabled=false.",
+    "skills_enabled": false,
     "suggest_skills": true,
-    "_skills_comment": "Skills (replayable macros) are stored in ./skills/skills.jsonl relative to the project root. The directory is created automatically and is git-ignored.",
     "skills_path": "skills/skills.jsonl",
     "planner": {
       "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces.",

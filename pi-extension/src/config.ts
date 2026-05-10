@@ -16,7 +16,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export interface ExtensionConfig {
-  /** Where saved skills (replayable macros) live. */
+  /** When true, skill_save / skill_list / skill_run are registered and a
+   *  SkillStore is created on disk.  Defaults to false so the extension
+   *  doesn't write a skills file unless the user opts in. */
+  skillsEnabled: boolean;
+  /** Where saved skills (replayable macros) live when skillsEnabled=true.
+   *  Empty string resolves to <extensionRoot>/runtime/skills/skills.jsonl,
+   *  which is intentionally distinct from the standalone Python agent's
+   *  ./skills/skills.jsonl so the two libraries don't shadow each other. */
   skillsPath: string;
   /** When true, the extension records a JSONL trace of every tool call. */
   recordTrace: boolean;
@@ -61,6 +68,7 @@ export interface ExtensionConfig {
 }
 
 const DEFAULTS: ExtensionConfig = {
+  skillsEnabled: false,
   skillsPath: "",  // resolved to <extensionRoot>/runtime/skills/skills.jsonl in loadConfig
   recordTrace: true,
   traceDir: "",    // resolved to <extensionRoot>/runtime/traces in loadConfig

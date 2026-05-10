@@ -212,6 +212,13 @@ class Agent:
         # Trace + skill store wiring (Phase 2).
         trace_dir = self._agent_cfg.get("trace_dir", "logs/traces")
         skills_path = self._agent_cfg.get("skills_path", "skills/skills.jsonl")
+        # Skills are OPT-IN: when skills_enabled is false (the default), the
+        # SkillStore is not created and the skill_save / skill_list /
+        # skill_run tools are not registered, so no skills/ directory is
+        # written to disk and the conversation history doesn't carry
+        # skill-suggestion blocks.  Set agent.skills_enabled=true to record
+        # successful tool sequences as replayable macros.
+        self._skills_enabled: bool = bool(self._agent_cfg.get("skills_enabled", False))
         self._suggest_skills: bool = bool(self._agent_cfg.get("suggest_skills", True))
         self._record_trace: bool = bool(self._agent_cfg.get("record_trace", True))
 
@@ -221,11 +228,15 @@ class Agent:
             logger.warning("[agent] TraceWriter init failed: %s", e)
             self._trace = None
 
-        try:
-            self._skill_store = SkillStore(skills_path)
-        except Exception as e:
-            logger.warning("[agent] SkillStore init failed: %s", e)
+        if self._skills_enabled:
+            try:
+                self._skill_store = SkillStore(skills_path)
+            except Exception as e:
+                logger.warning("[agent] SkillStore init failed: %s", e)
+                self._skill_store = None
+        else:
             self._skill_store = None
+            logger.info("[agent] skills disabled (agent.skills_enabled=false)")
 
         if self._trace:
             try:

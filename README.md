@@ -35,7 +35,7 @@ is configured to use and exposes desktop tools plus `/autogui`.
 | **Browser (Playwright)** | First-class Chromium driver: real DOM/ARIA selectors, `browser_click`, `browser_fill`, `browser_eval` — opt-in via `allowed_browser` |
 | **Native input (Windows)** | `click`/`type_text`/`hotkey` go through `user32.SendInput` directly (real INPUT events, correct DPI, full Unicode) |
 | **Best-of-N sampling** | On uncertain steps (recent failure or non-APPROVED validator), sample N candidates and pick via self-consistency or a verifier model |
-| **Skill library** | `skill_save`/`skill_list`/`skill_run`: persist successful tool sequences, retrieve them by keyword on the next task |
+| **Skill library** (opt-in) | `skill_save`/`skill_list`/`skill_run`: persist successful tool sequences and retrieve them by keyword on the next task. Off by default — enable with `agent.skills_enabled=true`. Each side keeps its own library: standalone agent uses `./skills/`, Pi extension uses `pi-extension/runtime/skills/`. |
 | **Trajectory replay** | Per-session JSONL trace + `replay.py` re-runs any saved skill or trace deterministically (no LLM) |
 | **Failure recording** | Rolling 5-second screen buffer dumps to an animated GIF on tool failure |
 | **State diff & modal flag** | Pre/post-action window-set diff with an `[UNEXPECTED MODAL: …]` banner when an error/permission/confirm dialog appears |
@@ -427,6 +427,46 @@ validator in a tmux session with only screenshot and window-listing tools active
 
 See `pi-extension/README.md` for the full extension details.
 
+### Skill library (opt-in)
+
+Skills are named, replayable sequences of successful tool calls — saved with
+`skill_save`, listed with `skill_list`, replayed with `skill_run` (or
+`replay.py` outside the agent loop).
+
+**Skills are off by default.**  To enable them in the standalone Python
+agent, set `agent.skills_enabled` in `config.json`:
+
+```jsonc
+{
+  "agent": {
+    "skills_enabled": true,             // default false — must opt in to write skills
+    "skills_path": "skills/skills.jsonl"  // standalone-agent skill library
+  }
+}
+```
+
+Once enabled, the standalone agent stores skills in
+`./skills/skills.jsonl` (relative to the project root).  This path is
+**deliberately separate** from the Pi extension's library at
+`pi-extension/runtime/skills/skills.jsonl` — each side manages its own
+skills so they don't shadow each other.  Both directories are
+git-ignored and created automatically on first save.
+
+| Side | Default skill path | Config key |
+|------|--------------------|------------|
+| Standalone Python agent | `skills/skills.jsonl` | `agent.skills_enabled` + `agent.skills_path` |
+| Pi extension | `pi-extension/runtime/skills/skills.jsonl` | `skillsEnabled` + `skillsPath` (in `pi-extension/config.json`) |
+
+If you want a single shared library across both, point both `skills_path`
+and `skillsPath` at the same absolute path — but the default is to keep
+them separate so each program's library is private.
+
+When `skills_enabled` is false the agent never creates the
+`SkillStore`, never registers `skill_save` / `skill_list` / `skill_run`,
+and never writes a `skills/` directory.  `agent.suggest_skills` (which
+controls the "candidate skills" block at task start) has no effect in
+that mode.
+
 ### Runtime directories
 
 The standalone Python agent creates runtime directories as needed:
@@ -435,20 +475,20 @@ The standalone Python agent creates runtime directories as needed:
 |------|----------|
 | `logs/` | `agent.log` (rotating) + per-session `session_<ts>.log` files |
 | `logs/traces/` | Per-task JSONL trajectory logs |
+| `logs/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
+| `logs/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
 | `screenshots/` | Ad-hoc screenshots taken by the agent |
 | `screenshots/failures/` | Animated GIF failure recordings |
-| `skills/` | **Skill library** — `skills/skills.jsonl`, one record per saved skill |
-
-`skills/` is git-ignored. Skills are replayable macros saved with `skill_save` and
-retrieved automatically at task start by keyword. They are shared with the Pi extension
-when both are run from the same project root (point `skillsPath` at the same file).
+| `skills/` | **Skill library** — `skills/skills.jsonl` (only when `skills_enabled=true`) |
 
 The Pi extension writes runtime files under `pi-extension/runtime/`:
 
 | Path | Contents |
 |------|----------|
-| `pi-extension/runtime/skills/` | **Skill library** — `skills.jsonl` |
+| `pi-extension/runtime/skills/` | **Skill library** — `skills.jsonl` (only when `skillsEnabled=true`) |
 | `pi-extension/runtime/traces/` | Per-session JSONL trajectory logs |
+| `pi-extension/runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
+| `pi-extension/runtime/progress/` | Per-task JSON progress records |
 | `pi-extension/runtime/screenshots/` | Ad-hoc screenshots |
 | `pi-extension/runtime/failures/` | Animated GIF failure recordings |
 | `pi-extension/runtime/logs/` | `autogui.log` |
@@ -625,8 +665,10 @@ No configuration is needed.
     "vision_screenshots": true,          // Send screenshots to vision-capable models
     "record_trace": true,                // Persist every event to logs/traces/<session>.jsonl
     "trace_dir": "logs/traces",          // Where the JSONL trajectory log lives
-    "suggest_skills": true,              // Offer top-K saved skills at task start
-    "skills_path": "skills/skills.jsonl",  // Skill library — git-ignored, created automatically
+    "skills_enabled": false,             // OFF by default — must opt in to record/replay skills
+    "suggest_skills": true,              // Offer top-K saved skills at task start (only when skills_enabled=true)
+    "skills_path": "skills/skills.jsonl",  // Standalone-agent skill library; deliberately distinct from
+                                            //   pi-extension/runtime/skills/skills.jsonl so each side has its own
     "planner": {                          // Pre-execution planning pass
       "enabled": true                     // One extra LLM call up front (uses the primary client)
     },
