@@ -61,6 +61,47 @@ _SK_SPECIAL: dict[str, str] = {
 _SK_ESCAPE = set("+^%~{}[]() ")
 
 
+def _decode_clixml(text: str) -> str:
+    """Extract human-readable error/warning messages from PowerShell's
+    CLIXML-serialised stderr.
+
+    PowerShell wraps non-success streams in
+    ``#< CLIXML\\n<Objs ...>...</Objs>`` when invoked via
+    ``powershell.exe -Command`` / ``-EncodedCommand`` without
+    ``-OutputFormat Text``.  We pass -OutputFormat Text now, but some
+    older 5.1 builds still emit CLIXML for certain pipeline shapes —
+    parse it as a backstop so the user always sees a real diagnostic
+    instead of an unreadable XML blob.
+    """
+    try:
+        import re as _re
+        envelope = text.split("\n", 1)[1] if text.startswith("#< CLIXML") else text
+        # Pull every <S S="Error"> ... </S> — that's where the actual
+        # exception messages live.  Order is preserved so the user
+        # sees them in the same sequence PowerShell produced them.
+        msgs = _re.findall(
+            r'<S S="Error">(.*?)</S>',
+            envelope,
+            flags=_re.DOTALL,
+        )
+        if not msgs:
+            return text  # unrecognised CLIXML shape; show raw
+        decoded = []
+        for m in msgs:
+            # CLIXML escapes some control chars as _x000D_ / _x000A_
+            # (UTF-16 hex escapes); replace the common ones with their
+            # actual characters.
+            m = (
+                m.replace("_x000D_", "\r")
+                 .replace("_x000A_", "\n")
+                 .replace("_x0009_", "\t")
+            )
+            decoded.append(m.strip())
+        return " | ".join(s for s in decoded if s)
+    except Exception:
+        return text
+
+
 def _to_sendkeys(keys: list[str]) -> str:
     """
     Convert a list like ['ctrl','alt','t'] to a SendKeys string like '^%(t)'.
@@ -125,15 +166,32 @@ class WSLBackend(DesktopBackend):
         try:
             proc = await asyncio.create_subprocess_exec(
                 "powershell.exe",
-                "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded,
+                # -OutputFormat Text keeps the error / warning / info
+                # streams as plain UTF-8 text instead of CLIXML-encoded
+                # PowerShell objects.  Without this any non-success
+                # stream comes back wrapped in
+                # "#< CLIXML\r\n<Objs ...>" which is unreadable to the
+                # user and useless for diagnosing screenshot failures.
+                "-NoProfile", "-NonInteractive", "-OutputFormat", "Text",
+                "-EncodedCommand", encoded,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_text = stdout.decode("utf-8", errors="replace").strip()
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            # Belt-and-suspenders: even with -OutputFormat Text some
+            # PowerShell setups (older 5.1 builds, certain pipeline
+            # configurations) still emit CLIXML on stderr.  Strip the
+            # XML envelope and pull the actual <S S="Error"> message
+            # text so the user sees a real diagnostic instead of an
+            # XML blob.
+            if stderr_text.startswith("#< CLIXML"):
+                stderr_text = _decode_clixml(stderr_text)
             return (
                 proc.returncode or 0,
-                stdout.decode("utf-8", errors="replace").strip(),
-                stderr.decode("utf-8", errors="replace").strip(),
+                stdout_text,
+                stderr_text,
             )
         except FileNotFoundError:
             return (-1, "", "powershell.exe not found — WSL interop may be disabled")
