@@ -105,15 +105,20 @@ async def _check_app(target: str) -> PreflightResult:
 
     On WSL the model often hints Windows-only apps (notepad, excel,
     chrome) that don't appear on the Linux PATH but ARE reachable
-    through WSL interop.  We try shutil.which first, then fall back to
-    ``where.exe`` so a Windows-side resolution still passes the check.
+    through WSL interop.  We try shutil.which first, then probe a
+    series of WSL-aware fallbacks (where.exe via PATH, where.exe at
+    its hard-coded interop path, then direct path checks under
+    /mnt/c/Windows/System32 etc.) so apps reachable through interop
+    don't fail the preflight just because the WSL ``$PATH`` excludes
+    Windows directories (``appendWindowsPath = false``).
     """
     if not target:
         return PreflightResult(PreflightCheck("app", target), False, "empty target")
     # Models often pass bare names like 'edge' / 'notepad' / 'excel';
     # try the bare name first then the .exe variant on Windows AND WSL.
     candidates = [target]
-    is_windowsy = _platform.system() == "Windows" or _is_wsl()
+    is_wsl = _is_wsl()
+    is_windowsy = _platform.system() == "Windows" or is_wsl
     if is_windowsy and not target.lower().endswith(".exe"):
         candidates.append(target + ".exe")
     for c in candidates:
@@ -121,28 +126,57 @@ async def _check_app(target: str) -> PreflightResult:
         if path:
             return PreflightResult(PreflightCheck("app", target), True,
                                    f"resolved to {path}")
-    # WSL fallback: ask Windows where the executable lives.  This finds
-    # apps installed under C:\\Program Files / C:\\Windows that aren't
-    # on the WSL PATH but are perfectly launchable through interop.
-    if _is_wsl() and shutil.which("where.exe"):
+
+    if is_wsl:
+        # 1. where.exe (PATH-resolved if appendWindowsPath=true, else its
+        #    hard-coded location under /mnt/c/Windows/System32 which is
+        #    always present on a stock WSL with interop enabled).  An
+        #    absolute path to where.exe still works because WSL interop
+        #    runs Windows binaries transparently.
+        import subprocess
+        where_candidates = [
+            shutil.which("where.exe"),
+            "/mnt/c/Windows/System32/where.exe",
+        ]
+        seen: set[str] = set()
+        for where_bin in where_candidates:
+            if not where_bin or where_bin in seen:
+                continue
+            seen.add(where_bin)
+            for c in candidates:
+                try:
+                    result = await asyncio.to_thread(
+                        subprocess.run,
+                        [where_bin, c],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        first = result.stdout.strip().splitlines()[0].strip()
+                        return PreflightResult(
+                            PreflightCheck("app", target), True,
+                            f"resolved via where.exe: {first}",
+                        )
+                except (OSError, subprocess.SubprocessError):
+                    continue
+
+        # 2. Direct file check under common Windows binary locations.
+        #    Catches stock-Windows apps like notepad.exe / cmd.exe /
+        #    explorer.exe even when neither shutil.which nor where.exe
+        #    can run.
+        win_dirs = (
+            "/mnt/c/Windows/System32",
+            "/mnt/c/Windows/SysWOW64",
+            "/mnt/c/Windows",
+        )
         for c in candidates:
-            try:
-                # Run synchronously in a thread so the event loop stays
-                # responsive even when 'where.exe' is slow.
-                import subprocess
-                result = await asyncio.to_thread(
-                    subprocess.run,
-                    ["where.exe", c],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    first = result.stdout.strip().splitlines()[0].strip()
+            for d in win_dirs:
+                full = os.path.join(d, c)
+                if os.path.isfile(full):
                     return PreflightResult(
                         PreflightCheck("app", target), True,
-                        f"resolved via where.exe: {first}",
+                        f"resolved via WSL interop path: {full}",
                     )
-            except (OSError, subprocess.SubprocessError):
-                pass
+
     return PreflightResult(PreflightCheck("app", target), False,
                            "not on PATH")
 
