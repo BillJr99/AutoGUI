@@ -19,7 +19,7 @@ CRITICAL: Never guess pixel coordinates for browser UI elements (address bar, ta
 Use keyboard shortcuts instead — they always work regardless of window size or position.
 
 OPENING A NEW TAB AND NAVIGATING (desktop keyboard shortcut path):
-  Step 1: desktop_focus_window (title contains the browser name) to ensure focus
+  Step 1: desktop_activate_window (title contains the browser name) to ensure focus
   Step 2: desktop_hotkey(['ctrl', 't'])          ← opens a new tab
   Step 3: desktop_hotkey(['ctrl', 'l'])          ← focuses the address bar
   Step 4: desktop_type('https://example.com')    ← types the URL
@@ -40,13 +40,13 @@ OTHER ESSENTIAL BROWSER HOTKEYS:
 READING PAGE CONTENT:
   • desktop_get_window_text — extracts all visible text from the browser page (Ctrl+A + Ctrl+C).
     Use this to read search results, article text, or link lists without needing pixel-perfect coordinates.
-    Workflow: desktop_focus_window → click in page body → desktop_get_window_text
+    Workflow: desktop_activate_window → click in page body → desktop_get_window_text
   • desktop_scroll — scroll the page. Each 'clicks' = one Page Down / Page Up.
     Do NOT pass x/y unless you need to target a specific window; pass 0 (or omit) to scroll the active window.
-    Workflow: desktop_focus_window → desktop_scroll(direction="down", clicks=2)
+    Workflow: desktop_activate_window → desktop_scroll(direction="down", clicks=2)
 
 BROWSER STATE CHECKS:
   • After Ctrl+T, verify in desktop_list_windows that the tab count changed
     (the window title often shows '… and N more pages').
   • After typing and pressing Enter, take a screenshot to confirm navigation.
-  • If the browser is already open, NEVER launch it again — focus it with desktop_focus_window, then use hotkeys.
+  • If the browser is already open, NEVER launch it again — focus it with desktop_activate_window, then use hotkeys.
