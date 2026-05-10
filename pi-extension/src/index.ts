@@ -118,6 +118,9 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   // Per-session state for skills + Set-of-Mark + trace.
   const sessionSteps: SkillStep[] = [];
   const lastMarks: { value: Mark[] } = { value: [] };
+  // Track tmux session names started by spawnAutoGuiValidator so
+  // autogui-abort can kill them.
+  const activeValidatorSessions = new Set<string>();
   // Mutable holders so tools.ts can read/write the current plan +
   // progress record over the lifetime of an /autogui task.
   const planSlot: { value: Plan | undefined } = { value: undefined };
@@ -389,6 +392,17 @@ ${autoGuiTask}`;
       resetAutoGuiState();
       ctx.abort();
       await logger.log("command.autogui-abort", { wasIdle: ctx.isIdle(), hadPendingMessages: ctx.hasPendingMessages() });
+
+      // Kill any validator tmux sessions started by this extension.
+      if (activeValidatorSessions.size > 0) {
+        const sessions = [...activeValidatorSessions];
+        activeValidatorSessions.clear();
+        await Promise.all(sessions.map(async (s) => {
+          const r = await execFile("tmux", ["kill-session", "-t", s]).catch((e: unknown) => ({ code: -1, stderr: String(e) }));
+          await logger.log("autogui-abort.kill-session", { session: s, code: (r as { code: number }).code });
+        }));
+      }
+
       ctx.ui.notify("AutoGUI automation aborted.", "warning");
     },
   });
@@ -463,6 +477,7 @@ ${trimmed}`;
       notify(`Failed to spawn AutoGUI validator: ${result.stderr || result.stdout}`, "error");
       return;
     }
+    activeValidatorSessions.add(sessionName);
     notify(`Spawned AutoGUI validator in tmux session: ${sessionName}`, "info");
   };
 
