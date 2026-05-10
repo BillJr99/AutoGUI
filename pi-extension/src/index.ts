@@ -406,25 +406,31 @@ ${autoGuiTask}`;
     },
   });
 
-  pi.registerCommand("autogui-validate", {
-    description: "Spawn a read-only AutoGUI validator Pi in tmux",
-    handler: async (args, ctx) => {
-      const task = args.trim();
-      await logger.log("command.autogui-validate", { task });
-      if (!task) {
-        ctx.ui.notify("Usage: /autogui-validate <task or expected desktop state>", "warning");
-        return;
-      }
-      if (!await commandExists("tmux", ctx.signal)) {
-        ctx.ui.notify("tmux is not installed or not on PATH; cannot spawn validator.", "error");
-        return;
-      }
+  /** Spawn a read-only AutoGUI validator Pi in a fresh tmux session.
+   *  Used to be wired to /autogui-validate as a manual command, but now
+   *  fires automatically from message_end() when an /autogui task
+   *  completes (stopReason="stop") and ``cfg.validateAfterAutogui`` is
+   *  on.  Best-effort: any spawn failure is logged + notified but never
+   *  rolls back the autogui completion. */
+  const spawnAutoGuiValidator = async (task: string, opts: {
+    cwd?: string;
+    notify?: (msg: string, level: "info" | "warning" | "error") => void;
+    signal?: AbortSignal;
+  } = {}): Promise<void> => {
+    const trimmed = task.trim();
+    if (!trimmed) return;
+    const cwd = opts.cwd ?? process.cwd();
+    const notify = opts.notify ?? (() => undefined);
+    if (!await commandExists("tmux", opts.signal)) {
+      notify("tmux is not installed or not on PATH; cannot spawn AutoGUI validator.", "warning");
+      return;
+    }
 
-      const sessionName = `autogui-validator-${Date.now()}`;
-      const c = await getConfig();
-      let backend: DesktopBackend | undefined;
-      try { backend = await getBackend(); } catch { /* fall through */ }
-      const validatorPrompt = `${buildAutoGuiPrompt(c, backend)}
+    const sessionName = `autogui-validator-${Date.now()}`;
+    const c = await getConfig();
+    let backend: DesktopBackend | undefined;
+    try { backend = await getBackend(); } catch { /* fall through */ }
+    const validatorPrompt = `${buildAutoGuiPrompt(c, backend)}
 
 Validator mode:
 - You are a read-only validator running in a separate Pi process.
@@ -433,31 +439,30 @@ Validator mode:
 - Report whether the current desktop state appears consistent with the requested task.
 
 Task or expected state to validate:
-${task}`;
+${trimmed}`;
 
-      const command = [
-        "cd", shellQuote(ctx.cwd), "&&",
-        "pi",
-        "--no-session",
-        "--no-builtin-tools",
-        "--tools", shellQuote("desktop_screenshot,desktop_list_windows,desktop_active_window"),
-        "-e", shellQuote(extensionEntry),
-        "-p", shellQuote(validatorPrompt),
-        ";",
-        "printf", shellQuote("\\nValidator finished. Press Enter to close this tmux pane.\\n"),
-        ";",
-        "read", "-r", "_",
-      ].join(" ");
+    const command = [
+      "cd", shellQuote(cwd), "&&",
+      "pi",
+      "--no-session",
+      "--no-builtin-tools",
+      "--tools", shellQuote("desktop_screenshot,desktop_list_windows,desktop_active_window"),
+      "-e", shellQuote(extensionEntry),
+      "-p", shellQuote(validatorPrompt),
+      ";",
+      "printf", shellQuote("\\nValidator finished. Press Enter to close this tmux pane.\\n"),
+      ";",
+      "read", "-r", "_",
+    ].join(" ");
 
-      const result = await execFile("tmux", ["new-session", "-d", "-s", sessionName, command], { timeoutMs: 5000, signal: ctx.signal });
-      await logger.log("command.autogui-validate.spawn", { sessionName, code: result.code, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut });
-      if (result.code !== 0) {
-        ctx.ui.notify(`Failed to spawn tmux validator: ${result.stderr || result.stdout}`, "error");
-        return;
-      }
-      ctx.ui.notify(`Spawned validator in tmux session: ${sessionName}`, "info");
-    },
-  });
+    const result = await execFile("tmux", ["new-session", "-d", "-s", sessionName, command], { timeoutMs: 5000, signal: opts.signal });
+    await logger.log("autogui.validator.spawn", { sessionName, code: result.code, stdout: result.stdout, stderr: result.stderr, timedOut: result.timedOut, trigger: "auto-after-autogui" });
+    if (result.code !== 0) {
+      notify(`Failed to spawn AutoGUI validator: ${result.stderr || result.stdout}`, "error");
+      return;
+    }
+    notify(`Spawned AutoGUI validator in tmux session: ${sessionName}`, "info");
+  };
 
   pi.on("before_provider_request", async (event) => {
     await logger.log("provider.request", { payloadPreview: JSON.stringify(event.payload).slice(0, 4000) });
@@ -481,7 +486,24 @@ ${task}`;
 
   pi.on("message_end", async (event) => {
     if (autoGuiActive && event.message.role === "assistant" && (event.message.stopReason === "stop" || event.message.stopReason === "aborted")) {
+      // Capture the task BEFORE resetAutoGuiState() clears it.  When the
+      // task completes naturally (stopReason="stop") and the user has
+      // left ``validateAfterAutogui`` on, kick off a read-only tmux
+      // validator pane that double-checks the desktop matches the
+      // requested task.  Aborted runs skip the validator since there's
+      // nothing meaningful to validate.
+      const completedTask = autoGuiTask;
+      const stopReason = event.message.stopReason;
       resetAutoGuiState();
+      if (stopReason === "stop" && completedTask) {
+        const c = await getConfig().catch(() => undefined);
+        if (c?.validateAfterAutogui) {
+          // Fire-and-forget; spawnAutoGuiValidator catches its own errors.
+          void spawnAutoGuiValidator(completedTask).catch((e) => {
+            void logger.log("autogui.validator.spawn.error", { error: String(e) });
+          });
+        }
+      }
       return;
     }
     if (!autoGuiActive || event.message.role !== "assistant" || event.message.stopReason !== "error") return;

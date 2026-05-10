@@ -6,9 +6,8 @@ This extension is decoupled from OpenWebUI. It does not create a model client, m
 
 ## What It Adds
 
-- `/autogui <task>`: sends a prepared desktop-automation prompt into Pi's normal agent loop.
+- `/autogui <task>`: sends a prepared desktop-automation prompt into Pi's normal agent loop.  When the task completes naturally and `validateAfterAutogui` is on (default), a read-only Pi validator is auto-spawned in a fresh tmux pane to double-check the desktop state.
 - `/autogui-abort`: aborts the current AutoGUI/Pi agent operation.
-- `/autogui-validate <task>`: spawns a separate read-only Pi validator in tmux.
 - `/desktop-status`: reports the detected backend, capabilities, and config snapshot.
 - Desktop tools (all platforms):
   - `desktop_screenshot`, `desktop_screenshot_marked`
@@ -216,27 +215,21 @@ AutoGUI also has an outer retry loop for these provider statuses. If Pi's own re
 
 After repeated `404`/`429` provider failures, AutoGUI enters screenshot degrade mode. Screenshots are still captured and saved to `runtime/screenshots`, but future `desktop_screenshot` results omit the inline image payload and the context hook strips earlier screenshot image payloads before provider calls. This lets the agent continue with window bounds, active-window detection, explicit window focusing, screenshot paths, and non-visual tools when the selected provider route struggles with image payloads.
 
-## Optional tmux Validator
+## Auto-Spawned tmux Validator
 
-Use `/autogui-validate <task>` to launch a separate Pi process in a detached tmux session:
-
-```text
-/autogui-validate Confirm the browser is open on the expected page
-```
-
-The validator is intentionally read-only. It starts Pi with only:
+When an `/autogui` task ends naturally (assistant `stopReason="stop"`) and `validateAfterAutogui` is `true` in `config.json` (the default), the extension auto-spawns a read-only Pi validator in a fresh detached tmux session.  The validator gets only:
 
 - `desktop_screenshot`
 - `desktop_list_windows`
 - `desktop_active_window`
 
-The spawned tmux session is named `autogui-validator-<timestamp>`. Attach to it with:
+…and the same task description as the original run, plus a "validator mode" rider that tells the model not to click/type/launch.  The spawned session is named `autogui-validator-<timestamp>`; attach with:
 
 ```bash
 tmux attach -t autogui-validator-<timestamp>
 ```
 
-This is useful when you want a second model pass to inspect the desktop state without giving that pass click/type/launch tools. It is opt-in because spawning another Pi can consume another model request and should be visible to the user.
+Use this when you want a second model pass to inspect the desktop state without giving that pass click/type/launch tools.  Aborted tasks (`/autogui-abort`) skip the validator.  Set `validateAfterAutogui: false` in `config.json` to disable the auto-spawn entirely — the cost is a separate Pi process per completed task, which means another model request, so users on tight token budgets will want to flip it off.
 
 ## Runtime Files
 

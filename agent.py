@@ -2396,7 +2396,19 @@ class Agent:
                         path_str = result_obj.get("path", "?")
                         dims = f"{result_obj.get('width')}×{result_obj.get('height')}"
 
-                        if self._vision_screenshots and b64:
+                        # Detect a screenshot-tool failure first: the base
+                        # backend returns {"error": ...} (no path/base64)
+                        # when PIL is missing or ImageGrab raises.  Without
+                        # this branch, the message below would mislead with
+                        # "saved" + path "?" + "None×None".
+                        shot_error = result_obj.get("error")
+                        if shot_error:
+                            yield AgentEvent(
+                                kind="tool_result",
+                                content=f"Auto-screenshot FAILED: {str(shot_error)[:200]}",
+                                data={"tool_name": "desktop_screenshot", "iteration": iteration, "error": shot_error},
+                            )
+                        elif self._vision_screenshots and b64:
                             self._history.append({
                                 "role": "user",
                                 "content": [

@@ -54,6 +54,9 @@
   "_vision_section": "When visionEnabled is true (default), desktop_screenshot results include the inline PNG image so the model can see the screen. Set false to return only the file path (useful if the provider struggles with image payloads).",
   "visionEnabled": true,
 
+  "_validate_section": "When validateAfterAutogui is true (default), an /autogui task that completes naturally (stopReason=stop) auto-spawns a read-only Pi validator in a fresh tmux session — only screenshot + window-listing tools active — to double-check the desktop matches the requested task. Aborted runs skip the validator. Set false to suppress the follow-up entirely (saves a model request per completed task).",
+  "validateAfterAutogui": true,
+
   "_record_section": "Rolling screen buffer. On any tool failure the buffer is concatenated into a GIF under outDir for post-mortem.",
   "screenRecord": {
     "enabled": true,

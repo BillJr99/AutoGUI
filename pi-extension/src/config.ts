@@ -99,6 +99,11 @@ export interface ExtensionConfig {
   };
   /** When false, desktop_screenshot returns only the file path (no inline image). */
   visionEnabled: boolean;
+  /** When true, /autogui auto-spawns a read-only tmux validator pane after the
+   *  task completes naturally (stopReason=stop).  Replaces the old
+   *  /autogui-validate manual command — flip to false to suppress the
+   *  follow-up validation entirely. */
+  validateAfterAutogui: boolean;
 }
 
 const DEFAULTS: ExtensionConfig = {
@@ -138,6 +143,7 @@ const DEFAULTS: ExtensionConfig = {
     outDir: "",
   },
   visionEnabled: true,
+  validateAfterAutogui: true,
 };
 
 function deepMerge<T>(base: T, patch: unknown): T {

@@ -422,8 +422,11 @@ Inside Pi:
 /autogui Open a harmless app and describe what you see
 ```
 
-For a read-only second pass, `/autogui-validate <task>` spawns a separate Pi
-validator in a tmux session with only screenshot and window-listing tools active.
+When an `/autogui` task completes naturally, the extension auto-spawns a
+read-only Pi validator in a fresh tmux session (only screenshot and window-
+listing tools active) to double-check the desktop state.  Set
+`validateAfterAutogui: false` in the extension's `config.json` to skip the
+follow-up.
 
 See `pi-extension/README.md` for the full extension details.
 
