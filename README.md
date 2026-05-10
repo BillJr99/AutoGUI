@@ -481,6 +481,7 @@ The standalone Python agent creates runtime directories as needed:
 | `logs/traces/` | Per-task JSONL trajectory logs |
 | `logs/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
 | `logs/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
+| `memory/` | **Per-app quirk store** — `memory/<app>.json` + `memory/index.jsonl`. Failure histograms, success counts, free-form notes (git-ignored). |
 | `screenshots/` | Ad-hoc screenshots taken by the agent |
 | `screenshots/failures/` | Animated GIF failure recordings |
 | `skills/` | **Skill library** — `skills/skills.jsonl` (only created the first time `skill_save` runs, which requires `skills_enabled=true`) |
@@ -493,6 +494,7 @@ The Pi extension writes runtime files under `pi-extension/runtime/`:
 | `pi-extension/runtime/traces/` | Per-session JSONL trajectory logs |
 | `pi-extension/runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
 | `pi-extension/runtime/progress/` | Per-task JSON progress records |
+| `pi-extension/runtime/memory/` | **Per-app quirk store** — `<app>.json` + `index.jsonl` |
 | `pi-extension/runtime/screenshots/` | Ad-hoc screenshots |
 | `pi-extension/runtime/failures/` | Animated GIF failure recordings |
 | `pi-extension/runtime/logs/` | `autogui.log` |
@@ -593,6 +595,61 @@ Open the model picker via **Ctrl+P** (the command palette) — type "model" and 
 
 ---
 
+## Robustness, planning & verification (controller-only)
+
+When `agent.controller.enabled` is on, the typed-plan controller layers
+several extra safeguards on top of the standard ReAct loop.  Each is
+individually toggleable so you can dial in the tradeoff between speed
+and reliability.
+
+| Knob | Default | What it does |
+|------|---------|-------------|
+| `agent.controller.critique_enabled` | `true` | Adds one extra LLM call after the planner that critiques the plan and returns a revised version when issues are found. Catches plan-level mistakes (missing steps, vague post-conditions, wrong dependencies) before any UI is touched. |
+| `agent.controller.preflight_enabled` | `true` | Before the first state-changing action, verifies that resources the plan needs are available: apps on PATH, files present, URLs TCP-reachable, named tools registered, probe commands exit 0. Tasks abort with a structured `preflight_failed` event when something is missing. |
+| `agent.controller.predicate_check_enabled` | `true` | When a plan step declares a typed `predicate` (`window_title_contains`, `file_exists`, `url_contains`, `text_visible`, `process_running`, `shell_returns`, …), the controller verifies it deterministically after `STEP_DONE`. A miss demotes the verdict to BLOCKED and triggers replan via the standard failure-classification path. |
+| `agent.controller.visual_diff_enabled` | `true` | When vision is on, hashes each pre/post screenshot pair via a 16×16 perceptual ("dHash") hash and tags the tool result with `verifier.visual_diff` when a state-changing action moved fewer than ~12% of bits — i.e. the screen barely changed. Catches the silent-no-op failure mode that exit-code checks miss. |
+| `agent.controller.watchdog_stall_threshold` | `3` | Hashes `(window list, active window, first proposed tool, first args)` per iteration. When the same signature recurs N times in a row the step is flagged as stuck and routed through the standard BLOCKED path. `0` disables. |
+| `agent.budget.max_*` | `0` | Hard ceilings for tool calls / chat calls / total tokens / seconds.  When any ceiling is exceeded a `budget_exceeded` event fires and the task ends before the next step runs. |
+| `agent.memory.dir` | `memory/` | Per-app quirk store (`memory/<app>.json`). The planner reads up to four "app memory hints" at task start so it can prefer strategies that worked before and avoid those that didn't. The model can also write notes via `memory_note(app, text)` and read records via `memory_get(app)`. |
+
+The planner also receives **few-shot exemplars** from the skill library
+(top-3 matches by keyword) and **app memory hints** for any visible
+apps, so plans are biased by what previously succeeded against the
+same software.
+
+`replay.py --drift-check` re-runs a saved skill while comparing the
+live post-state against the windows + perceptual screen hash recorded
+when the skill was first captured (`step.drift_anchor`).  Drift
+between rounds is logged so you know when a recipe has gone stale
+without having to re-record it from scratch.
+
+The pi extension exposes the same primitives as tools: `check_predicate`,
+`preflight`, `memory_get` / `memory_note`, `budget_status`,
+`classify_failure`, `desktop_wait_for`.  Pi owns the LLM loop, so the
+controller protocol injected into the system prompt instructs Pi's
+agent to call them at the right beats (preflight up front, predicate
+check before STEP_DONE, etc.) rather than the extension running them
+implicitly.
+
+## Test harness
+
+A pytest suite under `tests/` exercises the controller / artifacts /
+predicates / failures / app memory / budget / preflight / watchdog /
+visual diff modules with no live model and no desktop backend
+required:
+
+```bash
+pip install pytest pytest-asyncio
+python -m pytest
+```
+
+The tests use mocked `OpenWebUIClient` and `ToolRegistry` stubs (see
+`tests/conftest.py`) to drive `Agent._run_with_controller` end-to-end,
+including a budget-exhaustion case that proves the ceiling stops the
+loop before the next step runs.  Run this on every controller change
+to catch regressions in the orchestration logic without burning real
+model calls.
+
 ## Safety Guardrails
 
 ### Destructive command guard
@@ -675,6 +732,27 @@ No configuration is needed.
                                             //   pi-extension/runtime/skills/skills.jsonl so each side has its own
     "planner": {                          // Pre-execution planning pass
       "enabled": true                     // One extra LLM call up front (uses the primary client)
+    },
+    "controller": {                       // Typed-plan + step-by-step executor (opt-in)
+      "enabled": false,
+      "step_max_iterations": 8,           // Per-step iteration ceiling (separate from max_iterations)
+      "step_max_retries": 2,
+      "auto_resume": true,                // Resume completed step ids from logs/progress
+      "replan_on_block": true,
+      "critique_enabled": true,           // Extra LLM call to review the plan
+      "preflight_enabled": true,          // Verify apps/files/URLs/tools/commands before acting
+      "predicate_check_enabled": true,    // Verify typed post-conditions deterministically
+      "visual_diff_enabled": true,        // Perceptual-hash diff to flag silent-no-op actions
+      "watchdog_stall_threshold": 3       // 0 disables; flag step stuck after N identical signatures
+    },
+    "artifacts": {"dir": "logs/artifacts"},  // Content-addressed observation store
+    "progress":  {"dir": "logs/progress"},   // Per-task resume markers
+    "memory":    {"dir": "memory"},          // Per-app quirk database (separate from skills)
+    "budget": {                              // Hard ceilings; 0 = no ceiling
+      "max_tool_calls": 0,
+      "max_chat_calls": 0,
+      "max_total_tokens": 0,
+      "max_seconds": 0
     },
     "bon": {                              // Best-of-N action sampling
       "enabled": true,                    // Samples n completions, picks best on uncertain steps

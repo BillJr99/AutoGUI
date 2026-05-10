@@ -37,7 +37,9 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
+from app_memory import AppMemory, _normalize_app
 from artifacts import ArtifactStore
+from budget import BudgetTracker
 from client import OpenWebUIClient
 from controller import (
     Plan,
@@ -50,7 +52,9 @@ from controller import (
     parse_step_outcome,
 )
 from failures import FailureClass, RecoveryAction, classify, escalate_action
+import predicates
 from planner import Planner
+import preflight
 from progress import ProgressStore
 from prompt_loader import PromptLoader
 from screen_record import ScreenRecorder
@@ -58,6 +62,8 @@ from skills import SkillStore
 from subagent import Subagent
 from tools import ToolRegistry
 from trace import TraceWriter
+import visual_diff
+from watchdog import Watchdog
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +284,15 @@ class Agent:
         self._step_max_retries: int = max(0, int(controller_cfg.get("step_max_retries", 2)))
         self._auto_resume: bool = bool(controller_cfg.get("auto_resume", True))
         self._replan_on_block: bool = bool(controller_cfg.get("replan_on_block", True))
+        self._critique_enabled: bool = bool(controller_cfg.get("critique_enabled", True))
+        self._preflight_enabled: bool = bool(controller_cfg.get("preflight_enabled", True))
+        self._predicate_check_enabled: bool = bool(
+            controller_cfg.get("predicate_check_enabled", True)
+        )
+        self._visual_diff_enabled: bool = bool(
+            controller_cfg.get("visual_diff_enabled", True)
+        )
+        self._watchdog_threshold: int = int(controller_cfg.get("watchdog_stall_threshold", 3))
 
         artifact_cfg = self._agent_cfg.get("artifacts", {}) or {}
         self._artifacts: ArtifactStore | None = None
@@ -314,6 +329,29 @@ class Agent:
         self._plan: Plan | None = None
         self._task_progress = None
         self._step_retry_counts: dict[str, int] = {}
+        self._budget: BudgetTracker | None = None
+        self._watchdog: Watchdog | None = None
+        self._last_screenshot_hash: bytes | None = None
+
+        # Per-app memory store (failure histograms, success counts, notes).
+        # Lives under <agent.memory.dir> (default ./memory) and survives
+        # across sessions so the planner can warn about app quirks the
+        # next time the user touches the same app.
+        memory_cfg = self._agent_cfg.get("memory", {}) or {}
+        self._memory: AppMemory | None = None
+        try:
+            self._memory = AppMemory(memory_cfg.get("dir", "memory"))
+        except Exception as e:
+            logger.warning("[agent] AppMemory init failed: %s", e)
+            self._memory = None
+
+        # Budget ceilings.  All defaults zero = no ceiling — the user
+        # opts in to hard limits explicitly.
+        budget_cfg = self._agent_cfg.get("budget", {}) or {}
+        self._budget_max_tools: int = int(budget_cfg.get("max_tool_calls", 0))
+        self._budget_max_chats: int = int(budget_cfg.get("max_chat_calls", 0))
+        self._budget_max_tokens: int = int(budget_cfg.get("max_total_tokens", 0))
+        self._budget_max_seconds: float = float(budget_cfg.get("max_seconds", 0.0))
 
         # Register the artifact / plan / checkpoint / subagent meta-tools
         # so the model can interact with the new stores explicitly.
@@ -673,6 +711,81 @@ class Agent:
                 _ask_subagent,
             )
 
+        # ---- App-memory tools ------------------------------------------
+        if self._memory is not None:
+            async def _memory_get(app: str = "") -> dict:
+                if not app:
+                    return {"apps": agent._memory.list_apps()}
+                return agent._memory.get(str(app))
+
+            async def _memory_note(app: str, text: str, tag: str = "") -> dict:
+                if not app or not text:
+                    return {"error": "app and text are required"}
+                agent._memory.add_note(app=str(app), text=str(text), tag=str(tag or ""))
+                return {"saved": True, "app": _normalize_app(str(app))}
+
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "memory_get",
+                    "description": (
+                        "Read the per-app memory record for an app (failure "
+                        "histogram, success counts, recent notes).  Pass an "
+                        "empty app to list every app the memory store has "
+                        "ever recorded."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "app": {"type": "string"},
+                    }},
+                }},
+                _memory_get,
+            )
+            registry.add_tool(
+                {"type": "function", "function": {
+                    "name": "memory_note",
+                    "description": (
+                        "Attach a free-form note (\"Slack input box doesn't "
+                        "respond to ctrl+a\") to an app's memory record so "
+                        "future tasks against the same app see the warning."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "app": {"type": "string"},
+                        "text": {"type": "string"},
+                        "tag": {"type": "string"},
+                    }, "required": ["app", "text"]},
+                }},
+                _memory_note,
+            )
+
+        # ---- Budget tool -----------------------------------------------
+        async def _budget_status() -> dict:
+            if agent._budget is None:
+                return {"note": "no active task budget"}
+            snap = agent._budget.snapshot()
+            return {
+                "elapsed_seconds": snap.elapsed_seconds,
+                "tool_calls": snap.tool_calls,
+                "chat_calls": snap.chat_calls,
+                "prompt_tokens": snap.prompt_tokens,
+                "completion_tokens": snap.completion_tokens,
+                "total_tokens": snap.total_tokens,
+                "fraction_used": snap.fraction_used,
+                "exceeded": snap.exceeded,
+            }
+
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "budget_status",
+                "description": (
+                    "Return the current task's cost telemetry: elapsed time, "
+                    "tool/chat call counts, token usage, and how close we are "
+                    "to any configured ceiling.  Use periodically on long "
+                    "tasks to decide whether to wrap up early."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            }},
+            _budget_status,
+        )
+
     def _persist_progress(self):
         """Snapshot the live plan into the progress store (no-op if disabled)."""
         if self._progress is None or self._task_progress is None or self._plan is None:
@@ -733,14 +846,29 @@ class Agent:
 
     async def _run_with_controller(self, user_input: str) -> AsyncIterator[AgentEvent]:
         """
-        Plan -> step-by-step execution.
+        Plan -> critique -> preflight -> step-by-step execution.
 
         For each PENDING step the controller composes a scoped prompt
         (see controller.build_step_prompt), drives the executor loop in a
         per-step history, and observes the step's STEP_DONE / STEP_BLOCKED
         marker plus any tool failures.  Plan progress is persisted after
-        every step.
+        every step.  Cost telemetry, watchdog, predicate verification,
+        and visual diff are wired into the per-step loop.
         """
+        # Fresh per-task budget tracker + watchdog so concurrent runs
+        # don't share state.
+        self._budget = BudgetTracker(
+            max_tool_calls=self._budget_max_tools,
+            max_chat_calls=self._budget_max_chats,
+            max_total_tokens=self._budget_max_tokens,
+            max_seconds=self._budget_max_seconds,
+        )
+        self._watchdog = (
+            Watchdog(stall_threshold=self._watchdog_threshold)
+            if self._watchdog_threshold > 0 else None
+        )
+        self._last_screenshot_hash = None
+
         available_tools = set(self._registry.list_tools())
         windows_json = ""
         if "desktop_list_windows" in available_tools:
@@ -748,6 +876,35 @@ class Agent:
                 windows_json = await self._registry.dispatch("desktop_list_windows", {})
             except Exception:
                 pass
+
+        # --- Few-shot exemplars + memory hints ---------------------------
+        # Surface up to 3 successful skills with overlapping keywords as
+        # planning exemplars, plus per-app memory hints for any apps
+        # currently visible on the desktop.  Both are best-effort.
+        exemplars: list[dict] = []
+        if self._suggest_skills and self._skill_store is not None:
+            try:
+                exemplars = self._skill_store.search(user_input, limit=3)
+            except Exception:
+                exemplars = []
+
+        memory_hints: list[str] = []
+        if self._memory is not None and windows_json:
+            seen: set[str] = set()
+            try:
+                wins = json.loads(windows_json).get("windows") or []
+            except (json.JSONDecodeError, TypeError):
+                wins = []
+            for w in wins:
+                app = (w.get("app") or "").strip()
+                if not app or app in seen:
+                    continue
+                seen.add(app)
+                hint = self._memory.hint_for_planner(app)
+                if hint:
+                    memory_hints.append(hint)
+                if len(memory_hints) >= 4:
+                    break
 
         # --- Plan acquisition: typed first, free-text fallback ----------
         os_label = _platform.system()
@@ -762,9 +919,39 @@ class Agent:
                 browser_available=browser_avail,
                 a11y_available=a11y_avail,
                 windows_summary=windows_json,
+                exemplars=exemplars,
+                memory_hints=memory_hints,
             )
+            # Plan_typed wraps an internal client.chat call we can't
+            # otherwise observe; count it for the budget tracker.
+            if self._budget is not None:
+                self._budget.chat_calls += 1
         except Exception as e:
             logger.warning("[agent] typed planner failed: %s", e)
+
+        # --- Critique pass: one extra LLM call to review the plan ------
+        if self._critique_enabled and plan_text and plan_text.strip().startswith("{"):
+            try:
+                verdict = await self._planner.critique(task=user_input, plan_json=plan_text)
+                if self._budget is not None:
+                    self._budget.chat_calls += 1
+            except Exception as e:
+                logger.warning("[agent] critique failed: %s", e)
+                verdict = {"approve": True, "issues": [], "revised_plan_json": None}
+            if verdict.get("issues"):
+                yield AgentEvent(
+                    kind="plan_critique",
+                    content="critique issues: " + " | ".join(verdict["issues"][:5]),
+                    data={"issues": verdict["issues"], "approve": verdict.get("approve")},
+                )
+            if not verdict.get("approve") and verdict.get("revised_plan_json"):
+                plan_text = verdict["revised_plan_json"]
+                yield AgentEvent(
+                    kind="plan_revised",
+                    content="critique replaced plan",
+                    data={"source": "critique"},
+                )
+
         plan = parse_plan(plan_text)
         if not plan.steps:
             yield AgentEvent(
@@ -789,6 +976,32 @@ class Agent:
             data={"plan": plan.to_dict()},
         )
 
+        # --- Preflight: resource gates BEFORE the executor touches UI -----
+        if self._preflight_enabled:
+            checks = preflight.infer_checks_from_plan(plan.to_dict(), registry=self._registry)
+            if checks:
+                report = await preflight.run_preflight(checks, registry=self._registry)
+                yield AgentEvent(
+                    kind="preflight",
+                    content=("preflight passed" if report.all_passed
+                             else f"preflight failed ({len(report.failures())} of {len(report.results)})"),
+                    data=report.to_dict(),
+                )
+                if not report.all_passed:
+                    yield AgentEvent(
+                        kind="step_escalate",
+                        content="Preflight resources missing; aborting before any UI action.",
+                        data={"report": report.to_dict()},
+                    )
+                    if self._task_progress is not None:
+                        self._progress.finalize(self._task_progress, status="failed")
+                    yield AgentEvent(
+                        kind="done",
+                        content="Controller aborted (preflight)",
+                        data={"plan": plan.to_dict(), "status": "preflight_failed"},
+                    )
+                    return
+
         # --- Step loop ---------------------------------------------------
         global_iter = 0
         while True:
@@ -807,6 +1020,24 @@ class Agent:
                 )
                 break
 
+            # Pre-step budget check: bail BEFORE starting a new step when
+            # the previous step blew through the ceiling.  Mirror check
+            # at the bottom catches mid-step overflow as well.
+            if self._budget is not None and self._budget.exceeded:
+                yield AgentEvent(
+                    kind="budget_exceeded",
+                    content=f"Budget exceeded: {self._budget.reason()}",
+                    data=self._budget.snapshot(note="exceeded").__dict__,
+                )
+                if self._task_progress is not None:
+                    self._progress.finalize(self._task_progress, status="failed")
+                yield AgentEvent(
+                    kind="done",
+                    content="Controller stopped (budget)",
+                    data={"plan": plan.to_dict(), "status": "budget_exceeded"},
+                )
+                return
+
             step.status = StepStatus.RUNNING
             step.attempts += 1
             self._step_retry_counts[step.id] = self._step_retry_counts.get(step.id, 0)
@@ -824,10 +1055,58 @@ class Agent:
             )
             global_iter += used_iters
 
+            # Predicate verification: when the step declared a typed
+            # predicate, check it deterministically before accepting
+            # STEP_DONE.  A miss demotes the verdict to BLOCKED and
+            # routes through the standard failure-classification path.
+            predicate_failure_detail = ""
+            if (
+                verdict == StepVerdict.DONE
+                and self._predicate_check_enabled
+                and step.predicate
+            ):
+                try:
+                    p_result = await predicates.check_predicate(
+                        step.predicate, self._registry,
+                    )
+                except Exception as e:
+                    logger.warning("[agent] predicate check raised: %s", e)
+                    p_result = predicates.PredicateResult(
+                        ok=False, kind=str(step.predicate.get("kind", "?")),
+                        detail=f"check raised: {e}",
+                    )
+                yield AgentEvent(
+                    kind="predicate",
+                    content=("predicate ok: " if p_result.ok else "predicate FAILED: ")
+                            + predicates.render(step.predicate),
+                    data={
+                        "step": step.id, "ok": p_result.ok,
+                        "detail": p_result.detail,
+                        "predicate": step.predicate,
+                    },
+                )
+                if not p_result.ok:
+                    verdict = StepVerdict.BLOCKED
+                    predicate_failure_detail = p_result.detail
+                    reason = (
+                        f"predicate {predicates.render(step.predicate)} "
+                        f"did not hold ({p_result.detail})"
+                    )
+
             # Process the verdict.
             if verdict == StepVerdict.DONE:
                 step.status = StepStatus.DONE
                 step.last_error = ""
+                # Record per-app success so the planner can prefer the
+                # tools that worked next time.
+                if self._memory is not None:
+                    try:
+                        active_app = await self._best_effort_active_app()
+                        if active_app:
+                            for tool in step.tools_hint or []:
+                                self._memory.record_success(app=active_app, tool=tool)
+                    except Exception:
+                        pass
                 if self._task_progress is not None:
                     self._progress.mark_done(self._task_progress, step.id)
                 self._persist_progress()
@@ -836,6 +1115,23 @@ class Agent:
                     content=f"✓ ({step.id}) {reason[:160]}",
                     data={"step": step.to_public(), "iterations": used_iters},
                 )
+
+                # Budget check — if the user set ceilings, surface usage
+                # after each successful step and bail when exceeded.
+                if self._budget is not None and self._budget.exceeded:
+                    yield AgentEvent(
+                        kind="budget_exceeded",
+                        content=f"Budget exceeded: {self._budget.reason()}",
+                        data=self._budget.snapshot(note="exceeded").__dict__,
+                    )
+                    if self._task_progress is not None:
+                        self._progress.finalize(self._task_progress, status="failed")
+                    yield AgentEvent(
+                        kind="done",
+                        content="Controller stopped (budget)",
+                        data={"plan": plan.to_dict(), "status": "budget_exceeded"},
+                    )
+                    return
                 continue
 
             # Failed / blocked / exhausted — classify and decide.
@@ -846,6 +1142,21 @@ class Agent:
                 error_message=reason,
                 predicate_failed=verdict == StepVerdict.BLOCKED,
             )
+
+            # Record the failure against the active app's memory so the
+            # next plan can warn about it.
+            if self._memory is not None:
+                try:
+                    active_app = await self._best_effort_active_app()
+                    if active_app:
+                        self._memory.record_failure(
+                            app=active_app,
+                            tool=", ".join(step.tools_hint) or "(none)",
+                            failure_class=verdict_failure.cls.value,
+                            reason=predicate_failure_detail or reason[:120],
+                        )
+                except Exception:
+                    pass
             action = escalate_action(
                 verdict_failure,
                 retry_count=retry_count,
@@ -965,6 +1276,12 @@ class Agent:
         scoped step prompt — it does NOT touch ``self._history``, so steps
         don't contaminate each other's context.
         """
+        # Watchdog history is per-step: a "stuck on step X" signal must
+        # not bleed into step Y, even when both legitimately repeat the
+        # same set of preliminary read-only tools.
+        if self._watchdog is not None:
+            self._watchdog.reset()
+
         # Build artifact summary for the step prompt (one-line per artifact,
         # capped) so the executor knows what's already in the artifact store.
         artifact_summary = ""
@@ -1001,11 +1318,24 @@ class Agent:
 
         while iterations < self._step_max_iterations:
             iterations += 1
+
+            # Hard ceiling: refuse to make further chat calls when the
+            # task budget is already over.  The outer loop will translate
+            # this into a budget_exceeded event.
+            if self._budget is not None and self._budget.exceeded:
+                last_text = f"budget exceeded: {self._budget.reason()}"
+                last_failure = classify(
+                    tool_name="(budget)", error_message=last_text,
+                )
+                break
+
             try:
                 response = await self._client.chat(
                     messages=local_history,
                     tools=self._registry.schemas,
                 )
+                if self._budget is not None:
+                    self._budget.record_chat(response)
             except Exception as e:
                 last_text = f"chat call failed: {e}"
                 last_failure = classify(tool_name="(chat)", error_message=str(e))
@@ -1029,6 +1359,37 @@ class Agent:
                 verdict, reason = parse_step_outcome(text)
                 return verdict, reason or text[:200], iterations, last_failure
 
+            # Watchdog: hash (state + first proposed tool/args) and bail
+            # if the same signature recurs ``stall_threshold`` times.
+            if self._watchdog is not None and tool_calls:
+                first = tool_calls[0]
+                first_name = first.get("function", {}).get("name", "")
+                try:
+                    first_args = json.loads(first.get("function", {}).get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    first_args = {}
+                wd_state = await self._snapshot_watchdog_state()
+                sig = self._watchdog.signature(
+                    windows=wd_state["windows"],
+                    active_window=wd_state["active"],
+                    pending_tool=first_name,
+                    pending_args=first_args,
+                )
+                status = self._watchdog.observe(sig)
+                if status.stuck:
+                    last_failure = classify(
+                        tool_name=first_name,
+                        error_message="watchdog: no progress over "
+                                      f"{status.repeats} iterations",
+                        predicate_failed=True,
+                    )
+                    return (
+                        StepVerdict.BLOCKED,
+                        f"watchdog: same state+action signature {sig} "
+                        f"observed {status.repeats}× — step appears stuck.",
+                        iterations, last_failure,
+                    )
+
             # Dispatch each tool call.
             step_failure_seen = False
             for tc in tool_calls:
@@ -1039,6 +1400,15 @@ class Agent:
                 except json.JSONDecodeError:
                     args = {}
                 result_json = await self._registry.dispatch(tool_name, args)
+                if self._budget is not None:
+                    self._budget.record_tool()
+
+                # Default verifier: enrich the result with a structured
+                # post-condition check so the model reads it before deciding
+                # the action succeeded.
+                result_json = await self._apply_default_verifier(
+                    tool_name, args, result_json,
+                )
 
                 # Maybe store large results as artifacts to keep history small.
                 history_content = self._maybe_store_artifact(tool_name, args, result_json)
@@ -1142,6 +1512,163 @@ class Agent:
                 result[body_field] = preview
                 result[body_field + "_artifact_id"] = aid
                 return json.dumps(result, default=str)
+        return result_json
+
+    async def _snapshot_watchdog_state(self) -> dict:
+        """Cheap state snapshot for the watchdog signature.  Best-effort —
+        any failure produces empty fields so the watchdog still works."""
+        windows: list = []
+        active: dict = {}
+        tools = set(self._registry.list_tools())
+        if "desktop_list_windows" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_list_windows", {})
+                windows = json.loads(raw).get("windows") or []
+            except Exception:
+                windows = []
+        if "desktop_get_active_window" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_get_active_window", {})
+                active = json.loads(raw) or {}
+            except Exception:
+                active = {}
+        return {"windows": windows, "active": active}
+
+    async def _best_effort_active_app(self) -> str:
+        """Return a normalised app slug for the active window, or '' on miss."""
+        if "desktop_get_active_window" not in self._registry.list_tools():
+            return ""
+        try:
+            raw = await self._registry.dispatch("desktop_get_active_window", {})
+            info = json.loads(raw)
+            win = info.get("window") or info or {}
+            return _normalize_app(str(win.get("app") or win.get("title") or ""))
+        except Exception:
+            return ""
+
+    async def _apply_default_verifier(
+        self, tool_name: str, args: dict, result_json: str,
+    ) -> str:
+        """
+        For tool calls that have an obvious, cheap, post-condition check,
+        run it inline and tag the result with a ``verifier`` field so the
+        model reads structured evidence rather than trusting the tool's
+        self-reported success.
+
+        Currently covers:
+          * fs_write       — read back, confirm content matches
+          * browser_navigate — confirm window.location.href matches the URL
+          * desktop_launch — verify a window appeared in the listing
+          * any state-changing desktop tool, when vision is on — check
+            that the screen perceptual hash actually moved
+        """
+        try:
+            result = json.loads(result_json)
+        except json.JSONDecodeError:
+            return result_json
+        if "error" in result:
+            return result_json
+
+        verifier: dict = {}
+
+        if tool_name == "fs_write":
+            path = str(args.get("path") or result.get("path") or "")
+            wanted = args.get("content")
+            if path and isinstance(wanted, str):
+                try:
+                    raw = await self._registry.dispatch(
+                        "fs_read", {"path": path, "max_bytes": min(8192, len(wanted) + 16)},
+                    )
+                    parsed = json.loads(raw)
+                    body = parsed.get("content") or ""
+                    if wanted.strip() and wanted[:200] in body:
+                        verifier = {"ok": True, "kind": "fs_write_readback"}
+                    else:
+                        verifier = {
+                            "ok": False, "kind": "fs_write_readback",
+                            "detail": "read-back body does not contain written content",
+                        }
+                except Exception as e:
+                    verifier = {"ok": False, "kind": "fs_write_readback",
+                                "detail": f"read-back failed: {e}"}
+
+        elif tool_name == "browser_navigate":
+            wanted_url = str(args.get("url") or "")
+            if wanted_url and "browser_eval" in self._registry.list_tools():
+                try:
+                    raw = await self._registry.dispatch(
+                        "browser_eval", {"expression": "window.location.href"},
+                    )
+                    parsed = json.loads(raw)
+                    href = str(parsed.get("value") or "")
+                    if wanted_url in href or href in wanted_url:
+                        verifier = {"ok": True, "kind": "browser_url",
+                                    "current_url": href}
+                    else:
+                        verifier = {"ok": False, "kind": "browser_url",
+                                    "current_url": href,
+                                    "detail": "current URL does not match request"}
+                except Exception as e:
+                    verifier = {"ok": False, "kind": "browser_url",
+                                "detail": f"browser_eval failed: {e}"}
+
+        elif tool_name == "desktop_launch":
+            target = str(args.get("application") or "").rsplit(".", 1)[0].lower()
+            if target and "desktop_list_windows" in self._registry.list_tools():
+                try:
+                    raw = await self._registry.dispatch("desktop_list_windows", {})
+                    wins = json.loads(raw).get("windows") or []
+                    matched = any(
+                        target in (w.get("title", "") or "").lower()
+                        or target in (w.get("app", "") or "").lower()
+                        for w in wins
+                    )
+                    verifier = {
+                        "ok": matched, "kind": "desktop_launch_window",
+                        "detail": ("window with matching title/app found"
+                                   if matched else
+                                   f"no visible window matches {target!r}"),
+                    }
+                except Exception as e:
+                    verifier = {"ok": False, "kind": "desktop_launch_window",
+                                "detail": f"window listing failed: {e}"}
+
+        # Visual diff: applies to any state-changing desktop tool when
+        # vision is on AND the previous step's screenshot hash is on hand.
+        if (
+            self._visual_diff_enabled
+            and self._vision_screenshots
+            and tool_name in (
+                "desktop_click", "desktop_click_mark", "desktop_click_text",
+                "desktop_click_element", "desktop_type", "desktop_hotkey",
+                "desktop_scroll",
+            )
+            and "desktop_screenshot" in self._registry.list_tools()
+        ):
+            try:
+                raw = await self._registry.dispatch("desktop_screenshot", {})
+                shot = json.loads(raw)
+                b64 = shot.get("base64_png")
+                curr_hash = visual_diff.hash_b64(b64) if b64 else None
+                if curr_hash is not None:
+                    diff = visual_diff.diff(self._last_screenshot_hash, curr_hash)
+                    self._last_screenshot_hash = curr_hash
+                    if self._last_screenshot_hash is not None and diff.likely_no_change:
+                        verifier.setdefault("ok", False)
+                        verifier["visual_diff"] = {
+                            "hamming": diff.hamming,
+                            "fraction_changed": diff.fraction_changed,
+                            "note": "screen pixels barely changed; action may have been a no-op",
+                        }
+                        verifier.setdefault("kind", "visual_diff")
+                        verifier.setdefault("detail",
+                                            "perceptual hash stayed nearly identical")
+            except Exception:
+                pass
+
+        if verifier:
+            result["verifier"] = verifier
+            return json.dumps(result, default=str)
         return result_json
 
     async def _run_inner(self, user_input: str) -> AsyncIterator[AgentEvent]:

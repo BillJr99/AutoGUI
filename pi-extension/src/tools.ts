@@ -1,7 +1,9 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AppMemory } from "./app_memory.js";
 import type { ArtifactStore } from "./artifacts.js";
 import type { BrowserBackend } from "./browser_backend.js";
+import type { BudgetTracker } from "./budget.js";
 import { PerceptionCache } from "./cache.js";
 import type { ExtensionConfig } from "./config.js";
 import {
@@ -13,6 +15,17 @@ import {
   renderForPrompt,
 } from "./controller.js";
 import { classifyFailure } from "./failures.js";
+import {
+  type Predicate,
+  checkPredicate,
+  normalizePredicate,
+  renderPredicate,
+} from "./predicates.js";
+import {
+  inferChecksFromPlan,
+  runPreflight,
+  type PreflightCheck,
+} from "./preflight.js";
 import type { ProgressStore, TaskProgress } from "./progress.js";
 import { ScreenRecorder } from "./screen_record.js";
 import { normalizeSkillSteps, type SkillStep, type SkillStore } from "./skills.js";
@@ -54,6 +67,10 @@ export interface DesktopToolOptions {
   plan?: { value: Plan | undefined };
   /** Mutable holder for the active progress record. */
   progressRecord?: { value: TaskProgress | undefined };
+  /** Optional per-app memory store (failure histograms, success counts, notes). */
+  appMemory?: AppMemory;
+  /** Optional cost-telemetry tracker; reset at /autogui task start. */
+  budget?: BudgetTracker;
 }
 
 const Region = Type.Object({
@@ -177,6 +194,7 @@ export function createDesktopTools(
   ) => async (_id: string, params: T, signal?: AbortSignal) => {
     await logger?.log("tool.start", { toolName, params });
     void options.trace.writeEvent("tool_call", `→ ${toolName}`, { tool_name: toolName, args: params });
+    options.budget?.recordTool();
 
     // Dry-run: state-changing tools return a stub result.
     if (cfg.dryRun && STATE_CHANGING.has(toolName)) {
@@ -1059,6 +1077,177 @@ export function createDesktopTools(
         return textResult(`${v.cls} → ${v.action} (${v.reason})`, {
           class: v.cls, action: v.action, wait_seconds: v.waitSeconds, reason: v.reason,
         });
+      }),
+    }),
+  );
+
+  // ── check_predicate ─────────────────────────────────────────────────
+  // Lets the model verify a typed post-condition deterministically
+  // (window/file/url/text/process/shell) without round-tripping the
+  // verdict back through the LLM.
+  definitions.push(
+    defineTool({
+      name: "check_predicate",
+      label: "Check predicate",
+      description: "Evaluate a typed post-condition. Provide kind plus the relevant arg (value/path/command/stdout_contains). Returns {ok, detail, observed}. Use to verify a step's expected outcome before declaring STEP_DONE.",
+      promptSnippet: "check_predicate: verify a typed post-condition.",
+      parameters: Type.Object({
+        kind: Type.Union([
+          Type.Literal("window_title_contains"),
+          Type.Literal("window_active_app"),
+          Type.Literal("file_exists"),
+          Type.Literal("file_absent"),
+          Type.Literal("file_contains"),
+          Type.Literal("url_contains"),
+          Type.Literal("text_visible"),
+          Type.Literal("process_running"),
+          Type.Literal("shell_returns"),
+        ]),
+        value: Type.Optional(Type.String()),
+        path: Type.Optional(Type.String()),
+        command: Type.Optional(Type.String()),
+        stdout_contains: Type.Optional(Type.String()),
+      }),
+      executionMode: "sequential",
+      execute: wrap("check_predicate", async (params, signal) => {
+        const pred = normalizePredicate(params);
+        if (!pred) return textResult("Invalid predicate.", { ok: false, error: "invalid" });
+        const backend = await getBackend().catch(() => undefined);
+        const helpers: Parameters<typeof checkPredicate>[2] = {};
+        if (options.browser) {
+          helpers.browserEval = async (expr: string) => {
+            const r = await options.browser!.evalJs(expr);
+            return (r as { value?: unknown }).value;
+          };
+        }
+        helpers.findText = async (text: string) => {
+          const shot = await (await getBackend()).screenshot({ saveDir }, signal);
+          const f = await findText(shot.path, text, 0, signal);
+          return { found: !!f.found };
+        };
+        const result = await checkPredicate(pred, backend, helpers);
+        return textResult(
+          `${result.ok ? "ok" : "FAIL"}: ${renderPredicate(pred)} — ${result.detail}`,
+          {
+            ok: result.ok,
+            kind: result.kind,
+            detail: result.detail,
+            observed: result.observed,
+          },
+        );
+      }),
+    }),
+  );
+
+  // ── budget_status ───────────────────────────────────────────────────
+  if (options.budget) {
+    const tracker = options.budget;
+    definitions.push(
+      defineTool({
+        name: "budget_status",
+        label: "Budget",
+        description: "Return per-task cost telemetry: tool calls used, elapsed time, fraction of any configured ceiling consumed. Call periodically on long tasks to decide whether to wrap up early.",
+        promptSnippet: "budget_status: read the cost-telemetry counters.",
+        parameters: Type.Object({}),
+        executionMode: "sequential",
+        execute: wrap("budget_status", async () => {
+          const snap = tracker.snapshot();
+          return textResult(
+            `${snap.toolCalls} tool calls, ${snap.elapsedSeconds}s elapsed, ` +
+            `${(snap.fractionUsed * 100).toFixed(0)}% of any limit used` +
+            (snap.exceeded ? " — EXCEEDED" : ""),
+            snap as unknown as Record<string, unknown>,
+          );
+        }),
+      }),
+    );
+  }
+
+  // ── memory_get / memory_note ───────────────────────────────────────
+  if (options.appMemory) {
+    const mem = options.appMemory;
+    definitions.push(
+      defineTool({
+        name: "memory_get",
+        label: "Memory: get",
+        description: "Read the per-app memory record (failure histogram, success counts, recent notes). Pass an empty app to list every recorded app.",
+        promptSnippet: "memory_get: inspect what worked / failed for an app.",
+        parameters: Type.Object({
+          app: Type.Optional(Type.String()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("memory_get", async (params) => {
+          if (!params.app) {
+            const apps = await mem.listApps();
+            return textResult(`Memory has ${apps.length} app(s).`, { apps });
+          }
+          const rec = await mem.get(params.app);
+          return textResult(`Loaded memory for ${rec.app}.`,
+                            rec as unknown as Record<string, unknown>);
+        }),
+      }),
+      defineTool({
+        name: "memory_note",
+        label: "Memory: note",
+        description: "Attach a free-form note (\"input box doesn't respond to ctrl+a\") to an app's memory record so future tasks see the warning.",
+        promptSnippet: "memory_note: persist a per-app warning.",
+        parameters: Type.Object({
+          app: Type.String(),
+          text: Type.String(),
+          tag: Type.Optional(Type.String()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("memory_note", async (params) => {
+          await mem.addNote({ app: params.app, text: params.text, tag: params.tag });
+          return textResult(`Note saved for ${params.app}.`, { saved: true });
+        }),
+      }),
+    );
+  }
+
+  // ── preflight ──────────────────────────────────────────────────────
+  // Always available — useful even when no plan is installed (the
+  // model can run a one-off resource check before launching a flow).
+  definitions.push(
+    defineTool({
+      name: "preflight",
+      label: "Preflight",
+      description: "Verify that resources are available before touching any UI: app on PATH, file present, URL reachable, tool registered, command exits 0. Pass an explicit list of checks; when omitted, derives checks from the active plan's tools_hint and predicates.",
+      promptSnippet: "preflight: verify resources before acting.",
+      parameters: Type.Object({
+        checks: Type.Optional(Type.Array(Type.Object({
+          kind: Type.Union([
+            Type.Literal("app"),
+            Type.Literal("file"),
+            Type.Literal("url"),
+            Type.Literal("tool"),
+            Type.Literal("command"),
+          ]),
+          target: Type.String(),
+          note: Type.Optional(Type.String()),
+        }))),
+      }),
+      executionMode: "sequential",
+      execute: wrap("preflight", async (params) => {
+        const registered = new Set(definitions.map((d) => d.name));
+        const explicit = (params.checks ?? []) as PreflightCheck[];
+        const fromPlan = options.plan?.value
+          ? inferChecksFromPlan(planToDict(options.plan.value), registered)
+          : [];
+        const checks = [...explicit, ...fromPlan];
+        if (!checks.length) {
+          return textResult("No preflight checks supplied.", { results: [], allPassed: true });
+        }
+        const report = await runPreflight(checks, {
+          registeredTools: registered,
+          // shell helper omitted; preflight `command` checks simply fail
+          // with "shell unavailable" inside Pi (they aren't widely
+          // used here, and Pi's own shell tools are out of our scope).
+        });
+        const summary = report.allPassed
+          ? `Preflight passed (${report.results.length} checks).`
+          : `Preflight FAILED: ${report.results.filter((r) => !r.ok).length}/${report.results.length} missing.`;
+        return textResult(summary, report as unknown as Record<string, unknown>);
       }),
     }),
   );

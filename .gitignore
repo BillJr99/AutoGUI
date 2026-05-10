@@ -31,6 +31,7 @@ config.json
 logs/
 screenshots/
 skills/
+memory/
 pi-extension/node_modules/
 pi-extension/runtime/
 pi-extension/.agents/

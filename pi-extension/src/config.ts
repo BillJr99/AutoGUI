@@ -56,6 +56,14 @@ export interface ExtensionConfig {
   artifactsDir: string;
   /** Directory for persistent task progress records. Empty = disabled. */
   progressDir: string;
+  /** Directory for the per-app memory store (failure histograms, success
+   *  counts, free-form notes).  Empty string disables app memory. */
+  memoryDir: string;
+  /** Hard ceilings for the per-task budget tracker.  0 = no ceiling. */
+  budget: {
+    maxToolCalls: number;
+    maxSeconds: number;
+  };
   screenRecord: {
     enabled: boolean;
     fps: number;
@@ -88,6 +96,11 @@ const DEFAULTS: ExtensionConfig = {
   controllerEnabled: false,
   artifactsDir: "",   // resolved to <extensionRoot>/runtime/artifacts in loadConfig
   progressDir: "",    // resolved to <extensionRoot>/runtime/progress in loadConfig
+  memoryDir: "",      // resolved to <extensionRoot>/runtime/memory in loadConfig
+  budget: {
+    maxToolCalls: 0,
+    maxSeconds: 0,
+  },
   screenRecord: {
     enabled: true,
     fps: 5,
@@ -175,6 +188,9 @@ export async function loadConfig(extensionRoot: string): Promise<ExtensionConfig
   }
   if (!merged.progressDir) {
     merged.progressDir = join(extensionRoot, "runtime", "progress");
+  }
+  if (!merged.memoryDir) {
+    merged.memoryDir = join(extensionRoot, "runtime", "memory");
   }
 
   return merged;

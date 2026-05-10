@@ -68,7 +68,23 @@ Every key has a sensible default — leave the file out and everything works. Se
 - `controllerEnabled`: typed-plan + step-by-step protocol; injects the `plan_set` / `plan_update_step` / `checkpoint` workflow into the prompt and wires the plan slot to the new meta-tools.
 - `skillsEnabled` (default `false`): creation gate. False blocks `skill_save`; `skill_list`, `skill_run`, and the candidate-skills suggestion are always available so any existing library at `skillsPath` stays usable. Override the path with `skillsPath` (absolute).
 - `artifactsDir` / `progressDir`: locations for the artifact store and per-task progress records (default `runtime/artifacts/` and `runtime/progress/`; empty string disables that store entirely).
+- `memoryDir`: location for the per-app quirk database (default `runtime/memory/`; empty string disables). The pi-extension uses its own memory dir, separate from the standalone agent's `./memory/`.
+- `budget.maxToolCalls` / `budget.maxSeconds`: hard ceilings consulted by the `budget_status` tool. 0 = no ceiling.
 - `screenRecord.*`: rolling screen buffer for failure post-mortem.
+
+### Verification & robustness tools (always available when the supporting store is constructed)
+
+| Tool | What it does |
+|------|--------------|
+| `desktop_wait_for(window_title \| element_name \| text \| window_id, timeout)` | Block until the target appears; never click on a not-yet-drawn window. |
+| `check_predicate(kind, value/path/command/...)` | Verify a typed post-condition deterministically (window/file/URL/text/process/shell). Use after a step's expected outcome should hold. |
+| `preflight(checks?)` | Verify required apps / files / URLs / tools / commands are available. With no `checks` arg, derives the list from the active plan's `tools_hint` + predicate paths + explicit `preflight` block. |
+| `classify_failure(tool_name, error_message)` | Maps an error to one of `{transient_io, app_not_ready, missing_element, permission, predicate_not_met, user_input_needed, unknown}` and recommends `retry` / `wait_and_retry` / `replan` / `escalate`. |
+| `memory_get(app)` / `memory_note(app, text, tag?)` | Read/write the per-app quirk database under `runtime/memory/`. Surfaced into the system prompt so future tasks see what failed last time. |
+| `budget_status()` | Return tool-call / wall-time counters and the fraction of any configured ceiling consumed. |
+| `plan_set` / `plan_get` / `plan_update_step` | Manage the typed plan from inside the loop; wire `plan_update_step(id, status="done")` after each verified step. |
+| `checkpoint(label, data?)` | Persist a free-form progress marker so the task can resume after a crash or abort. |
+| `get_artifact` / `list_artifacts` | Fetch / enumerate large bodies (file content, page text, command stdout > 4KB) the wrap helper auto-stored. |
 
 Optional system dependencies for graceful-degrade features (all
 installed by `scripts/install-dependencies.*`):
@@ -230,6 +246,7 @@ All runtime output lives under `pi-extension/runtime/` (git-ignored):
 | `runtime/traces/` | Per-session JSONL trajectory logs |
 | `runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
 | `runtime/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
+| `runtime/memory/` | Per-app quirk store — `<app>.json` + `index.jsonl` (failure histograms, success counts, free-form notes) |
 | `runtime/screenshots/` | Ad-hoc screenshots taken by the agent |
 | `runtime/failures/` | Animated GIF failure recordings |
 | `runtime/browser/` | Playwright browser screenshots |

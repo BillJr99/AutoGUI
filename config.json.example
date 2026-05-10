@@ -25,12 +25,17 @@
       "enabled": true
     },
     "controller": {
-      "_comment": "Typed plan + step-by-step executor. When enabled, the planner emits a JSON plan and each step runs in its own scoped history with its own iteration budget. Replan triggers automatically on persistent failures.",
+      "_comment": "Typed plan + step-by-step executor. When enabled, the planner emits a JSON plan and each step runs in its own scoped history with its own iteration budget. Replan triggers automatically on persistent failures. critique_enabled adds one extra LLM call after the planner to review the plan; preflight_enabled gates resource availability before any UI action; predicate_check_enabled verifies typed post-conditions deterministically; visual_diff_enabled flags state-changing actions whose screen pixels barely moved; watchdog_stall_threshold flags a step as stuck after the same (state+action) signature recurs N iterations in a row (0 = disabled).",
       "enabled": false,
       "step_max_iterations": 8,
       "step_max_retries": 2,
       "auto_resume": true,
-      "replan_on_block": true
+      "replan_on_block": true,
+      "critique_enabled": true,
+      "preflight_enabled": true,
+      "predicate_check_enabled": true,
+      "visual_diff_enabled": true,
+      "watchdog_stall_threshold": 3
     },
     "artifacts": {
       "_comment": "Content-addressed store for large observations (file bodies, command stdout, OCR snippets). The model fetches by id with get_artifact when it actually needs the body.",
@@ -39,6 +44,17 @@
     "progress": {
       "_comment": "Task progress markers persisted across runs so a crash or abort can resume mid-task.",
       "dir": "logs/progress"
+    },
+    "memory": {
+      "_comment": "Per-app failure/success histograms + free-form notes. Surfaced to the planner as 'app memory hints' so future tasks against the same app see what worked / failed before. Lives under ./memory (git-ignored). The pi-extension keeps its own memory under pi-extension/runtime/memory/.",
+      "dir": "memory"
+    },
+    "budget": {
+      "_comment": "Per-task hard ceilings. 0 = no ceiling for that dimension. Exceeding any ceiling fires a budget_exceeded event and ends the task before the next step runs.",
+      "max_tool_calls": 0,
+      "max_chat_calls": 0,
+      "max_total_tokens": 0,
+      "max_seconds": 0
     },
     "subagent": {
       "_comment": "Read-only subagent for pure-lookup questions; keeps the main conversation small.",

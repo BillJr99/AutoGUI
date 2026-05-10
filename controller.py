@@ -55,9 +55,11 @@ class StepStatus(str, Enum):
 class PlanStep:
     id: str
     goal: str
-    expected: str = ""               # post-condition the executor will verify
+    expected: str = ""               # human-readable post-condition
+    predicate: dict = field(default_factory=dict)   # typed predicate (predicates.py)
     tools_hint: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)   # pre-mortem risk notes
     status: StepStatus = StepStatus.PENDING
     attempts: int = 0
     last_error: str = ""
@@ -75,6 +77,10 @@ class Plan:
     steps: list[PlanStep] = field(default_factory=list)
     created: float = field(default_factory=time.time)
     revision: int = 0
+    # Explicit preflight checks the planner / critique pass attached.  The
+    # controller passes these to ``preflight.run_preflight`` before the
+    # first step executes; failures abort the task with a structured report.
+    preflight: list[dict] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Lookup helpers
@@ -115,6 +121,7 @@ class Plan:
             "steps": [s.to_public() for s in self.steps],
             "created": self.created,
             "revision": self.revision,
+            "preflight": list(self.preflight),
         }
 
     @classmethod
@@ -126,22 +133,30 @@ class Plan:
                 status = StepStatus(sd.get("status", "pending"))
             except ValueError:
                 status = StepStatus.PENDING
+            pred = sd.get("predicate")
+            if not isinstance(pred, dict):
+                pred = {}
             steps.append(PlanStep(
                 id=str(sd.get("id", "")),
                 goal=str(sd.get("goal", "")),
                 expected=str(sd.get("expected", "")),
+                predicate=dict(pred),
                 tools_hint=list(sd.get("tools_hint") or []),
                 depends_on=list(sd.get("depends_on") or []),
+                risks=[str(r) for r in (sd.get("risks") or [])],
                 status=status,
                 attempts=int(sd.get("attempts", 0)),
                 last_error=str(sd.get("last_error", "")),
                 artifacts=list(sd.get("artifacts") or []),
                 notes=str(sd.get("notes", "")),
             ))
+        preflight_raw = data.get("preflight") or []
+        preflight = [p for p in preflight_raw if isinstance(p, dict)]
         return cls(
             steps=steps,
             created=float(data.get("created") or time.time()),
             revision=int(data.get("revision") or 0),
+            preflight=preflight,
         )
 
     def render_for_prompt(self) -> str:
@@ -160,10 +175,15 @@ class Plan:
             extras = []
             if s.expected:
                 extras.append(f"expected: {s.expected}")
+            if s.predicate:
+                from predicates import render as _render_pred
+                extras.append(f"predicate: {_render_pred(s.predicate)}")
             if s.tools_hint:
                 extras.append(f"tools: {', '.join(s.tools_hint)}")
             if s.depends_on:
                 extras.append(f"depends: {', '.join(s.depends_on)}")
+            if s.risks:
+                extras.append("risks: " + "; ".join(s.risks[:3]))
             if s.last_error and s.status == StepStatus.FAILED:
                 extras.append(f"last_error: {s.last_error[:80]}")
             if extras:

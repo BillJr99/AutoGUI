@@ -1,8 +1,10 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { AppMemory } from "./app_memory.js";
 import { ArtifactStore } from "./artifacts.js";
 import { BrowserBackend } from "./browser_backend.js";
+import { BudgetTracker } from "./budget.js";
 import { PerceptionCache } from "./cache.js";
 import { loadConfig, type ExtensionConfig } from "./config.js";
 import type { Plan } from "./controller.js";
@@ -44,17 +46,26 @@ ${controllerOn ? `Typed-plan protocol (REQUIRED):
 - Your FIRST tool call must be plan_set with a JSON plan whose schema is:
     { "steps": [
         { "id": "s1", "goal": "...", "expected": "<observable post-condition>",
-          "tools_hint": ["browser_navigate"], "depends_on": [] },
+          "predicate": { "kind": "window_title_contains"|"window_active_app"|"file_exists"|
+                                  "file_absent"|"file_contains"|"url_contains"|"text_visible"|
+                                  "process_running"|"shell_returns",
+                          "value": "...", "path": "...", "command": "...",
+                          "stdout_contains": "..." },
+          "tools_hint": ["browser_navigate"], "depends_on": [],
+          "risks": ["login wall", "captcha"] },
         ...
-    ] }
-- 3 to 8 steps; each maps to ONE observable post-condition.
-- After each step finishes, call plan_update_step(id, status="done") so progress is persisted.
+      ],
+      "preflight": [ {"kind":"app"|"file"|"url"|"tool"|"command", "target":"..."} ]
+    }
+- 3 to 8 steps; each maps to ONE observable post-condition.  Add a typed predicate when the post-condition is checkable so check_predicate can verify it deterministically.
+- BEFORE the first state-changing action, call preflight() to confirm required apps/files/URLs/tools/commands are available.  Bail out cleanly if anything is missing.
+- After each step finishes, call check_predicate (when one is set), then plan_update_step(id, status="done").
 - If a step is blocked, call plan_update_step(id, status="blocked", notes="why"), then revise the plan with another plan_set call.
-- Use plan_get when you need to see current statuses.
-- For long-running tasks, call checkpoint(label, data) after non-trivial milestones so a crash / abort can resume from the marker.
-- Use desktop_wait_for after desktop_launch / browser_navigate / any action that triggers a slow UI transition. Never click a window that may not be drawn yet.
-- For pure read-only lookups (\"which file mentions X\", \"summarise this stdout\"), prefer get_artifact / list_artifacts to keep history small.
-- Classify any persistent failure with classify_failure to decide between retry / wait / replan / escalate.
+- Use plan_get when you need to see current statuses; budget_status to see how much of the budget is used.
+- For long-running tasks, call checkpoint(label, data) after non-trivial milestones.
+- Use desktop_wait_for after desktop_launch / browser_navigate / any action that triggers a slow UI transition.
+- For pure read-only lookups, prefer get_artifact / list_artifacts to keep history small.
+- Classify persistent failures with classify_failure; record them via memory_note so future tasks see the warning.
 
 ` : (planner ? `Planning protocol:
 - BEFORE taking any state-changing action, your FIRST assistant message must be a numbered plan of 3 to 8 high-level steps that will accomplish the task.
@@ -128,6 +139,8 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   let cfg: ExtensionConfig | undefined;
   let artifactStore: ArtifactStore | undefined;
   let progressStore: ProgressStore | undefined;
+  let appMemory: AppMemory | undefined;
+  let budget: BudgetTracker | undefined;
 
   const init = (async () => {
     cfg = await getConfig();
@@ -148,6 +161,13 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
     if (cfg.progressDir) {
       progressStore = new ProgressStore(cfg.progressDir);
     }
+    if (cfg.memoryDir) {
+      appMemory = new AppMemory(cfg.memoryDir);
+    }
+    budget = new BudgetTracker({
+      maxToolCalls: cfg.budget.maxToolCalls,
+      maxSeconds: cfg.budget.maxSeconds,
+    });
     if (cfg.recordTrace) {
       trace = new TraceWriter(cfg.traceDir);
       void trace.writeMeta({ event: "session_start" });
@@ -279,6 +299,8 @@ ${autoGuiTask}`;
       progressStore,
       plan: planSlot,
       progressRecord: progressSlot,
+      appMemory,
+      budget,
     });
     for (const tool of tools) {
       pi.registerTool(tool);
@@ -308,6 +330,7 @@ ${autoGuiTask}`;
       sessionSteps.length = 0;
       lastMarks.value = [];
       planSlot.value = undefined;
+      budget?.reset();
       // Open (or resume) a progress record for this task so progress
       // markers + plan snapshots survive crashes and aborts.
       if (progressStore) {
