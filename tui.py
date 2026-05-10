@@ -307,7 +307,13 @@ class _TUILogHandler(logging.Handler):
             else "yellow" if record.levelno >= logging.WARNING
             else "dim"
         )
-        line = f"[{colour}]{msg}[/{colour}]"
+        # Our log messages routinely contain `[backend:screenshot]`,
+        # `[agent.py:run]`, etc. — RichLog with markup=True would parse
+        # those bracketed strings as Rich markup tags and either swallow
+        # the line or apply unintended styles.  Escape the formatted
+        # record before wrapping it in our own colour tags.
+        from rich.markup import escape as _rich_escape
+        line = f"[{colour}]{_rich_escape(msg)}[/{colour}]"
         try:
             # call_from_thread is safe whether emit() runs on the
             # event-loop thread or a worker thread.
