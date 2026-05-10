@@ -20,13 +20,20 @@ export interface BudgetSnapshot {
 export class BudgetTracker {
   readonly maxToolCalls: number;
   readonly maxSeconds: number;
-  readonly started: number;
+  // ``started`` is intentionally mutable — reset() bumps it back to
+  // "now" between tasks.  Keeping it private makes the mutability
+  // explicit at the type level without resorting to a cast.
+  private startedAt: number;
   toolCalls = 0;
 
   constructor(opts: { maxToolCalls?: number; maxSeconds?: number } = {}) {
     this.maxToolCalls = opts.maxToolCalls ?? 0;
     this.maxSeconds = opts.maxSeconds ?? 0;
-    this.started = Date.now() / 1000;
+    this.startedAt = Date.now() / 1000;
+  }
+
+  get started(): number {
+    return this.startedAt;
   }
 
   recordTool(): void {
@@ -34,7 +41,7 @@ export class BudgetTracker {
   }
 
   get elapsed(): number {
-    return Date.now() / 1000 - this.started;
+    return Date.now() / 1000 - this.startedAt;
   }
 
   get exceeded(): boolean {
@@ -70,6 +77,6 @@ export class BudgetTracker {
 
   reset(): void {
     this.toolCalls = 0;
-    (this as { started: number }).started = Date.now() / 1000;
+    this.startedAt = Date.now() / 1000;
   }
 }

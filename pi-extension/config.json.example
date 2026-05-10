@@ -30,16 +30,18 @@
   "_planner_section": "When plannerEnabled is true (default), /autogui injects instructions telling the model to produce a numbered plan as its FIRST assistant message before executing.",
   "plannerEnabled": true,
 
-  "_controller_section": "When controllerEnabled is true, the typed-plan protocol replaces the free-text plan: the model issues plan_set with a JSON plan, marks each step done via plan_update_step, and uses checkpoint() for long-running tasks. Defaults to false to preserve legacy behaviour.",
-  "controllerEnabled": false,
+  "_controller_section": "controllerEnabled (default true) injects the typed-plan protocol into /autogui's prompt: the model issues plan_set with a JSON plan, calls check_predicate / preflight where appropriate, and marks each step done via plan_update_step. Set false to fall back to the free-text planner protocol.",
+  "controllerEnabled": true,
 
-  "_artifacts_section": "Content-addressed artifact store (file bodies, page text, command stdout > 4KB) so large observations don't bloat history. Default directory is pi-extension/runtime/artifacts. Set artifactsDir to an empty string to disable.",
+  "_artifacts_section": "Stable-id artifact store (large file bodies, page text, command stdout > 4KB) so big observations don't bloat history. artifactsEnabled (default true) gates the store; set false to disable. artifactsDir overrides the default path of pi-extension/runtime/artifacts; leave empty to use the runtime default.",
+  "artifactsEnabled": true,
   "artifactsDir": "",
 
-  "_progress_section": "Persistent task progress markers under pi-extension/runtime/progress. Re-running the same task text resumes where the previous attempt stopped. Set progressDir to an empty string to disable.",
+  "_progress_section": "Persistent task progress markers under pi-extension/runtime/progress. Re-running the same task text resumes where the previous attempt stopped. progressEnabled (default true) gates the store; set false to disable. progressDir overrides the default path; leave empty to use the runtime default.",
+  "progressEnabled": true,
   "progressDir": "",
 
-  "_memory_section": "Per-app memory store (failure histograms, success counts, free-form notes). memoryEnabled controls CREATION ONLY (mirrors skillsEnabled): when false (the default) memory_get and the planner's app-memory hints continue to read whatever is already at memoryDir, but memory_note is NOT registered and the controller does not persist new records. Default storage is pi-extension/runtime/memory — separate from the standalone Python agent's ./memory directory so each side has its own quirk database. Set memoryDir to an empty string to disable the store entirely.",
+  "_memory_section": "Per-app memory store (failure histograms, success counts, free-form notes). memoryEnabled controls CREATION ONLY (mirrors skillsEnabled): when false (the default) memory_get and the planner's app-memory hints continue to read whatever is already at memoryDir, but memory_note is NOT registered and the controller does not persist new records. Default storage is pi-extension/runtime/memory — separate from the standalone Python agent's ./memory directory so each side has its own quirk database. memoryDir overrides the default location; leave empty to use the runtime default.",
   "memoryEnabled": false,
   "memoryDir": "",
 

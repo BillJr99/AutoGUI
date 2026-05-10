@@ -52,9 +52,22 @@ export interface ExtensionConfig {
   /** When true, the typed-plan controller protocol is injected into the prompt
    *  and plan_set / plan_update_step / plan_get tools are wired to the plan slot. */
   controllerEnabled: boolean;
-  /** Directory for the content-addressed artifact store. Empty = disabled. */
+  /** When true, large tool outputs (file bodies, page text, big stdout)
+   *  are auto-captured into the on-disk artifact store and replaced
+   *  inline with a short preview + id.  Default true.  Set false to
+   *  disable the store entirely; ``artifactsDir`` then has no effect. */
+  artifactsEnabled: boolean;
+  /** Directory for the artifact store.  When empty, resolves to
+   *  ``<extensionRoot>/runtime/artifacts``.  Has no effect when
+   *  ``artifactsEnabled`` is false. */
   artifactsDir: string;
-  /** Directory for persistent task progress records. Empty = disabled. */
+  /** When true, per-task progress markers are persisted under
+   *  ``progressDir`` and re-running the same task text resumes from
+   *  the previous attempt.  Default true.  Set false to disable. */
+  progressEnabled: boolean;
+  /** Directory for persistent task progress records.  Empty resolves
+   *  to ``<extensionRoot>/runtime/progress``.  Has no effect when
+   *  ``progressEnabled`` is false. */
   progressDir: string;
   /** Directory for the per-app memory store (failure histograms, success
    *  counts, free-form notes).  Empty string disables app memory. */
@@ -99,10 +112,12 @@ const DEFAULTS: ExtensionConfig = {
   allowedApps: [],
   blockedWindowTitles: [],
   plannerEnabled: true,
-  controllerEnabled: false,
-  artifactsDir: "",   // resolved to <extensionRoot>/runtime/artifacts in loadConfig
-  progressDir: "",    // resolved to <extensionRoot>/runtime/progress in loadConfig
-  memoryDir: "",      // resolved to <extensionRoot>/runtime/memory in loadConfig
+  controllerEnabled: true,
+  artifactsEnabled: true,
+  artifactsDir: "",       // resolved to <extensionRoot>/runtime/artifacts when enabled
+  progressEnabled: true,
+  progressDir: "",        // resolved to <extensionRoot>/runtime/progress when enabled
+  memoryDir: "",          // resolved to <extensionRoot>/runtime/memory when enabled
   memoryEnabled: false,
   budget: {
     maxToolCalls: 0,
@@ -190,13 +205,23 @@ export async function loadConfig(extensionRoot: string): Promise<ExtensionConfig
   if (!merged.screenRecord.outDir) {
     merged.screenRecord.outDir = join(extensionRoot, "runtime", "failures");
   }
-  if (!merged.artifactsDir) {
+  // Only fill in runtime defaults when the store is enabled.  When the
+  // user disables a store via its *Enabled flag, leaving the dir
+  // empty is the deliberate "no path needed" signal — index.ts will
+  // not construct that store at all.  This is the behaviour the
+  // README documents, replacing the old "empty string disables"
+  // (which was never actually honoured because the default was
+  // always reapplied here).
+  if (merged.artifactsEnabled && !merged.artifactsDir) {
     merged.artifactsDir = join(extensionRoot, "runtime", "artifacts");
   }
-  if (!merged.progressDir) {
+  if (merged.progressEnabled && !merged.progressDir) {
     merged.progressDir = join(extensionRoot, "runtime", "progress");
   }
   if (!merged.memoryDir) {
+    // memoryEnabled is the creation gate (writes-only); reads of an
+    // existing store still want a default location, so always resolve
+    // a runtime path here regardless of memoryEnabled.
     merged.memoryDir = join(extensionRoot, "runtime", "memory");
   }
 

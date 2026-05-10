@@ -889,6 +889,10 @@ export function createDesktopTools(
           text: params.text,
           windowId: params.window_id,
           timeout: params.timeout,
+          // Pass saveDir so the OCR-based `text` branch in waitFor can
+          // capture interim screenshots; tests/CI without Tesseract
+          // simply degrade to a "no OCR available" lastObservation note.
+          saveDir,
         }, signal);
         const msg = r.found
           ? `Target ${r.target} matched after ${r.elapsed}s.`

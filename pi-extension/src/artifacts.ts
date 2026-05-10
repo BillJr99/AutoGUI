@@ -1,12 +1,16 @@
 /**
- * artifacts.ts — Content-addressed artifact store.
+ * artifacts.ts — Stable-id artifact store (NOT content-addressed).
  *
  * Mirror of the Python ``artifacts.py`` module so observations from
  * fs_read / browser_get_text / shell_run can be referenced by id rather
  * than pasted in full into the LLM context.  IDs use the same
- * ``artifact://<8-hex>`` format so a skill captured on either side can
- * reference the same artifact namespace logically (artifacts themselves
- * are not portable — each side has its own store).
+ * ``artifact://<8-hex>`` format and the same timestamp-salted derivation
+ * — they are deliberately not content hashes, so the model can tell
+ * apart "what did I see at step 3" from "what did I see at step 7"
+ * even when the bodies are identical.
+ *
+ * Artifact store contents are not portable across the Python and TS
+ * sides — each program writes into its own runtime/artifacts folder.
  */
 
 import { createHash } from "node:crypto";
@@ -62,6 +66,12 @@ export class ArtifactStore {
     this.loaded = true;
   }
 
+  /**
+   * Store ``body`` and return its artifact id.  IDs are derived from
+   * sha1(kind|source|timestamp|body-prefix); identical bodies stored
+   * moments apart receive different ids on purpose — the store is a
+   * capture log, not a content-addressed cache.
+   */
   async put(
     body: string,
     options: { kind: string; source?: string; summary?: string; meta?: Record<string, unknown> },

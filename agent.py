@@ -279,7 +279,10 @@ class Agent:
         # the user resume.  Subagent answers read-only questions without
         # bloating the main conversation.
         controller_cfg = self._agent_cfg.get("controller", {}) or {}
-        self._controller_enabled: bool = bool(controller_cfg.get("enabled", False))
+        # Controller is ON by default — the typed-plan + step-scoped
+        # executor is the recommended path.  Set enabled=false to fall
+        # back to the legacy single-loop executor.
+        self._controller_enabled: bool = bool(controller_cfg.get("enabled", True))
         self._step_max_iterations: int = max(1, int(controller_cfg.get("step_max_iterations", 8)))
         self._step_max_retries: int = max(0, int(controller_cfg.get("step_max_retries", 2)))
         self._auto_resume: bool = bool(controller_cfg.get("auto_resume", True))

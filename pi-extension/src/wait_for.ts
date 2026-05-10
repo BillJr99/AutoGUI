@@ -6,6 +6,7 @@
  * timeout elapses.
  */
 
+import { findText } from "./tesseract.js";
 import type { DesktopBackend } from "./types.js";
 
 export interface WaitForResult {
@@ -26,6 +27,10 @@ export interface WaitForOptions {
   windowId?: string;
   timeout?: number;
   pollInterval?: number;
+  /** Where to stash interim screenshots when text-based waiting falls
+   *  back to OCR.  Optional; if omitted, OCR-based waits are skipped
+   *  and the timeout fires on the text target. */
+  saveDir?: string;
 }
 
 export async function waitFor(
@@ -47,6 +52,8 @@ export async function waitFor(
     };
   }
 
+  // Normalise once so the loop-exit comparison and the sleep math
+  // share a single ceiling — mirrors the Python wait_for clamp.
   const timeout = Math.max(0.5, options.timeout ?? 15.0);
   const pollInterval = Math.max(0.1, options.pollInterval ?? 0.5);
   const start = Date.now();
@@ -85,6 +92,30 @@ export async function waitFor(
       } catch (e) {
         lastObservation.element_error = (e as Error).message;
       }
+    }
+
+    // Text branch: snap a screenshot and OCR-search for the substring.
+    // Skipped silently when no saveDir is provided (the caller didn't
+    // wire OCR support for this invocation), so existing window/element
+    // callers don't pay the cost.
+    if (options.text && options.saveDir) {
+      try {
+        const shot = await backend.screenshot({ saveDir: options.saveDir }, signal);
+        const result = await findText(shot.path, options.text, 0, signal);
+        if (result.found && result.match) {
+          return {
+            found: true,
+            target: "text",
+            elapsed: elapsedSec(start),
+            observation: result.match,
+          };
+        }
+        if (result.error) lastObservation.text_error = result.error;
+      } catch (e) {
+        lastObservation.text_error = (e as Error).message;
+      }
+    } else if (options.text && !options.saveDir) {
+      lastObservation.text_error = "OCR text waiting requires saveDir; not configured by caller";
     }
 
     if (elapsed >= timeout) {

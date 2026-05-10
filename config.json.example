@@ -25,8 +25,8 @@
       "enabled": true
     },
     "controller": {
-      "_comment": "Typed plan + step-by-step executor. When enabled, the planner emits a JSON plan and each step runs in its own scoped history with its own iteration budget. Replan triggers automatically on persistent failures. critique_enabled adds one extra LLM call after the planner to review the plan; preflight_enabled gates resource availability before any UI action; predicate_check_enabled verifies typed post-conditions deterministically; visual_diff_enabled flags state-changing actions whose screen pixels barely moved; watchdog_stall_threshold flags a step as stuck after the same (state+action) signature recurs N iterations in a row (0 = disabled).",
-      "enabled": false,
+      "_comment": "Typed plan + step-by-step executor. ON by default. The planner emits a JSON plan and each step runs in its own scoped history with its own iteration budget. Replan triggers automatically on persistent failures. critique_enabled adds one extra LLM call after the planner to review the plan; preflight_enabled gates resource availability before any UI action; predicate_check_enabled verifies typed post-conditions deterministically; visual_diff_enabled flags state-changing actions whose screen pixels barely moved; watchdog_stall_threshold flags a step as stuck after the same (state+action) signature recurs N iterations in a row (0 = disabled). Set enabled=false to fall back to the legacy single-loop ReAct executor.",
+      "enabled": true,
       "step_max_iterations": 8,
       "step_max_retries": 2,
       "auto_resume": true,
@@ -38,7 +38,7 @@
       "watchdog_stall_threshold": 3
     },
     "artifacts": {
-      "_comment": "Content-addressed store for large observations (file bodies, command stdout, OCR snippets). The model fetches by id with get_artifact when it actually needs the body.",
+      "_comment": "Stable-id store for large observations (file bodies, command stdout, OCR snippets). Each capture gets a fresh artifact://<id>; identical bodies are NOT deduped — the store is an append-only log of what the agent saw and when. The model fetches by id with get_artifact when it needs the body.",
       "dir": "logs/artifacts"
     },
     "progress": {

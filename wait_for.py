@@ -57,9 +57,14 @@ async def wait_for(
             "found": False,
         }
 
-    start = time.monotonic()
-    deadline = start + max(0.5, float(timeout))
+    # Normalize timeout once so the loop-exit comparison and the sleep
+    # math both use the same effective ceiling.  A caller-supplied
+    # timeout below the floor is silently raised so we still poll at
+    # least once before giving up.
+    timeout = max(0.5, float(timeout))
     poll_interval = max(0.1, float(poll_interval))
+    start = time.monotonic()
+    deadline = start + timeout
 
     last_observation: dict[str, Any] = {}
 

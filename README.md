@@ -516,7 +516,7 @@ The standalone Python agent creates runtime directories as needed:
 |------|----------|
 | `logs/` | `agent.log` (rotating) + per-session `session_<ts>.log` files |
 | `logs/traces/` | Per-task JSONL trajectory logs |
-| `logs/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
+| `logs/artifacts/` | Artifact bodies + `index.jsonl`. Stable-id store: each capture gets a fresh `artifact://<id>` even when the body is identical to a prior capture. |
 | `logs/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
 | `memory/` | **Per-app quirk store** — `memory/<app>.json` + `memory/index.jsonl`. Only created the first time `memory_note` runs or the controller auto-records, which requires `agent.memory.enabled=true`. Reads via `memory_get` work regardless. |
 | `screenshots/` | Ad-hoc screenshots taken by the agent |
@@ -529,7 +529,7 @@ The Pi extension writes runtime files under `pi-extension/runtime/`:
 |------|----------|
 | `pi-extension/runtime/skills/` | **Skill library** — `skills.jsonl` (only created when `skillsEnabled=true` and `skill_save` fires; reads are always allowed) |
 | `pi-extension/runtime/traces/` | Per-session JSONL trajectory logs |
-| `pi-extension/runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
+| `pi-extension/runtime/artifacts/` | Artifact bodies + `index.jsonl` (stable-id, not deduped). |
 | `pi-extension/runtime/progress/` | Per-task JSON progress records |
 | `pi-extension/runtime/memory/` | **Per-app quirk store** — `<app>.json` + `index.jsonl`. Created lazily when `memoryEnabled=true` and a write fires; reads via `memory_get` work regardless. |
 | `pi-extension/runtime/screenshots/` | Ad-hoc screenshots |
@@ -634,7 +634,9 @@ Open the model picker via **Ctrl+P** (the command palette) — type "model" and 
 
 ## Robustness, planning & verification (controller-only)
 
-When `agent.controller.enabled` is on, the typed-plan controller layers
+`agent.controller.enabled` defaults to **true**, so all of this runs by
+default; set it to false to fall back to the legacy single-loop ReAct
+executor.  When the controller is on it layers
 several extra safeguards on top of the standard ReAct loop.  Each is
 individually toggleable so you can dial in the tradeoff between speed
 and reliability.
@@ -771,8 +773,8 @@ No configuration is needed.
     "planner": {                          // Pre-execution planning pass
       "enabled": true                     // One extra LLM call up front (uses the primary client)
     },
-    "controller": {                       // Typed-plan + step-by-step executor (opt-in)
-      "enabled": false,
+    "controller": {                       // Typed-plan + step-by-step executor (default ON)
+      "enabled": true,
       "step_max_iterations": 8,           // Per-step iteration ceiling (separate from max_iterations)
       "step_max_retries": 2,
       "auto_resume": true,                // Resume completed step ids from logs/progress
@@ -783,7 +785,7 @@ No configuration is needed.
       "visual_diff_enabled": true,        // Perceptual-hash diff to flag silent-no-op actions
       "watchdog_stall_threshold": 3       // 0 disables; flag step stuck after N identical signatures
     },
-    "artifacts": {"dir": "logs/artifacts"},  // Content-addressed observation store
+    "artifacts": {"dir": "logs/artifacts"},  // Stable-id observation store (append-only; not deduped)
     "progress":  {"dir": "logs/progress"},   // Per-task resume markers
     "memory": {                              // Per-app quirk database (separate from skills)
       "enabled": false,                      //   CREATION gate. False blocks memory_note + auto-recording;

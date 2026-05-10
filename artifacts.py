@@ -1,15 +1,23 @@
 """
-artifacts.py — Content-addressed artifact store.
+artifacts.py — Stable-id artifact store (NOT content-addressed).
 
 Large observations (file bodies, OCR snippets, command stdout, accessibility
 trees) bloat the conversation history if pasted in full on every turn.  The
-artifact store gives them stable IDs so the executor can reference an
-observation by id and only fetch the body when it actually needs to look at
-it.
+artifact store gives each capture a short opaque id so the executor can
+reference an observation by id and only fetch the body when it actually
+needs to look at it.
 
-ID format: ``artifact://<8-hex-prefix>``.  Bodies are stored on disk under a
-configurable directory; metadata lives in an in-memory map plus a JSONL
-sidecar for crash recovery.
+ID format: ``artifact://<8-hex>``.  IDs are deliberately *not* a pure
+content hash: each capture mixes in a high-resolution timestamp, so reading
+the same file twice produces two distinct ids and two distinct records.
+That suits an append-only per-task observation log — the model can
+reason about "what did I see at step 3 vs step 7" without earlier
+records being silently overwritten by later identical reads.  Use
+``ArtifactStore.list_recent`` if you want to find prior captures of the
+same source.
+
+Bodies are stored on disk under a configurable directory; metadata lives
+in an in-memory map plus a JSONL sidecar for crash recovery.
 
 Typical use
 -----------
@@ -61,12 +69,17 @@ class Artifact:
 
 class ArtifactStore:
     """
-    Append-only, JSONL-backed artifact store.
+    Append-only, JSONL-backed artifact store with timestamp-salted ids.
 
     Bodies above ``_INLINE_BODY_LIMIT`` characters are written to a sibling
     file (``<id_prefix>.txt``) so the metadata sidecar stays cheap to load.
     Smaller bodies are kept inline.  ``get_body`` is the single read path —
     it transparently reads from disk when needed.
+
+    IDs are NOT content hashes (see module docstring): every ``put`` call
+    returns a fresh id even when the body is byte-identical to a prior
+    capture.  This lets the model reason about WHEN something was
+    observed, at the cost of giving up dedup.
     """
 
     def __init__(self, directory: str = "logs/artifacts"):
@@ -119,7 +132,13 @@ class ArtifactStore:
         summary: str = "",
         meta: dict[str, Any] | None = None,
     ) -> str:
-        """Store ``body`` and return its artifact id."""
+        """Store ``body`` and return its artifact id.
+
+        The id is a short opaque sha1 prefix derived from
+        kind|source|timestamp|body-prefix.  Identical bodies stored
+        moments apart receive *different* ids — the store is a log of
+        captures, not a content-addressed cache.
+        """
         body = body if isinstance(body, str) else str(body)
         h = hashlib.sha1(
             f"{kind}|{source}|{time.time_ns()}|{body[:200]}".encode("utf-8")

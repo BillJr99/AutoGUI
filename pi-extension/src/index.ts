@@ -155,10 +155,14 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
     if (!cfg.skillsEnabled) {
       await logger.log("init.skill_save_disabled", { reason: "skillsEnabled=false; reads still allowed" });
     }
-    if (cfg.artifactsDir) {
+    // Each store is built only when its *Enabled flag is true AND the
+    // resolved dir is non-empty.  Setting Enabled=false in config.json
+    // is the canonical way to disable a store; setting the dir to ""
+    // (with Enabled=true) reverts to the runtime-default path.
+    if (cfg.artifactsEnabled && cfg.artifactsDir) {
       artifactStore = new ArtifactStore(cfg.artifactsDir);
     }
-    if (cfg.progressDir) {
+    if (cfg.progressEnabled && cfg.progressDir) {
       progressStore = new ProgressStore(cfg.progressDir);
     }
     if (cfg.memoryDir) {

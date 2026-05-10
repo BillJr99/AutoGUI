@@ -65,9 +65,9 @@ Every key has a sensible default — leave the file out and everything works. Se
 - `visionEnabled`: when true (default), `desktop_screenshot` includes the inline PNG image in the tool result so the model can see the screen. Set false if the provider struggles with image payloads.
 - `dryRun` / `allowedApps` / `blockedWindowTitles`: safety gates.
 - `plannerEnabled`: planner-first protocol in the system prompt.
-- `controllerEnabled`: typed-plan + step-by-step protocol; injects the `plan_set` / `plan_update_step` / `checkpoint` workflow into the prompt and wires the plan slot to the new meta-tools.
+- `controllerEnabled` (default `true`): typed-plan + step-by-step protocol; injects the `plan_set` / `plan_update_step` / `checkpoint` workflow into the prompt and wires the plan slot to the new meta-tools. Set false for the legacy free-text planner.
 - `skillsEnabled` (default `false`): creation gate. False blocks `skill_save`; `skill_list`, `skill_run`, and the candidate-skills suggestion are always available so any existing library at `skillsPath` stays usable. Override the path with `skillsPath` (absolute).
-- `artifactsDir` / `progressDir`: locations for the artifact store and per-task progress records (default `runtime/artifacts/` and `runtime/progress/`; empty string disables that store entirely).
+- `artifactsEnabled` (default `true`) / `progressEnabled` (default `true`): explicit on/off for the artifact and progress stores. Set either to false to disable that store entirely. `artifactsDir` / `progressDir` override the runtime-default path (`runtime/artifacts/` / `runtime/progress/`); leave them empty to use the default. Empty string alone no longer disables a store — set the corresponding `*Enabled` flag.
 - `memoryEnabled` (default `false`): creation gate for the per-app quirk database (mirrors `skillsEnabled`). False blocks `memory_note` and the controller's auto-recording; `memory_get` and the planner's app-memory hints continue to read whatever is already at `memoryDir`. Set true to allow new records.
 - `memoryDir`: location for the per-app quirk database (default `runtime/memory/`; empty string disables the store entirely). The pi-extension uses its own memory dir, separate from the standalone agent's `./memory/` so they don't shadow each other.
 - `budget.maxToolCalls` / `budget.maxSeconds`: hard ceilings consulted by the `budget_status` tool. 0 = no ceiling.
@@ -246,7 +246,7 @@ All runtime output lives under `pi-extension/runtime/` (git-ignored):
 |------|----------|
 | `runtime/skills/skills.jsonl` | **Skill library** — created the first time `skill_save` runs (which requires `skillsEnabled=true`); reads via `skill_list`/`skill_run` work regardless of the flag |
 | `runtime/traces/` | Per-session JSONL trajectory logs |
-| `runtime/artifacts/` | Content-addressed artifact bodies + `index.jsonl` |
+| `runtime/artifacts/` | Artifact bodies + `index.jsonl` — stable-id store (each capture gets a fresh `artifact://<id>`; identical bodies are not deduped). |
 | `runtime/progress/` | Per-task JSON progress records (auto-resume keyed by task hash) |
 | `runtime/memory/` | Per-app quirk store — `<app>.json` + `index.jsonl`. Only created when `memoryEnabled=true` and a write fires; reads via `memory_get` work regardless. |
 | `runtime/screenshots/` | Ad-hoc screenshots taken by the agent |
