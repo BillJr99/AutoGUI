@@ -161,9 +161,14 @@ class Agent:
         # Controller protocol is appended to the system prompt only when
         # the controller is enabled — otherwise the legacy "free-form
         # assistant" guidance applies and the STEP_DONE markers would be
-        # noise.
+        # noise.  Read the SAME default that the runtime branch below
+        # uses (True) so we don't accidentally take the controller path
+        # while leaving the system prompt without the step protocol —
+        # that combination caused the model to receive a typed plan
+        # with no STEP_DONE guidance and respond by hallucinating "I've
+        # completed the plan" in text without invoking tools.
         controller_protocol = ""
-        if (self._agent_cfg.get("controller", {}) or {}).get("enabled", False):
+        if (self._agent_cfg.get("controller", {}) or {}).get("enabled", True):
             controller_protocol = self._prompts.text("controller_step_protocol")
 
         self._system_prompt: str = "\n\n".join(filter(None, [
