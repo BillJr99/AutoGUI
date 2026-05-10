@@ -41,7 +41,36 @@ _YDOTOOL_SCROLL = {
 class WaylandBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": False, "get_window_text": True}
+        find_element = False
+        try:
+            import pyatspi  # noqa: F401
+            find_element = True
+        except Exception:
+            pass
+        return {
+            "find_element": find_element,
+            "get_window_tree": False,
+            "activate_window": True,
+            "get_active_window": False,
+            "get_window_text": True,
+        }
+
+    async def find_element(
+        self,
+        name: str | None = None,
+        control_type: str | None = None,
+        window_title: str | None = None,
+        index: int = 0,
+    ) -> dict:
+        """AT-SPI lookup. Same implementation strategy as the X11 backend."""
+        from backends.linux_x11 import X11Backend
+        return await X11Backend.find_element(
+            self,
+            name=name,
+            control_type=control_type,
+            window_title=window_title,
+            index=index,
+        )
 
     async def screenshot(
         self,
@@ -120,14 +149,30 @@ class WaylandBackend(DesktopBackend):
             return {"error": str(e)}
 
     async def type_text(self, text: str) -> dict:
+        """
+        Type text on Wayland via ydotool.  --key-delay slows the per-key
+        cadence so slow targets don't drop or repeat characters.
+        """
+        if not text:
+            return {"success": True, "length": 0, "method": "noop"}
+        log_text = (text[:60] + "…") if len(text) > 60 else text
+        logger.info("[wayland:type_text] len=%d text=%r", len(text), log_text)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ydotool", "type", "--", text,
+                "ydotool", "type", "--key-delay", "20", "--", text,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(proc.communicate(), timeout=30)
-            return {"success": True, "length": len(text)}
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+            if proc.returncode != 0:
+                # Older ydotool versions don't accept --key-delay; retry.
+                proc = await asyncio.create_subprocess_exec(
+                    "ydotool", "type", "--", text,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=60)
+            return {"success": True, "length": len(text), "method": "ydotool"}
         except FileNotFoundError:
             return {"error": "ydotool not found — install with: sudo apt install ydotool"}
         except Exception as e:

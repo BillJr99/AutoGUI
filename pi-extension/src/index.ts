@@ -1,11 +1,18 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BrowserBackend } from "./browser_backend.js";
+import { PerceptionCache } from "./cache.js";
+import { loadConfig, type ExtensionConfig } from "./config.js";
+import { runInstaller } from "./install_runner.js";
 import { createLogger } from "./logger.js";
 import { createBackend } from "./platform.js";
 import { commandExists, execFile, shellQuote } from "./process.js";
+import { ScreenRecorder } from "./screen_record.js";
+import { SkillStore, type SkillStep } from "./skills.js";
 import { createDesktopTools } from "./tools.js";
-import type { DesktopBackend } from "./types.js";
+import { TraceWriter } from "./trace.js";
+import type { DesktopBackend, Mark } from "./types.js";
 
 const extensionRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const extensionEntry = fileURLToPath(import.meta.url);
@@ -13,23 +20,50 @@ const screenshotDir = join(extensionRoot, "runtime", "screenshots");
 const logger = createLogger(extensionRoot);
 const SCREENSHOT_DEGRADE_AFTER_PROVIDER_ERRORS = 3;
 
-const AUTOGUI_PROMPT = `You are using the AutoGUI desktop automation extension.
+/**
+ * Build the AutoGUI system prompt the `/autogui` command injects into Pi.
+ * The prompt is dynamic now: it advertises whichever extra tools are
+ * available (browser, click_element, click_text), and includes the
+ * planner instructions when the planner is enabled in config.
+ */
+function buildAutoGuiPrompt(cfg: ExtensionConfig, backend: DesktopBackend | undefined): string {
+  const browserOn = cfg.allowedBrowser;
+  const a11yOn = backend?.capabilities?.findElement === true;
+  const planner = cfg.plannerEnabled;
+  return `You are using the AutoGUI desktop automation extension.
 
-Goal: complete the user's desktop task using Pi's normal agent workflow and the registered desktop_* tools.
+Goal: complete the user's desktop task using Pi's normal agent workflow and the registered desktop_*${browserOn ? "/browser_*" : ""} tools.
+
+${planner ? `Planning protocol:
+- BEFORE taking any state-changing action, your FIRST assistant message must be a numbered plan of 3 to 8 high-level steps that will accomplish the task.
+- Steps describe goals ("open Edge", "navigate to weather page"), not specific clicks.
+- Then execute the plan step by step. After each step, verify with desktop_screenshot, desktop_list_windows, or desktop_active_window.
+- Adapt the plan if the screen state diverges from what a step expects.
+- For trivial single-step tasks, the plan may be a single line.
+
+` : ""}Click ladder — pick the strongest available method for each click:
+1. ${browserOn ? "browser_click for any element on a web page (most reliable for web).\n2. " : ""}desktop_click_element for any native UI control with a visible name/label (uses the OS accessibility API; survives DPI scaling, window moves, async redraws). ${a11yOn ? "" : "(Limited support on the current backend.)\n"}
+${a11yOn ? `${browserOn ? "3" : "2"}. ` : `${browserOn ? "2" : "1"}. `}desktop_click_text — find a visible label via OCR and click it (slower but no a11y dependency).
+${a11yOn ? `${browserOn ? "4" : "3"}. ` : `${browserOn ? "3" : "2"}. `}desktop_screenshot_marked + desktop_click_mark — Set-of-Mark grounding when you need to point at something without a clean name.
+${a11yOn ? `${browserOn ? "5" : "4"}. ` : `${browserOn ? "4" : "3"}. `}desktop_click(x, y) — last resort, only when none of the above can identify the target.
 
 Rules:
-- Inspect current desktop state first with desktop_list_windows or desktop_screenshot.
-- When screenshots are unavailable, degraded, or insufficient, use desktop_list_windows, desktop_active_window, and desktop_focus_window instead of guessing.
-- Prefer window bounds and current screenshots over guessed coordinates.
-- Before typing, focus the target window/control with desktop_focus_window when possible, then verify with desktop_active_window.
+- Inspect current desktop state first with desktop_list_windows, desktop_active_window, or desktop_screenshot.
+- When screenshots are unavailable, degraded, or insufficient, use desktop_list_windows and desktop_active_window/desktop_focus_window instead of guessing.
+- Before typing, focus the target window/control with desktop_focus_window or desktop_click_element, then verify with desktop_active_window.
 - Do not use alt+space, application menus, or window menus as a focus strategy.
 - After launching apps or making visible changes, verify with desktop_list_windows or desktop_screenshot.
-- Keep using Pi's built-in coding/filesystem tools for code and file work; use desktop_* tools only for desktop UI automation.
+- Keep using Pi's built-in coding/filesystem tools for code and file work; use desktop_*${browserOn ? "/browser_*" : ""} tools only for desktop UI automation.
 - If a desktop tool reports a missing permission or dependency, tell the user exactly what is missing and stop that desktop action.
-`;
+- When you finish a task that worked well, consider calling skill_save with descriptive keywords so the procedure can be replayed via skill_run later.
+${browserOn
+  ? "- For any task involving a web page or URL, prefer browser_navigate and browser_* tools over launching a browser via desktop_launch.\n- browser_navigate(url) navigates the Playwright-managed Chromium page in place; it does not open the user's existing browser window.\n"
+  : "- Browser tools are NOT enabled. Do NOT attempt desktop_launch with browser names (Edge, Chrome, Firefox, etc.) — those paths are unreliable. If a web task is requested, tell the user to set allowedBrowser=true in pi-extension/config.json and re-run the install script to set up Playwright + Chromium.\n"}`;
+}
 
 export default function autoGuiExtension(pi: ExtensionAPI) {
   let backendPromise: Promise<DesktopBackend> | undefined;
+  let cfgPromise: Promise<ExtensionConfig> | undefined;
   let autoGuiActive = false;
   let autoGuiTask = "";
   let lastRetryableProviderStatus: number | undefined;
@@ -39,16 +73,72 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   let screenshotProviderFailureCount = 0;
   let omitScreenshotImages = false;
 
+  // Per-session state for skills + Set-of-Mark + trace.
+  const sessionSteps: SkillStep[] = [];
+  const lastMarks: { value: Mark[] } = { value: [] };
+
+  const getConfig = async () => {
+    cfgPromise ??= loadConfig(extensionRoot);
+    return await cfgPromise;
+  };
+
   const getBackend = async () => {
     backendPromise ??= createBackend(logger);
     return await backendPromise;
   };
 
-  const clearRetryTimer = () => {
-    if (retryTimer) {
-      clearTimeout(retryTimer);
-      retryTimer = undefined;
+  // Build singletons that depend on the loaded config.  `init` is awaited at
+  // session_start; the tools are registered eagerly with placeholders and
+  // wired up after `init` resolves.
+  const cache = new PerceptionCache();
+  let skillStore: SkillStore | undefined;
+  let trace: TraceWriter | undefined;
+  let recorder: ScreenRecorder | undefined;
+  let browser: BrowserBackend | undefined;
+  let cfg: ExtensionConfig | undefined;
+
+  const init = (async () => {
+    cfg = await getConfig();
+    omitScreenshotImages = !cfg.visionEnabled;
+    cache.configure(cfg.perceptionCacheTtlMs);
+    skillStore = new SkillStore(cfg.skillsPath);
+    if (cfg.recordTrace) {
+      trace = new TraceWriter(cfg.traceDir);
+      void trace.writeMeta({ event: "session_start" });
+    } else {
+      // Stub writer so the rest of the code can call .writeEvent without checks.
+      trace = new TraceWriter(cfg.traceDir);
+      // Block writes by emptying path — simpler to just create one anyway since
+      // writes are best-effort and skip on error.
     }
+    // Optional one-shot dependency install — invokes the same scripts/
+    // shell scripts the user can run by hand.  Runs BEFORE BrowserBackend
+    // construction so Playwright + Chromium can be installed first.
+    if (cfg.installDependencies) {
+      const result = await runInstaller(logger);
+      if (!result.ok) {
+        await logger.log("init.install_runner.failed", { result });
+      }
+    }
+    if (cfg.allowedBrowser) {
+      browser = new BrowserBackend({
+        headless: cfg.browser.headless,
+        screenshotDir: cfg.browser.screenshotDir,
+        userDataDir: cfg.browser.userDataDir,
+        viewport: cfg.browser.viewport,
+      });
+      // BrowserBackend lazily imports playwright on first use; if it's
+      // missing the user gets a clear "please install" error pointing
+      // at scripts/install-dependencies.*.
+    }
+    if (cfg.screenRecord.enabled) {
+      recorder = new ScreenRecorder(cfg.screenRecord, getBackend, logger);
+      void recorder.start();
+    }
+  })();
+
+  const clearRetryTimer = () => {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = undefined; }
   };
 
   const resetAutoGuiState = () => {
@@ -88,22 +178,20 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
     retryAttempt = attempt;
     const providerError = pendingRetryableProviderError;
     await logger.log("provider.autogui_retry_scheduled", {
-      attempt,
-      delayMs,
-      status: providerError.status,
-      errorMessage: providerError.errorMessage,
+      attempt, delayMs, status: providerError.status, errorMessage: providerError.errorMessage,
     });
     ctx.ui.notify(`AutoGUI provider retry ${attempt} scheduled in ${Math.ceil(delayMs / 1000)}s. Use /autogui-abort to stop.`, "warning");
 
-    const dispatchRetry = () => {
+    const dispatchRetry = async () => {
       retryTimer = undefined;
       if (!autoGuiActive || !pendingRetryableProviderError) return;
       if (!ctx.isIdle()) {
-        retryTimer = setTimeout(dispatchRetry, 1000);
+        retryTimer = setTimeout(() => { void dispatchRetry(); }, 1000);
         return;
       }
-
-      const retryMessage = `${AUTOGUI_PROMPT}
+      const backend = await getBackend().catch(() => undefined);
+      const c = await getConfig();
+      const retryMessage = `${buildAutoGuiPrompt(c, backend)}
 
 AutoGUI provider retry:
 - The previous provider request failed with temporary status ${providerError.status}.
@@ -115,20 +203,36 @@ ${omitScreenshotImages ? "- Screenshot inline images are temporarily disabled. U
 Original user desktop task:
 ${autoGuiTask}`;
 
-      void logger.log("provider.autogui_retry_dispatch", {
-        attempt,
-        status: providerError.status,
-        task: autoGuiTask,
-      });
+      void logger.log("provider.autogui_retry_dispatch", { attempt, status: providerError.status, task: autoGuiTask });
       pi.sendUserMessage(retryMessage);
     };
 
-    retryTimer = setTimeout(dispatchRetry, delayMs);
+    retryTimer = setTimeout(() => { void dispatchRetry(); }, delayMs);
   };
 
-  for (const tool of createDesktopTools(getBackend, screenshotDir, logger, { omitScreenshotImages: () => omitScreenshotImages })) {
-    pi.registerTool(tool);
-  }
+  // Tool registration is deferred until after init resolves so the tool
+  // closures see the real config / skill store / browser.
+  void init.then(async () => {
+    if (!cfg) return;
+    if (!skillStore) skillStore = new SkillStore(cfg.skillsPath);
+    if (!trace) trace = new TraceWriter(cfg.traceDir);
+    const tools = createDesktopTools(getBackend, screenshotDir, logger, {
+      omitScreenshotImages: () => omitScreenshotImages,
+      config: cfg,
+      cache,
+      skillStore,
+      trace,
+      recorder,
+      browser,
+      sessionSteps,
+      lastMarks,
+    });
+    for (const tool of tools) {
+      pi.registerTool(tool);
+    }
+  }).catch(async (err) => {
+    await logger.log("init.failed", { error: String(err) });
+  });
 
   pi.registerCommand("autogui", {
     description: "Start a desktop automation task with AutoGUI tools",
@@ -147,7 +251,25 @@ ${autoGuiTask}`;
       retryAttempt = 0;
       screenshotProviderFailureCount = 0;
       omitScreenshotImages = false;
-      const message = `${AUTOGUI_PROMPT}\n\nUser desktop task:\n${task}`;
+      // Reset per-task session state so skill_save snapshots only this task.
+      sessionSteps.length = 0;
+      lastMarks.value = [];
+
+      const c = await getConfig();
+      let backend: DesktopBackend | undefined;
+      try { backend = await getBackend(); } catch { /* prompt builds without backend caps */ }
+      let prompt = buildAutoGuiPrompt(c, backend);
+
+      // Skill suggestion: top-3 candidate skills whose keywords match the task.
+      try {
+        const candidates = (await (skillStore ?? new SkillStore(c.skillsPath)).search(task, 3));
+        if (candidates.length) {
+          const lines = candidates.map((s) => `- ${JSON.stringify(s.name)} (app=${s.app || "?"}, steps=${s.steps.length}, successes=${s.success_count})`);
+          prompt += `\n\nCandidate saved skills (call skill_run if one matches):\n${lines.join("\n")}`;
+        }
+      } catch { /* best-effort */ }
+
+      const message = `${prompt}\n\nUser desktop task:\n${task}`;
       if (ctx.isIdle()) {
         pi.sendUserMessage(message);
       } else {
@@ -162,10 +284,7 @@ ${autoGuiTask}`;
     handler: async (_args, ctx) => {
       resetAutoGuiState();
       ctx.abort();
-      await logger.log("command.autogui-abort", {
-        wasIdle: ctx.isIdle(),
-        hadPendingMessages: ctx.hasPendingMessages(),
-      });
+      await logger.log("command.autogui-abort", { wasIdle: ctx.isIdle(), hadPendingMessages: ctx.hasPendingMessages() });
       ctx.ui.notify("AutoGUI automation aborted.", "warning");
     },
   });
@@ -175,9 +294,10 @@ ${autoGuiTask}`;
     handler: async (_args, ctx) => {
       try {
         await logger.log("command.desktop-status");
+        const c = await getConfig();
         const backend = await getBackend();
         const status = await backend.status(ctx.signal);
-        ctx.ui.notify(JSON.stringify(status, null, 2), "info");
+        ctx.ui.notify(JSON.stringify({ ...status, capabilities: backend.capabilities, config: { allowedBrowser: c.allowedBrowser, dryRun: c.dryRun, plannerEnabled: c.plannerEnabled, installDependencies: c.installDependencies } }, null, 2), "info");
       } catch (error) {
         ctx.ui.notify(`AutoGUI status failed: ${String(error)}`, "error");
       }
@@ -199,7 +319,10 @@ ${autoGuiTask}`;
       }
 
       const sessionName = `autogui-validator-${Date.now()}`;
-      const validatorPrompt = `${AUTOGUI_PROMPT}
+      const c = await getConfig();
+      let backend: DesktopBackend | undefined;
+      try { backend = await getBackend(); } catch { /* fall through */ }
+      const validatorPrompt = `${buildAutoGuiPrompt(c, backend)}
 
 Validator mode:
 - You are a read-only validator running in a separate Pi process.
@@ -235,23 +358,15 @@ ${task}`;
   });
 
   pi.on("before_provider_request", async (event) => {
-    await logger.log("provider.request", {
-      payloadPreview: JSON.stringify(event.payload).slice(0, 4000),
-    });
+    await logger.log("provider.request", { payloadPreview: JSON.stringify(event.payload).slice(0, 4000) });
   });
 
   pi.on("after_provider_response", async (event) => {
     const retryable = event.status === 429 || event.status === 404;
-    if (autoGuiActive && retryable) {
-      lastRetryableProviderStatus = event.status;
-    }
+    if (autoGuiActive && retryable) lastRetryableProviderStatus = event.status;
     await logger.log("provider.response", {
-      status: event.status,
-      retryable,
-      headers: event.headers,
-      note: retryable
-        ? "AutoGUI tags 404/429 provider errors as retryable at message_end so Pi core can apply its retry/backoff path."
-        : undefined,
+      status: event.status, retryable, headers: event.headers,
+      note: retryable ? "AutoGUI tags 404/429 provider errors as retryable at message_end." : undefined,
     });
   });
 
@@ -267,10 +382,7 @@ ${task}`;
       resetAutoGuiState();
       return;
     }
-
-    if (!autoGuiActive || event.message.role !== "assistant" || event.message.stopReason !== "error") {
-      return;
-    }
+    if (!autoGuiActive || event.message.role !== "assistant" || event.message.stopReason !== "error") return;
 
     const errorMessage = event.message.errorMessage ?? "";
     const status = detectRetryableStatus(errorMessage, lastRetryableProviderStatus);
@@ -280,21 +392,11 @@ ${task}`;
     screenshotProviderFailureCount++;
     if (!omitScreenshotImages && screenshotProviderFailureCount >= SCREENSHOT_DEGRADE_AFTER_PROVIDER_ERRORS) {
       omitScreenshotImages = true;
-      await logger.log("provider.screenshot_degrade_enabled", {
-        threshold: SCREENSHOT_DEGRADE_AFTER_PROVIDER_ERRORS,
-        screenshotProviderFailureCount,
-        status,
-        errorMessage,
-      });
+      await logger.log("provider.screenshot_degrade_enabled", { threshold: SCREENSHOT_DEGRADE_AFTER_PROVIDER_ERRORS, screenshotProviderFailureCount, status, errorMessage });
     }
 
     pendingRetryableProviderError = { status, errorMessage };
-    await logger.log("provider.retryable_error_tagged", {
-      status,
-      errorMessage,
-      screenshotProviderFailureCount,
-      omitScreenshotImages,
-    });
+    await logger.log("provider.retryable_error_tagged", { status, errorMessage, screenshotProviderFailureCount, omitScreenshotImages });
 
     return {
       message: {
@@ -310,14 +412,20 @@ ${task}`;
 
   pi.on("session_start", async (_event, ctx) => {
     try {
+      await init;
       await logger.log("session_start");
       const backend = await getBackend();
       const status = await backend.status(ctx.signal);
+      const c = cfg ?? await getConfig();
       ctx.ui.setStatus("autogui", `AutoGUI: ${backend.name}`);
       ctx.ui.setWidget("autogui", [
         `AutoGUI desktop backend: ${backend.name}`,
         `Platform: ${backend.platform.summary}`,
+        `Capabilities: ${JSON.stringify(backend.capabilities ?? {})}`,
         `Status: ${JSON.stringify(status)}`,
+        `Browser: ${c.allowedBrowser ? (browser ? "ready" : "not installed") : "disabled"}`,
+        `Recorder: ${recorder ? "running" : "off"}`,
+        `Planner: ${c.plannerEnabled ? "on" : "off"}, dry-run: ${c.dryRun ? "on" : "off"}`,
       ]);
     } catch (error) {
       await logger.log("session_start.failed", { error: String(error) });

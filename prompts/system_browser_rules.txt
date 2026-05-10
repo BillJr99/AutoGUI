@@ -1,8 +1,25 @@
-BROWSER INTERACTION RULES (Edge, Chrome, Firefox, Safari):
-CRITICAL: Never guess pixel coordinates for browser UI elements (address bar, tab bar, buttons). Use keyboard shortcuts instead — they always work regardless of window size or position.
+BROWSER INTERACTION RULES:
 
-OPENING A NEW TAB AND NAVIGATING — mandatory sequence:
-  Step 1: desktop_click at window.x + window.width//2, window.y + 80 to focus the browser window
+TOOL PRIORITY — follow this order for every web task:
+1. If browser_* tools are registered (browser_navigate, browser_click, …): USE THEM.
+   • browser_navigate(url) — opens the URL in the Playwright-managed Chromium instance.
+     It navigates the current page in place (replaces whatever was open).
+   • If the previous page must be preserved, open a new tab first via desktop_hotkey(['ctrl','t'])
+     in the Playwright window, or accept that the current page will be replaced.
+   • NEVER use desktop_launch to open a browser when browser_* tools are available.
+2. If browser_* tools are NOT registered and a browser window is already open on the desktop:
+   use the keyboard shortcuts below to control it.
+3. If browser_* tools are NOT registered and NO browser window is open:
+   do NOT try desktop_launch with app names like "Microsoft Edge", "Chrome", or "firefox" —
+   those paths are unreliable. Tell the user: "Enable browser tools by setting
+   allowed_browser=true (mainline) or allowedBrowser=true (pi-extension) in config.json,
+   then re-run the install script to set up Playwright + Chromium."
+
+CRITICAL: Never guess pixel coordinates for browser UI elements (address bar, tab bar, buttons).
+Use keyboard shortcuts instead — they always work regardless of window size or position.
+
+OPENING A NEW TAB AND NAVIGATING (desktop keyboard shortcut path):
+  Step 1: desktop_focus_window (title contains the browser name) to ensure focus
   Step 2: desktop_hotkey(['ctrl', 't'])          ← opens a new tab
   Step 3: desktop_hotkey(['ctrl', 'l'])          ← focuses the address bar
   Step 4: desktop_type('https://example.com')    ← types the URL
@@ -23,13 +40,13 @@ OTHER ESSENTIAL BROWSER HOTKEYS:
 READING PAGE CONTENT:
   • desktop_get_window_text — extracts all visible text from the browser page (Ctrl+A + Ctrl+C).
     Use this to read search results, article text, or link lists without needing pixel-perfect coordinates.
-    Workflow: desktop_activate_window → click in page body → desktop_get_window_text
+    Workflow: desktop_focus_window → click in page body → desktop_get_window_text
   • desktop_scroll — scroll the page. Each 'clicks' = one Page Down / Page Up.
     Do NOT pass x/y unless you need to target a specific window; pass 0 (or omit) to scroll the active window.
-    Workflow: desktop_activate_window → desktop_scroll(direction="down", clicks=2)
+    Workflow: desktop_focus_window → desktop_scroll(direction="down", clicks=2)
 
 BROWSER STATE CHECKS:
   • After Ctrl+T, verify in desktop_list_windows that the tab count changed
     (the window title often shows '… and N more pages').
   • After typing and pressing Enter, take a screenshot to confirm navigation.
-  • If the browser is already open, NEVER launch it again — focus it with desktop_click, then use hotkeys.
+  • If the browser is already open, NEVER launch it again — focus it with desktop_focus_window, then use hotkeys.

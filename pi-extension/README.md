@@ -9,21 +9,73 @@ This extension is decoupled from OpenWebUI. It does not create a model client, m
 - `/autogui <task>`: sends a prepared desktop-automation prompt into Pi's normal agent loop.
 - `/autogui-abort`: aborts the current AutoGUI/Pi agent operation.
 - `/autogui-validate <task>`: spawns a separate read-only Pi validator in tmux.
-- `/desktop-status`: reports the detected backend and platform dependencies.
-- Desktop tools:
-  - `desktop_screenshot`
-  - `desktop_click`
-  - `desktop_type`
-  - `desktop_hotkey`
-  - `desktop_scroll`
-  - `desktop_list_windows`
-  - `desktop_active_window`
-  - `desktop_focus_window`
-  - `desktop_launch`
-  - `desktop_get_cursor_pos`
-  - `desktop_mouse_move`
+- `/desktop-status`: reports the detected backend, capabilities, and config snapshot.
+- Desktop tools (all platforms):
+  - `desktop_screenshot`, `desktop_screenshot_marked`
+  - `desktop_click`, `desktop_click_mark`, `desktop_click_text`, `desktop_click_element`
+  - `desktop_find_text`
+  - `desktop_type`, `desktop_hotkey`, `desktop_scroll`
+  - `desktop_list_windows`, `desktop_active_window`, `desktop_focus_window`
+  - `desktop_launch`, `desktop_get_cursor_pos`, `desktop_mouse_move`
+  - `desktop_get_window_text`
+- Skill library (replayable macros):
+  - `skill_save`, `skill_list`, `skill_run`
+- Browser tools (registered when `allowedBrowser=true` in config; uses Playwright+Chromium):
+  - `browser_navigate`, `browser_back`, `browser_forward`, `browser_reload`
+  - `browser_click`, `browser_fill`, `browser_press`
+  - `browser_get_text`, `browser_screenshot`, `browser_eval`, `browser_close`
 
 Pi's built-in `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` tools remain responsible for coding and filesystem work.
+
+## Reliability Stack
+
+The tools above form a click-fidelity ladder; the system prompt teaches Pi to walk it in order:
+
+1. **`browser_click`** for any element on a web page (DOM/ARIA selectors).
+2. **`desktop_click_element`** for any native UI control with a visible name/label (UIAutomation on Windows, AT-SPI on Linux, AppleScript-AX on macOS).
+3. **`desktop_click_text`** finds visible text via OCR (Tesseract) and clicks the centre of its bounding box.
+4. **`desktop_screenshot_marked` + `desktop_click_mark`** uses Set-of-Mark grounding when the target lacks a clean name.
+5. **`desktop_click(x, y)`** is the last resort — only when none of the above can identify the target.
+
+Each step gracefully degrades: if Tesseract isn't installed `desktop_click_text` returns a "please install" message instead of failing silently. If the AT-SPI helper isn't available on Linux, `desktop_click_element` returns the install instructions. If `magick`/`convert` isn't on PATH, `desktop_screenshot_marked` still emits the marks list — the model can still call `desktop_click_mark(id)` even without the visual annotation overlay.
+
+## Other Features
+
+- **Planner**: when `plannerEnabled=true` (default) the `/autogui` system prompt instructs the model to produce a numbered plan as its first message before executing. No separate LLM call — Pi owns the model loop.
+- **Skill library**: `skill_save` snapshots the recipe of "what worked" in this session as a JSONL record at `pi-extension/runtime/skills/skills.jsonl` (git-ignored, created automatically). `/autogui` retrieves the top-3 candidate skills for the current task and lists them in the prompt; `skill_run` replays one deterministically through the same backend. Override with `skillsPath` in config.
+- **Trajectory log**: every tool call (start, success, failure) is appended to `pi-extension/runtime/traces/<session>.jsonl` for post-hoc inspection.
+- **Failure recording**: a daemon thread maintains a 5-second rolling screen buffer; on any tool failure it dumps the frames as an animated GIF (via ImageMagick) into `runtime/failures/` so you can see *how* the agent got into trouble.
+- **Action scoping & dry-run**: `allowedApps`, `blockedWindowTitles`, and `dryRun` config flags gate every state-changing tool. Default is unrestricted; turn them on for sensitive contexts.
+- **Pre/post window-set diff**: every state-changing desktop tool emits an `unchanged: true` flag if the window list didn't change, plus an `unexpectedModal` field when a new window matches `/error|warning|sign in|password|allow|permission|are you sure|confirm|update available/i`.
+- **Native Windows input**: on Windows/WSL, `desktop_click` uses `user32.SendInput` directly via PowerShell PInvoke — real INPUT events, correct DPI, falls back to legacy `mouse_event` only on PowerShell errors.
+- **Perception cache**: `desktop_screenshot` and `desktop_list_windows` results are cached for `perceptionCacheTtlMs` (500 ms default) and invalidated on any state-changing tool, so the auto-verify cycle is cheap.
+
+## Configuration
+
+The extension reads optional JSON from one of:
+
+1. `pi-extension/config.json` (next to `package.json`)
+2. `~/.autogui/pi-extension.json`
+
+Every key has a sensible default — leave the file out and everything works. See `config.json.example` for the full schema. Highlights:
+
+- `installDependencies`: when true, the extension runs the same `scripts/install-dependencies.*` shell script as the mainline, once at session start. Default false.
+- `allowedBrowser`: set true to register the `browser_*` tools (requires Playwright + Chromium).
+- `visionEnabled`: when true (default), `desktop_screenshot` includes the inline PNG image in the tool result so the model can see the screen. Set false if the provider struggles with image payloads.
+- `dryRun` / `allowedApps` / `blockedWindowTitles`: safety gates.
+- `plannerEnabled`: planner-first protocol in the system prompt.
+- `screenRecord.*`: rolling screen buffer for failure post-mortem.
+
+Optional system dependencies for graceful-degrade features (all
+installed by `scripts/install-dependencies.*`):
+
+| Feature                          | Dep                                                              |
+|----------------------------------|------------------------------------------------------------------|
+| `desktop_screenshot_marked` overlay | ImageMagick (`magick` or `convert`)                            |
+| `desktop_click_text`/`desktop_find_text` | Tesseract                                              |
+| `desktop_click_element` on Linux | `python3` + `python3-pyatspi` + `gir1.2-atspi-2.0`              |
+| `browser_*` tools                | Playwright + Chromium                                            |
+| Failure GIF                      | ImageMagick (manifest written if missing)                        |
 
 ## Install Dependencies
 
@@ -35,6 +87,58 @@ npm run typecheck
 ```
 
 The extension targets the installed Pi package name `@earendil-works/pi-coding-agent`.
+
+### Optional system dependencies (single install script)
+
+All the optional system tools (Tesseract, ImageMagick, Playwright + Chromium, AT-SPI bindings on Linux, Python deps for the mainline, Node deps for this extension) are installed by **one script per OS** that lives at the project root under `scripts/`:
+
+```bash
+# Linux / macOS / WSL
+bash scripts/install-dependencies.sh
+
+# Windows (cmd shim)
+scripts\install-dependencies.cmd
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File scripts\install-dependencies.ps1
+```
+
+The script is idempotent — every dep is checked first and skipped if it's already installed — and loud, echoing every command before running it.
+
+You can also have AutoGUI run the script automatically at session start by setting the config flag (default false):
+
+```json
+{ "installDependencies": true }
+```
+
+After running, set `allowedBrowser: true` to register the `browser_*` tools (Playwright + Chromium are now installed inside `pi-extension/node_modules/`).
+
+**What each tool needs if you'd rather install one piece by hand:**
+
+```bash
+# Tesseract (for desktop_click_text / desktop_find_text)
+sudo apt install tesseract-ocr   # Linux / WSL
+brew install tesseract           # macOS
+winget install UB-Mannheim.TesseractOCR   # Windows
+
+# ImageMagick (for SoM overlay + failure GIFs)
+sudo apt install imagemagick     # Linux
+brew install imagemagick         # macOS
+winget install ImageMagick.ImageMagick   # Windows
+
+# Linux a11y for desktop_click_element
+sudo apt install python3 python3-pyatspi gir1.2-atspi-2.0
+
+# Playwright + Chromium for browser_* tools (playwright is an optional dep;
+# npm install picks it up automatically, then install the browser binary)
+cd pi-extension
+npm install
+npx playwright install chromium
+```
+
+When something is missing the corresponding tool returns a clear error pointing back at the install script — the agent can then walk down the click ladder to the next-best option (`desktop_click_element` → `desktop_click_text` → `desktop_click_mark` → `desktop_click(x, y)`).
+
+When ImageMagick is missing, marks are still emitted as a list (you can call `desktop_click_mark(id)` even without the visual overlay), and failure recordings are written as a manifest file listing the captured PNG frames instead of a single GIF.
 
 ## Load The Extension
 
@@ -114,19 +218,18 @@ This is useful when you want a second model pass to inspect the desktop state wi
 
 ## Runtime Files
 
-Screenshots are saved under:
+All runtime output lives under `pi-extension/runtime/` (git-ignored):
 
-```text
-pi-extension/runtime/screenshots/
-```
+| Path | Contents |
+|------|----------|
+| `runtime/skills/skills.jsonl` | **Skill library** — saved with `skill_save`, replayed with `skill_run` |
+| `runtime/traces/` | Per-session JSONL trajectory logs |
+| `runtime/screenshots/` | Ad-hoc screenshots taken by the agent |
+| `runtime/failures/` | Animated GIF failure recordings |
+| `runtime/browser/` | Playwright browser screenshots |
+| `runtime/logs/autogui.log` | Verbose JSON-lines event log |
 
-Verbose logs are written as JSON lines under:
-
-```text
-pi-extension/runtime/logs/autogui.log
-```
-
-The extension creates these directories recursively as needed. Runtime files, local Pi metadata, and `node_modules` are ignored by git.
+The extension creates these directories recursively as needed.
 
 The log records command starts, tool starts, successes, failures, backend detection, PowerShell script attempts, PowerShell stdout/stderr, and provider response statuses. Large string fields are truncated in the log so screenshots are not written into logs wholesale.
 

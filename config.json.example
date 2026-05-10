@@ -8,28 +8,54 @@
     "timeout_seconds": 120
   },
   "prompts_dir": "prompts",
+  "_install_comment": "Set install_dependencies=true to run scripts/install-dependencies.* at startup (system + Python + Playwright + pi-extension Node deps).",
+  "install_dependencies": false,
   "agent": {
     "max_iterations": 30,
     "confirm_destructive": true,
-    "destructive_keywords": [
-      "rm",
-      "delete",
-      "format",
-      "truncate",
-      "DROP",
-      "sudo rm",
-      "rmdir"
-    ],
-    "vision_screenshots": true
+    "vision_screenshots": true,
+    "record_trace": true,
+    "trace_dir": "logs/traces",
+    "suggest_skills": true,
+    "_skills_comment": "Skills (replayable macros) are stored in ./skills/skills.jsonl relative to the project root. The directory is created automatically and is git-ignored.",
+    "skills_path": "skills/skills.jsonl",
+    "planner": {
+      "_comment": "Pre-execution planning pass; one extra LLM call up front but more coherent multi-step traces.",
+      "enabled": true
+    },
+    "bon": {
+      "_comment": "Best-of-N action sampling. Samples n completions and picks the best. Increases token cost on uncertain steps.",
+      "enabled": true,
+      "n": 3,
+      "temperature": 0.7,
+      "trigger_on_recent_failure": true,
+      "trigger_on_validator_disagreement": true
+    },
+    "screen_record": {
+      "_comment": "Rolling screen buffer; flushes to an animated GIF on tool failure.",
+      "enabled": true,
+      "fps": 5,
+      "buffer_seconds": 5.0,
+      "max_width": 960,
+      "out_dir": "screenshots/failures"
+    }
   },
   "tools": {
     "shell_timeout_seconds": 30,
     "screenshot_dir": "screenshots",
     "max_screenshot_width": 1280,
+    "perception_cache_ttl_seconds": 0.5,
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,
-    "allowed_browser": false
+    "allowed_browser": true
+  },
+  "browser": {
+    "_comment": "Settings for the Playwright-driven browser backend (used when allowed_browser=true).",
+    "headless": false,
+    "screenshot_dir": "screenshots/browser",
+    "user_data_dir": "",
+    "viewport": {"width": 1280, "height": 800}
   },
   "logging": {
     "level": "INFO",
@@ -40,10 +66,14 @@
   "tui": {
     "theme": "dark",
     "show_tool_calls": true,
-    "show_token_counts": false,
+    "show_token_counts": true,
     "history_file": "logs/history.jsonl"
   },
   "safety": {
-    "command_confirm_delay_seconds": 5
+    "command_confirm_delay_seconds": 5,
+    "dry_run": false,
+    "allowed_apps": [],
+    "blocked_window_titles": [],
+    "fs_write_snapshot_dir": ""
   }
 }

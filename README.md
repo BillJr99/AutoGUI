@@ -24,11 +24,23 @@ is configured to use and exposes desktop tools plus `/autogui`.
 
 | Category | What it does |
 |----------|--------------|
+| **Planner** | One LLM call up front produces a numbered plan; executor follows it across the ReAct loop. Off-switchable, defaults on |
 | **ReAct loop** | Reason → tool call → observe result → repeat, up to configurable iteration limit |
 | **Shell** | Run any shell command with timeout, destructive-pattern guard, and confirmation delay |
-| **Filesystem** | Read, write (or append), and list files/directories |
-| **Desktop** | Screenshot, click, double-click, type text, hotkeys, scroll, launch apps, list windows |
-| **Accessibility** | Find UI elements by name/type (Windows UIAutomation, macOS osascript, WSL) |
+| **Filesystem** | Read, write (or append), and list files/directories; optional pre-overwrite snapshots |
+| **Desktop (pixel)** | Screenshot, click, double-click, type text, hotkeys, scroll, launch apps, list windows |
+| **Desktop (a11y-first)** | `desktop_click_element(name, …)` clicks real UI controls via UIAutomation (Windows), AT-SPI (Linux), and AppleScript (macOS) — no pixel guessing |
+| **Set-of-Mark grounding** | Numbered overlay on detected elements; the model clicks by id (`desktop_click_mark`) instead of pixel coords |
+| **Click-by-text** | OCR-anchored click (`desktop_click_text`); install Tesseract via `scripts/install-dependencies.*` |
+| **Browser (Playwright)** | First-class Chromium driver: real DOM/ARIA selectors, `browser_click`, `browser_fill`, `browser_eval` — opt-in via `allowed_browser` |
+| **Native input (Windows)** | `click`/`type_text`/`hotkey` go through `user32.SendInput` directly (real INPUT events, correct DPI, full Unicode) |
+| **Best-of-N sampling** | On uncertain steps (recent failure or non-APPROVED validator), sample N candidates and pick via self-consistency or a verifier model |
+| **Skill library** | `skill_save`/`skill_list`/`skill_run`: persist successful tool sequences, retrieve them by keyword on the next task |
+| **Trajectory replay** | Per-session JSONL trace + `replay.py` re-runs any saved skill or trace deterministically (no LLM) |
+| **Failure recording** | Rolling 5-second screen buffer dumps to an animated GIF on tool failure |
+| **State diff & modal flag** | Pre/post-action window-set diff with an `[UNEXPECTED MODAL: …]` banner when an error/permission/confirm dialog appears |
+| **Dry-run mode** | Stub all state-changing tools while keeping observation tools live |
+| **Action scoping** | `allowed_apps` + `blocked_window_titles` enforced before every GUI action |
 | **Platform-aware prompts** | Auto-injects OS-specific instructions (WSL `.exe`, `where.exe`, `which`, etc.) |
 | **Startup validation** | Checks API key and model against the live server; prompts to fix or save |
 | **Live model picker** | Ctrl+P → "Change Model" fetches the live model list; select and optionally persist to config |
@@ -67,8 +79,14 @@ main.py             Entry point — argparse, validation, component wiring, TUI/
 │   ├─ shell_run             Shell command with timeout and destructive guard
 │   ├─ fs_read / fs_write / fs_list
 │   ├─ desktop_screenshot / click / type / hotkey / scroll / launch / list_windows
-│   ├─ desktop_find_element  (Windows, macOS, WSL — when backend supports it)
-│   ├─ desktop_get_window_tree (Windows, macOS)
+│   ├─ desktop_find_element  (Windows UIAutomation, Linux AT-SPI, WSL)
+│   ├─ desktop_click_element (a11y-first click — same backends as find_element)
+│   ├─ desktop_click_text    (OCR / a11y text match)
+│   ├─ desktop_screenshot_marked / desktop_click_mark  (Set-of-Mark)
+│   ├─ skill_save / skill_list / skill_run  (persistent macros)
+│   ├─ browser_navigate / click / fill / press / get_text / screenshot / eval
+│   │   (Playwright; registered when allowed_browser=true)
+│   ├─ desktop_get_window_tree (Windows)
 │   └─ ToolRegistry          JSON Schema catalog + async dispatch
 │
 ├── agent.py        Agentic loop
@@ -155,6 +173,202 @@ pip install uiautomation pywin32
 pip install pyobjc-framework-Quartz pyobjc-framework-AppKit
 ```
 
+### Optional dependencies — install scripts
+
+Optional features (Tesseract for click-by-text, Playwright + Chromium for
+the browser tools, Linux AT-SPI for `desktop_click_element`, ImageMagick
+for Set-of-Mark overlays + failure GIFs, plus a few platform-specific pip
+packages) are installed by **one script per OS** under `scripts/`:
+
+| OS                   | Script                                            |
+|----------------------|---------------------------------------------------|
+| Linux / macOS / WSL  | `bash scripts/install-dependencies.sh`            |
+| Windows              | `scripts\install-dependencies.cmd` (cmd shim)     |
+| Windows (PowerShell) | `powershell -ExecutionPolicy Bypass -File scripts\install-dependencies.ps1` |
+
+Each script:
+- detects its OS, package manager (apt/dnf/pacman/zypper/brew/winget), and display server (X11 vs Wayland on Linux);
+- skips dependencies that are already installed (idempotent);
+- echoes every command before running it (loud by design);
+- installs the Python deps from `requirements.txt`, plus the optional ones (`pyperclip`, `pytesseract`, `playwright`, `pyobjc-framework-Quartz` on macOS, `uiautomation` + `pywin32` on Windows);
+- runs `python -m playwright install chromium`;
+- if `pi-extension/` exists, also runs `npm install` (which picks up `playwright` from `optionalDependencies`) and `npx playwright install chromium` inside it.
+
+Either run the script manually before launch, or set this config flag and
+AutoGUI will invoke it once at startup before initialising the registry:
+
+```json
+{ "install_dependencies": true }
+```
+
+The flag is at the top level of `config.json` (not under `agent`/`tools`).
+Default is `false` so unmodified setups don't install anything.
+
+**Manual single-package install** if you only want one of the optional
+deps:
+
+```bash
+# Tesseract (for desktop_click_text / desktop_find_text)
+sudo apt install tesseract-ocr   # Debian/Ubuntu/WSL
+sudo dnf install tesseract       # Fedora
+brew install tesseract           # macOS
+winget install UB-Mannheim.TesseractOCR   # Windows
+pip install pytesseract
+
+# Playwright + Chromium (for browser_* tools)
+pip install playwright
+python -m playwright install chromium
+
+# Linux a11y for desktop_click_element
+sudo apt install python3-pyatspi gir1.2-atspi-2.0
+
+# ImageMagick (for Set-of-Mark overlay + failure GIFs)
+sudo apt install imagemagick     # Linux
+brew install imagemagick         # macOS
+winget install ImageMagick.ImageMagick   # Windows
+```
+
+### Planner (vs. dry-run — they're different things)
+
+**Planner** = one extra LLM call at the start of each task that
+produces a numbered, high-level plan (3–8 steps describing goals,
+not specific clicks). The plan is injected as a `[PLAN]` block into
+the executor's context so every subsequent decision has the full
+trajectory in mind. Configured under `agent.planner.enabled`,
+defaults on. Same OpenWebUI client as the rest of the agent — one
+extra round-trip per task; no separate model required.
+
+**Dry-run** (`safety.dry_run: true`) is a *safety stub*, not a
+planner — it returns `{dry_run: true, would_execute: …}` for every
+state-changing tool while leaving the real screen unchanged. Useful
+for "rehearse a task without touching anything", but not as a
+plan-then-execute mechanism: the executor would think each step
+succeeded, observe the unchanged real screen, and tie itself in
+knots over the contradiction.
+
+If you want plan-first-then-execute semantics, leave dry-run off and
+keep the planner on — that's exactly what the planner does.
+
+You can turn the planner off entirely with
+`agent.planner.enabled: false` if you don't want the extra round-
+trip while debugging.
+
+### A11y-first clicking (most reliable)
+
+`desktop_click_element(name=…, control_type=…)` talks to the real UI
+control by name/role via the OS accessibility API instead of clicking
+at a guessed pixel position. **Prefer this over `desktop_click`
+whenever the target has a visible label** — it survives DPI scaling,
+window moves, and async UI redraws.
+
+| Platform     | Backend used                        | Install                                                |
+|--------------|-------------------------------------|--------------------------------------------------------|
+| Windows      | UIAutomation (`uiautomation` pkg)   | `pip install uiautomation pywin32`                     |
+| macOS        | AppleScript / AX (`pyobjc`)         | `pip install pyobjc-framework-Quartz pyobjc-framework-AppKit` (built-in if installed) |
+| Linux X11    | AT-SPI 2 (`pyatspi`)                | `sudo apt install python3-pyatspi gir1.2-atspi-2.0`    |
+| Linux Wayland| AT-SPI 2 (`pyatspi`)                | same as X11                                             |
+
+When the a11y backend isn't available the fallback ladder is:
+`desktop_click_text` (OCR/a11y text match) → `desktop_click_mark`
+(Set-of-Mark) → `desktop_click(x, y)`. The agent's system prompt
+encourages the model to walk this ladder.
+
+### Browser automation (Playwright)
+
+Set `tools.allowed_browser: true` to enable the `browser_*` tool
+family — a Playwright-driven Chromium that the agent can navigate,
+inspect, and interact with via real DOM/ARIA selectors instead of
+pixel coordinates.
+
+Playwright + Chromium are installed by `scripts/install-dependencies.*`
+(see "Optional dependencies — install scripts" above). Either run the
+script once manually, or set `install_dependencies: true` at the top
+of `config.json` to have AutoGUI run it at startup. Until they're
+present, the `browser_*` tools register but return a clear error
+pointing back at the install script.
+
+Selectors follow Playwright syntax:
+- CSS: `button.primary`, `#login-form input[name="email"]`
+- Text: `text=Sign in`, `text=/^Continue$/i`
+- ARIA role: `role=button[name="Sign in"]`
+- XPath: `xpath=//button[contains(.,"Sign in")]`
+
+Use `browser.user_data_dir` to point at a persistent profile if you
+want logins/cookies to survive restarts.
+
+### Native input on Windows
+
+On Windows, `desktop_click` / `desktop_type` / `desktop_hotkey` go
+through `user32.SendInput` directly via ctypes when available. This
+gives you real INPUT events (indistinguishable from a physical
+keyboard/mouse), correct per-monitor DPI behaviour, and full Unicode
+text input via `KEYEVENTF_UNICODE`. Falls back to pyautogui if
+SendInput initialisation fails. No configuration required.
+
+### Typing reliability
+
+`desktop_type` always tries clipboard paste first (one event,
+arbitrary length, perfect Unicode), with the platform-correct
+modifier — `Cmd+V` on macOS, `Ctrl+V` everywhere else. Only when
+the clipboard path fails or `pyperclip` isn't installed does it
+fall back to per-character keystrokes. Per-platform fallbacks:
+
+- **Windows / WSL** — `SendInput KEYEVENTF_UNICODE` with a 5 ms
+  inter-event pause and 15 ms inter-character pause (slow targets
+  used to drop keys at the previous 0 ms cadence).
+- **Linux X11** — `xdotool type --clearmodifiers --delay 30` (the
+  default 12 ms cadence sometimes loses keys on slow targets,
+  producing artefacts like `hello world` → `hello ddddd`).
+- **Linux Wayland** — `ydotool type --key-delay 20` with a fallback
+  to plain `ydotool type` for older versions.
+
+Every typing call is now logged at INFO level with the actual text
+(truncated to 60 chars) and the method that ran, so if a target app
+keeps losing keys you can see which path is being used.
+
+The clipboard-paste path saves the user's clipboard before pasting
+and restores it afterward, so automation doesn't clobber whatever
+the user had copied.
+
+### Best-of-N action sampling
+
+Optional. Set `agent.bon.enabled: true` and on uncertain steps the
+agent will sample N candidate completions from the primary model in
+parallel, then choose between them via:
+
+1. **Self-consistency** — if a strong majority propose the same first
+   tool + arg signature, that's the pick (no extra call).
+2. **Verifier** — otherwise the same OpenWebUI client is given a
+   one-line summary of each candidate (no tools attached) and asked
+   to return only the index of the best one.
+3. **Fallback** — any failure path picks the first viable candidate,
+   so BoN can never make the agent worse than baseline.
+
+Triggers (also configurable):
+- `trigger_on_recent_failure` — last iteration had a failed tool.
+- `trigger_on_validator_disagreement` — last validator verdict was
+  not `APPROVED`.
+
+Cost: 3–5× tokens on triggered steps. Spend nothing on confident
+steps. Defaults are conservative; turn it on when you're chasing the
+last ~20% of accuracy.
+
+### Failure recording
+
+A daemon thread maintains a rolling 5-second screen buffer at 5 fps.
+On any failed tool call the buffer is flushed to an animated GIF
+under `screenshots/failures/`, and a `failure_recording` event is
+emitted with the path. Defaults to on; tune via `agent.screen_record`.
+
+### Set-of-Mark grounding
+
+When vision is enabled, the agent uses **Set-of-Mark** screenshots:
+numbered boxes are drawn over detected UI elements, and the model
+clicks by ID via `desktop_click_mark(mark_id)` instead of guessing
+pixel coordinates. The marks come from the OS accessibility tree
+where available (Windows UIAutomation, macOS) and from window rects
+elsewhere. No setup required — it's on by default.
+
 ### Configuration
 
 ```bash
@@ -217,12 +431,29 @@ See `pi-extension/README.md` for the full extension details.
 
 The standalone Python agent creates runtime directories as needed:
 
-- `logs/` is created before `logs/agent.log` is opened.
-- The parent directory for `logs/history.jsonl` is created when TUI history is saved.
-- `screenshots/` is created by the active screenshot backend before saving a screenshot.
+| Path | Contents |
+|------|----------|
+| `logs/` | `agent.log` (rotating) + per-session `session_<ts>.log` files |
+| `logs/traces/` | Per-task JSONL trajectory logs |
+| `screenshots/` | Ad-hoc screenshots taken by the agent |
+| `screenshots/failures/` | Animated GIF failure recordings |
+| `skills/` | **Skill library** — `skills/skills.jsonl`, one record per saved skill |
 
-The Pi extension creates `pi-extension/runtime/screenshots/` recursively before
-saving screenshots. These runtime paths are ignored by git.
+`skills/` is git-ignored. Skills are replayable macros saved with `skill_save` and
+retrieved automatically at task start by keyword. They are shared with the Pi extension
+when both are run from the same project root (point `skillsPath` at the same file).
+
+The Pi extension writes runtime files under `pi-extension/runtime/`:
+
+| Path | Contents |
+|------|----------|
+| `pi-extension/runtime/skills/` | **Skill library** — `skills.jsonl` |
+| `pi-extension/runtime/traces/` | Per-session JSONL trajectory logs |
+| `pi-extension/runtime/screenshots/` | Ad-hoc screenshots |
+| `pi-extension/runtime/failures/` | Animated GIF failure recordings |
+| `pi-extension/runtime/logs/` | `autogui.log` |
+
+All `pi-extension/runtime/` paths are git-ignored.
 
 ### Interactive TUI
 
@@ -387,19 +618,48 @@ No configuration is needed.
     "max_tokens": 4096,                   // Max completion tokens per call
     "timeout_seconds": 120               // Per-request timeout
   },
+  "install_dependencies": false,          // True = run scripts/install-dependencies.* at startup
   "agent": {
     "max_iterations": 30,                 // Hard stop after N agentic loop iterations
-    "system_prompt": "...",              // Full system prompt (see config.json.example)
-    "confirm_destructive": true          // Block shell commands matching destructive patterns
+    "confirm_destructive": true,         // Block shell commands matching destructive regex patterns
+    "vision_screenshots": true,          // Send screenshots to vision-capable models
+    "record_trace": true,                // Persist every event to logs/traces/<session>.jsonl
+    "trace_dir": "logs/traces",          // Where the JSONL trajectory log lives
+    "suggest_skills": true,              // Offer top-K saved skills at task start
+    "skills_path": "skills/skills.jsonl",  // Skill library — git-ignored, created automatically
+    "planner": {                          // Pre-execution planning pass
+      "enabled": true                     // One extra LLM call up front (uses the primary client)
+    },
+    "bon": {                              // Best-of-N action sampling
+      "enabled": true,                    // Samples n completions, picks best on uncertain steps
+      "n": 3,                             // Number of candidates to sample
+      "temperature": 0.7,                 // Sampling temperature for diverse candidates
+      "trigger_on_recent_failure": true,
+      "trigger_on_validator_disagreement": true
+    },
+    "screen_record": {                    // Rolling screen buffer
+      "enabled": true,                    // Capture into a deque while running
+      "fps": 5,                           // Frames per second
+      "buffer_seconds": 5.0,              // Length of rolling window in seconds
+      "max_width": 960,                   // Downscale before storing
+      "out_dir": "screenshots/failures"   // GIFs are written here on tool failure
+    }
   },
   "tools": {
     "shell_timeout_seconds": 30,          // Per-command shell timeout
     "screenshot_dir": "screenshots",      // Directory for saved screenshots
     "max_screenshot_width": 1280,         // Resize screenshots wider than this (px)
+    "perception_cache_ttl_seconds": 0.5,  // Reuse the last screenshot for this long
     "allowed_shell": true,               // Enable shell_run tool
     "allowed_filesystem": true,          // Enable fs_read / fs_write / fs_list
     "allowed_desktop": true,             // Enable all desktop/* tools
-    "allowed_browser": false             // Playwright browser tools (not yet implemented)
+    "allowed_browser": false             // Playwright browser_* tools
+  },
+  "browser": {                            // Settings for the Playwright backend
+    "headless": false,                    // Run with a visible window
+    "screenshot_dir": "screenshots/browser",
+    "user_data_dir": "",                 // Non-empty path = persistent profile (keeps logins)
+    "viewport": {"width": 1280, "height": 800}
   },
   "logging": {
     "level": "INFO",                     // Log level for file handler
@@ -414,7 +674,12 @@ No configuration is needed.
     "history_file": "logs/history.jsonl" // Ctrl+S saves here
   },
   "safety": {
-    "command_confirm_delay_seconds": 5   // Countdown before each tool call (0 = off)
+    "command_confirm_delay_seconds": 5,  // Countdown before each tool call (0 = off)
+    "dry_run": false,                    // True = state-changing tools return a stub
+                                          //   {dry_run, would_execute} instead of running
+    "allowed_apps": [],                  // Restrict GUI actions to these apps; empty = unrestricted
+    "blocked_window_titles": [],         // Regex patterns; matching active window blocks GUI tools
+    "fs_write_snapshot_dir": ""           // Non-empty path = back up files before fs_write overwrite
   }
 }
 ```

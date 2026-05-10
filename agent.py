@@ -35,11 +35,15 @@ import platform as _platform
 import re
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from client import OpenWebUIClient
+from planner import Planner
 from prompt_loader import PromptLoader
+from screen_record import ScreenRecorder
+from skills import SkillStore
 from tools import ToolRegistry
+from trace import TraceWriter
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +119,19 @@ class Agent:
         Full configuration dict (agent section used for system prompt, etc.).
     """
 
-    def __init__(self, client: OpenWebUIClient, registry: ToolRegistry, cfg: dict):
+    def __init__(
+        self,
+        client: OpenWebUIClient,
+        registry: ToolRegistry,
+        cfg: dict,
+        event_sink: Callable[["AgentEvent"], None] | None = None,
+    ):
         self._client = client
         self._registry = registry
+        self._cfg = cfg
         self._agent_cfg = cfg.get("agent", {})
         self._max_iterations: int = self._agent_cfg.get("max_iterations", 30)
+        self._event_sink = event_sink
 
         # Load prompt files; fall back to config system_prompt for the base if missing.
         self._prompts = PromptLoader(cfg.get("prompts_dir", "prompts"))
@@ -138,7 +150,8 @@ class Agent:
         self._confirm_delay: int = int(cfg.get("safety", {}).get("command_confirm_delay_seconds", 0))
         # When True, screenshot base64 is delivered as an image_url vision message
         # so vision-capable models can actually see it.  Set False for text-only models.
-        self._vision_screenshots: bool = self._agent_cfg.get("vision_screenshots", True)
+        self._vision_screenshots: bool = bool(self._agent_cfg.get("vision_screenshots", True))
+        logger.info("[agent] vision_screenshots=%s", self._vision_screenshots)
 
         # The message history is the single source of truth for the conversation.
         # It persists across multiple calls to run(), allowing multi-turn dialogue.
@@ -150,11 +163,249 @@ class Agent:
         # checker so it can flag duplicates (e.g. launching the same app twice).
         self._completed_actions: list[str] = []
 
+        # Full-fidelity record of successful tool dispatches for the current
+        # session.  Used by skill_save to snapshot the recipe of "what worked"
+        # and by the trace writer for post-hoc inspection.
+        self._session_steps: list[dict] = []
+
+        # Best-of-N (Phase 7) configuration + uncertainty trackers.  When
+        # bon.enabled is true and any of the trigger conditions match, the
+        # next action is selected by sampling N completions and asking the
+        # fast/verifier model to pick the best.  All defaults off — this
+        # multiplies token spend on uncertain steps.
+        bon_cfg = self._agent_cfg.get("bon", {}) or {}
+        self._bon_enabled: bool = bool(bon_cfg.get("enabled", False))
+        self._bon_n: int = max(2, int(bon_cfg.get("n", 3)))
+        self._bon_temperature: float = float(bon_cfg.get("temperature", 0.7))
+        self._bon_trigger_on_failure: bool = bool(
+            bon_cfg.get("trigger_on_recent_failure", True)
+        )
+        self._bon_trigger_on_validator: bool = bool(
+            bon_cfg.get("trigger_on_validator_disagreement", True)
+        )
+        self._last_iteration_had_failure: bool = False
+        self._last_validator_verdict: str | None = None
+
+        # Trace + skill store wiring (Phase 2).
+        trace_dir = self._agent_cfg.get("trace_dir", "logs/traces")
+        skills_path = self._agent_cfg.get("skills_path", "skills/skills.jsonl")
+        self._suggest_skills: bool = bool(self._agent_cfg.get("suggest_skills", True))
+        self._record_trace: bool = bool(self._agent_cfg.get("record_trace", True))
+
+        try:
+            self._trace = TraceWriter(trace_dir) if self._record_trace else None
+        except Exception as e:
+            logger.warning("[agent] TraceWriter init failed: %s", e)
+            self._trace = None
+
+        try:
+            self._skill_store = SkillStore(skills_path)
+        except Exception as e:
+            logger.warning("[agent] SkillStore init failed: %s", e)
+            self._skill_store = None
+
+        if self._trace:
+            try:
+                self._trace.write_meta(
+                    event="session_start",
+                    model=cfg.get("openwebui", {}).get("model", "?"),
+                    vision=self._vision_screenshots,
+                )
+            except Exception:
+                pass
+
+        if self._skill_store is not None:
+            self._register_skill_tools()
+
+        # Planner (Phase 12).  When enabled, the agent issues one extra
+        # LLM call BEFORE the action loop to produce a numbered plan, then
+        # injects the plan into history so the executor sees the full
+        # trajectory it's working towards.  Disabled = legacy behaviour.
+        planner_cfg = self._agent_cfg.get("planner", {}) or {}
+        self._planner_enabled: bool = bool(planner_cfg.get("enabled", True))
+        self._planner: Planner | None = None
+        if self._planner_enabled:
+            try:
+                self._planner = Planner(self._client)
+            except Exception as e:
+                logger.warning("[agent] Planner init failed: %s", e)
+                self._planner = None
+
+        # Rolling screen buffer (Phase 11).  When a tool fails, the buffer
+        # is flushed to an animated GIF so the user can see exactly how
+        # the agent got into trouble.
+        rec_cfg = self._agent_cfg.get("screen_record", {}) or {}
+        self._record_enabled: bool = bool(rec_cfg.get("enabled", True))
+        self._recorder: ScreenRecorder | None = None
+        if self._record_enabled:
+            try:
+                self._recorder = ScreenRecorder(
+                    out_dir=rec_cfg.get("out_dir", "screenshots/failures"),
+                    fps=int(rec_cfg.get("fps", 5)),
+                    buffer_seconds=float(rec_cfg.get("buffer_seconds", 5.0)),
+                    max_width=int(rec_cfg.get("max_width", 960)),
+                )
+                self._recorder.start()
+            except Exception as e:
+                logger.warning("[agent] ScreenRecorder init failed: %s", e)
+                self._recorder = None
+
+    # ------------------------------------------------------------------
+    # Skill tool registration
+    # ------------------------------------------------------------------
+
+    def _register_skill_tools(self):
+        """Add skill_save / skill_list / skill_run to the registry."""
+        store = self._skill_store
+        registry = self._registry
+
+        async def _skill_save(name: str, keywords=None, app: str = "") -> dict:
+            if not self._session_steps:
+                return {"error": "No successful steps in this session yet to save."}
+            kw = keywords or []
+            if isinstance(kw, str):
+                kw = [k.strip() for k in re.split(r"[,;\s]+", kw) if k.strip()]
+            try:
+                skill = store.save(
+                    name=str(name),
+                    keywords=list(kw),
+                    app=str(app or ""),
+                    steps=list(self._session_steps),
+                )
+                return {"success": True, "name": skill["name"], "step_count": len(skill["steps"])}
+            except Exception as e:
+                return {"error": str(e)}
+
+        async def _skill_list(query: str = "", limit: int = 5) -> dict:
+            try:
+                results = store.search(str(query) if query else "", limit=int(limit) if limit else 5)
+                return {
+                    "skills": [
+                        {
+                            "name": s.get("name"),
+                            "app": s.get("app", ""),
+                            "keywords": s.get("keywords", []),
+                            "step_count": len(s.get("steps", [])),
+                            "success_count": s.get("success_count", 0),
+                        }
+                        for s in results
+                    ],
+                    "count": len(results),
+                }
+            except Exception as e:
+                return {"error": str(e)}
+
+        async def _skill_run(name: str) -> dict:
+            from skills import normalize_skill_steps
+            skill = store.get(str(name))
+            if not skill:
+                return {"error": f"No skill named {name!r}"}
+            executed: list[dict] = []
+            for step in normalize_skill_steps(skill.get("steps", [])):
+                tool = step.get("tool")
+                args = step.get("args", {}) or {}
+                if not tool:
+                    continue
+                result_json = await registry.dispatch(tool, args)
+                try:
+                    result = json.loads(result_json)
+                except json.JSONDecodeError:
+                    result = {"raw": result_json[:120]}
+                executed.append({"tool": tool, "args": args, "ok": "error" not in result})
+                if "error" in result:
+                    return {
+                        "skill": name,
+                        "executed": executed,
+                        "stopped_at": tool,
+                        "error": result["error"],
+                    }
+            try:
+                store.increment_success(str(name))
+            except Exception:
+                pass
+            return {"skill": name, "executed": executed, "step_count": len(executed), "success": True}
+
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "skill_save",
+                "description": (
+                    "Save the sequence of tool calls completed in this session as a "
+                    "named, replayable skill. Provide keywords describing when this "
+                    "skill applies (e.g. 'open weather forecast in browser'). "
+                    "Call this only after the task has succeeded — earlier failed "
+                    "attempts in the same session are not included. "
+                    "Saved skills can later be invoked by skill_run or replayed "
+                    "outside the agent via replay.py. "
+                    "NOTE: pixel-coordinate desktop_click steps used for window focus "
+                    "are automatically dropped on replay (coordinates change between runs). "
+                    "Prefer desktop_activate_window for focus — it is position-independent."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "name": {"type": "string", "description": "Short unique identifier for the skill."},
+                    "keywords": {"type": "array", "items": {"type": "string"},
+                                 "description": "Words/phrases that describe when to use this skill."},
+                    "app": {"type": "string",
+                            "description": "Primary app or context this skill targets (optional)."},
+                }, "required": ["name"]},
+            }},
+            _skill_save,
+        )
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "skill_list",
+                "description": (
+                    "List saved skills, optionally filtered by a search query. "
+                    "Use this at the start of a task to check whether a known "
+                    "procedure already exists for what the user asked."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string", "description": "Optional keyword filter."},
+                    "limit": {"type": "integer", "description": "Max skills to return (default 5)."},
+                }},
+            }},
+            _skill_list,
+        )
+        registry.add_tool(
+            {"type": "function", "function": {
+                "name": "skill_run",
+                "description": (
+                    "Replay every step of a previously saved skill in order. "
+                    "Stops at the first failing step. Use only when the current "
+                    "screen state and target app match the conditions under which "
+                    "the skill was originally recorded."
+                ),
+                "parameters": {"type": "object", "properties": {
+                    "name": {"type": "string"},
+                }, "required": ["name"]},
+            }},
+            _skill_run,
+        )
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     async def run(self, user_input: str) -> AsyncIterator[AgentEvent]:
+        """
+        Public entry point.  Tees every yielded event through the trace
+        writer and the optional event_sink before passing it to the caller,
+        so observability / replay logging can be added without modifying
+        each yield site individually.
+        """
+        async for event in self._run_inner(user_input):
+            if self._trace is not None:
+                try:
+                    self._trace.write_event(event)
+                except Exception:
+                    pass
+            if self._event_sink is not None:
+                try:
+                    self._event_sink(event)
+                except Exception:
+                    pass
+            yield event
+
+    async def _run_inner(self, user_input: str) -> AsyncIterator[AgentEvent]:
         """
         Append user_input to the history and drive the agentic loop until
         the model produces a final response or the iteration ceiling is reached.
@@ -185,6 +436,7 @@ class Agent:
         else:
             initial_suffix = "\n" + self._prompts.text("runtime_vision_disabled")
 
+        windows_json = ""
         if "desktop_list_windows" in available_tools:
             try:
                 windows_json = await self._registry.dispatch("desktop_list_windows", {})
@@ -192,16 +444,84 @@ class Agent:
             except Exception:
                 pass
 
-        if self._vision_screenshots and "desktop_screenshot" in available_tools:
+        # ---- Planner pass (Phase 12) -------------------------------------
+        # One extra LLM call BEFORE the executor loop produces a numbered
+        # plan; the plan is injected as a [PLAN] block so every subsequent
+        # tool decision has the full trajectory in mind.  Falls back to a
+        # plan-less run on any failure so this can never make things worse.
+        if self._planner is not None:
+            browser_avail = any(t.startswith("browser_") for t in available_tools)
+            a11y_avail = "desktop_click_element" in available_tools
+            os_label = _platform.system()
+            plan_text = ""
             try:
-                shot_json = await self._registry.dispatch("desktop_screenshot", {})
+                plan_text = await self._planner.plan(
+                    task=user_input,
+                    os_label=os_label,
+                    vision=self._vision_screenshots,
+                    browser_available=browser_avail,
+                    a11y_available=a11y_avail,
+                    windows_summary=windows_json,
+                )
+            except Exception as e:
+                logger.warning("[agent] planner failed: %s", e)
+            if plan_text:
+                logger.info("[agent] plan:\n%s", plan_text)
+                yield AgentEvent(
+                    kind="plan",
+                    content=plan_text,
+                    data={"plan": plan_text},
+                )
+                initial_suffix += (
+                    "\n\n[PLAN — follow this trajectory, but adapt if the "
+                    "screen state diverges from what a step expects:]\n"
+                    + plan_text
+                )
+
+        # Skill retrieval — show the model up to 3 saved procedures whose
+        # keywords overlap with the user's request, so it can opt to skill_run
+        # instead of re-deriving from scratch.
+        if self._suggest_skills and self._skill_store is not None and "skill_run" in available_tools:
+            try:
+                candidates = self._skill_store.search(user_input, limit=3)
+            except Exception:
+                candidates = []
+            if candidates:
+                lines = ["[Candidate saved skills (call skill_run if one matches):]"]
+                for s in candidates:
+                    lines.append(
+                        f"  - {s.get('name')!r} (app={s.get('app','?')}, "
+                        f"steps={len(s.get('steps', []))}, "
+                        f"successes={s.get('success_count', 0)}, "
+                        f"keywords={s.get('keywords', [])[:5]})"
+                    )
+                initial_suffix += "\n\n" + "\n".join(lines)
+
+        # Pick the best screenshot tool: marked (Set-of-Mark) when available,
+        # else plain.  The marked variant draws numbered boxes over UI elements
+        # so the model can refer to them by id.
+        shot_tool = (
+            "desktop_screenshot_marked"
+            if "desktop_screenshot_marked" in available_tools
+            else "desktop_screenshot"
+        )
+        if self._vision_screenshots and shot_tool in available_tools:
+            try:
+                shot_json = await self._registry.dispatch(shot_tool, {})
                 result_obj = json.loads(shot_json)
                 b64 = result_obj.pop("base64_png", None)
+                marks = result_obj.get("marks") or []
                 if b64:
+                    text_parts = [user_input + initial_suffix]
+                    if marks:
+                        text_parts.append(
+                            f"[Set-of-Mark active — {len(marks)} numbered boxes drawn. "
+                            "Use desktop_click_mark(id) to click any of them.]"
+                        )
                     self._history.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": user_input + initial_suffix},
+                            {"type": "text", "text": "\n".join(text_parts)},
                             {"type": "image_url",
                              "image_url": {"url": "data:image/png;base64," + b64}},
                         ],
@@ -222,11 +542,24 @@ class Agent:
             logger.info("[agent.py:run] Iteration %d / %d", iteration, self._max_iterations)
 
             # ---- Call the LLM ----------------------------------------
+            # Best-of-N branch when uncertainty triggers fired on the
+            # previous iteration; otherwise greedy single sample.
             try:
-                response = await self._client.chat(
-                    messages=self._history,
-                    tools=self._registry.schemas,
-                )
+                if self._bon_should_trigger():
+                    response, bon_rationale = await self._bon_sample()
+                    yield AgentEvent(
+                        kind="validation",
+                        content=f"BoN: {bon_rationale}",
+                        data={
+                            "bon_rationale": bon_rationale,
+                            "iteration": iteration,
+                        },
+                    )
+                else:
+                    response = await self._client.chat(
+                        messages=self._history,
+                        tools=self._registry.schemas,
+                    )
             except Exception as e:
                 print(f"[agent.py:run] API call failed on iteration {iteration}: {e}")
                 traceback.print_exc()
@@ -334,6 +667,30 @@ class Agent:
             tool_result_messages: list[dict] = []
             vision_messages: list[dict] = []       # appended after tool results
             failed_tools:  list[str]  = []         # track failures for retry directive
+            iteration_validator_verdict: str | None = None  # most recent validator verdict
+
+            # ---- Capture pre-action window state for the diff ------------
+            # Only relevant when at least one of the upcoming tool calls is a
+            # desktop action.  Skipped otherwise to avoid wasting a wmctrl call.
+            pre_windows = None
+            tool_names_pending = {
+                tc.get("function", {}).get("name", "") for tc in tool_calls
+            }
+            if (
+                any(n.startswith("desktop_") and n not in (
+                    "desktop_list_windows", "desktop_screenshot",
+                    "desktop_screenshot_marked", "desktop_get_active_window",
+                    "desktop_get_cursor_pos", "desktop_get_window_text",
+                    "desktop_get_window_tree", "desktop_find_element",
+                    "desktop_find_text",
+                ) for n in tool_names_pending)
+                and "desktop_list_windows" in available_tools
+            ):
+                try:
+                    pre_json = await self._registry.dispatch("desktop_list_windows", {})
+                    pre_windows = json.loads(pre_json).get("windows", [])
+                except Exception:
+                    pre_windows = None
 
             for tc in tool_calls:
                 tool_name = tc.get("function", {}).get("name", "unknown")
@@ -350,7 +707,16 @@ class Agent:
                 yield AgentEvent(
                     kind="tool_call",
                     content=f"→ {tool_name}({', '.join(f'{k}={repr(v)[:60]}' for k, v in args.items())})",
-                    data={"tool_name": tool_name, "args": args, "call_id": call_id, "iteration": iteration},
+                    data={
+                        "tool_name": tool_name,
+                        "args": args,
+                        "call_id": call_id,
+                        "iteration": iteration,
+                        # Phase 6b: stitch the model's preceding rationale onto
+                        # every tool_call event so observability tools can show
+                        # "why did the model do this?" without re-walking history.
+                        "rationale": (text_content or "")[:400],
+                    },
                 )
 
                 # Safety countdown: yield one event per second so consumers can
@@ -376,6 +742,7 @@ class Agent:
                     proceed, args, verdict = await self._check_command_coherence(
                         tool_name, args, user_input
                     )
+                    iteration_validator_verdict = verdict
                     yield AgentEvent(
                         kind="validation",
                         content=f"Coherence [{tool_name}]: {verdict}",
@@ -494,6 +861,19 @@ class Agent:
                         if len(self._completed_actions) > 20:
                             self._completed_actions = self._completed_actions[-20:]
 
+                    # Full-fidelity record for skill snapshotting / trace export.
+                    # Skip the meta tools — they're not meaningful to replay.
+                    if tool_name not in (
+                        "skill_save", "skill_list", "skill_run",
+                        "desktop_screenshot", "desktop_screenshot_marked",
+                        "desktop_list_windows", "desktop_get_active_window",
+                        "desktop_get_cursor_pos", "desktop_get_window_text",
+                        "desktop_get_window_tree", "desktop_find_element",
+                        "desktop_find_text",
+                        "fs_read", "fs_list",
+                    ):
+                        self._session_steps.append({"tool": tool_name, "args": dict(args)})
+
                 # ---- Error injection: fail loud, not quiet -----------------
                 # Prepend a header inside the tool result AND track the failure
                 # so we can inject a strong user-role retry directive afterward.
@@ -503,6 +883,23 @@ class Agent:
                         "[TOOL FAILED: " + tool_name + "]\n"
                         + history_content
                     )
+                    # Phase 11: dump the rolling screen buffer so the user
+                    # has a visual of how the agent got here.  Cheap when
+                    # the buffer is small; silent if the recorder is off.
+                    if self._recorder is not None:
+                        gif_path = self._recorder.flush(
+                            label=f"{tool_name}_iter{iteration}"
+                        )
+                        if gif_path:
+                            yield AgentEvent(
+                                kind="failure_recording",
+                                content=f"Saved failure recording: {gif_path}",
+                                data={
+                                    "path": gif_path,
+                                    "tool_name": tool_name,
+                                    "iteration": iteration,
+                                },
+                            )
 
                 tool_result_messages.append({
                     "role": "tool",
@@ -515,6 +912,13 @@ class Agent:
             self._history.extend(tool_result_messages)
             if vision_messages:
                 self._history.extend(vision_messages)
+
+            # ---- Update BoN uncertainty trackers --------------------------
+            # Persisted across iterations so that BoN triggers on the *next*
+            # decision when this one fired off a failed tool or had a
+            # disputed validator verdict.
+            self._last_iteration_had_failure = bool(failed_tools)
+            self._last_validator_verdict = iteration_validator_verdict
 
             # ---- Error retry directive -----------------------------------
             # If any tools failed, inject a role="user" message AFTER the tool
@@ -541,13 +945,21 @@ class Agent:
             # has ground-truth desktop state rather than having to hallucinate it.
             # If vision is on and the model didn't already take a screenshot this
             # batch, also inject a screenshot so it can SEE the result.
+            # skill_run replays desktop actions internally so it also triggers
+            # the verify pass — otherwise the model never sees whether typing
+            # actually appeared in the target window.
             called_names = {tc.get("function", {}).get("name", "") for tc in tool_calls}
             desktop_actions_taken = {
                 n for n in called_names
                 if n.startswith("desktop_")
                 and n not in ("desktop_list_windows", "desktop_screenshot")
             }
-            if desktop_actions_taken:
+            verify_label = (
+                ", ".join(sorted(desktop_actions_taken))
+                if desktop_actions_taken
+                else "skill_run"
+            )
+            if desktop_actions_taken or "skill_run" in called_names:
                 if "desktop_list_windows" in available_tools:
                     try:
                         windows_json = await self._registry.dispatch("desktop_list_windows", {})
@@ -556,11 +968,63 @@ class Agent:
                         launch_reminder = ""
                         if "desktop_launch" in desktop_actions_taken:
                             launch_reminder = " " + self._prompts.text("runtime_launch_reminder")
+
+                        # ---- State-diff banner (Phases 4a/4b) -----------
+                        # Compare pre/post window sets and surface "nothing
+                        # happened" or "a modal popped up" as a one-line
+                        # banner, so the model deliberately notices the
+                        # change rather than glossing past it.
+                        diff_banner = ""
+                        modal_banner = ""
+                        try:
+                            post_windows = json.loads(windows_json).get("windows", [])
+                        except Exception:
+                            post_windows = []
+                        if pre_windows is not None:
+                            pre_ids = {(w.get("id"), w.get("title", "")) for w in pre_windows}
+                            post_ids = {(w.get("id"), w.get("title", "")) for w in post_windows}
+                            added = post_ids - pre_ids
+                            removed = pre_ids - post_ids
+                            yield AgentEvent(
+                                kind="state_diff",
+                                content=(
+                                    f"Δ windows added={len(added)} removed={len(removed)} "
+                                    f"total {len(pre_windows)}→{len(post_windows)}"
+                                ),
+                                data={
+                                    "added": [t for _, t in added],
+                                    "removed": [t for _, t in removed],
+                                    "iteration": iteration,
+                                },
+                            )
+                            if not added and not removed:
+                                diff_banner = (
+                                    " [State-diff: no window changes — the action "
+                                    "may not have taken effect; verify carefully.]"
+                                )
+                            else:
+                                diff_banner = (
+                                    f" [State-diff: +{len(added)} -{len(removed)} windows.]"
+                                )
+                            modal_pat = re.compile(
+                                r"\b(error|warning|sign[ -]?in|password|allow|"
+                                r"permission|are you sure|confirm|update available)\b",
+                                re.IGNORECASE,
+                            )
+                            modal_titles = [t for _, t in added if t and modal_pat.search(t)]
+                            if modal_titles:
+                                modal_banner = (
+                                    " [UNEXPECTED MODAL: new window(s) "
+                                    + ", ".join(repr(t) for t in modal_titles)
+                                    + " — handle this dialog before continuing.]"
+                                )
                         self._history.append({
                             "role": "user",
                             "content": (
-                                f"[Auto-verify after {', '.join(sorted(desktop_actions_taken))}] "
+                                f"[Auto-verify after {verify_label}] "
                                 f"Current desktop state: {windows_json}"
+                                + diff_banner
+                                + modal_banner
                                 + launch_reminder
                             ),
                         })
@@ -594,8 +1058,7 @@ class Agent:
                                     {
                                         "type": "text",
                                         "text": (
-                                            f"[Auto-verify screenshot after "
-                                            f"{', '.join(sorted(desktop_actions_taken))}]\n"
+                                            f"[Auto-verify screenshot after {verify_label}]\n"
                                             + self._prompts.text("runtime_screenshot_verify")
                                         ),
                                     },
@@ -632,7 +1095,32 @@ class Agent:
         """Clear conversation history, preserving the system prompt."""
         self._history = [{"role": "system", "content": self._system_prompt}]
         self._completed_actions.clear()
+        self._session_steps.clear()
+        self._last_iteration_had_failure = False
+        self._last_validator_verdict = None
         logger.info("[agent.py:reset] Conversation history cleared.")
+
+    def shutdown(self):
+        """Best-effort release of background resources (rolling recorder,
+        trace writer).  Safe to call multiple times."""
+        try:
+            if self._recorder is not None:
+                self._recorder.stop()
+                self._recorder = None
+        except Exception:
+            pass
+        try:
+            if self._trace is not None:
+                self._trace.close()
+                self._trace = None
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
 
     @property
     def history(self) -> list[dict]:
@@ -737,6 +1225,160 @@ class Agent:
         """Return True when the model's stop-response sounds like it is giving up."""
         lower = text.lower()
         return any(re.search(pat, lower) for pat in cls._GIVING_UP_PATTERNS)
+
+    # ------------------------------------------------------------------
+    # Best-of-N sampling (Phase 7)
+    # ------------------------------------------------------------------
+
+    def _bon_should_trigger(self) -> bool:
+        if not self._bon_enabled:
+            return False
+        if self._bon_trigger_on_failure and self._last_iteration_had_failure:
+            return True
+        if self._bon_trigger_on_validator and self._last_validator_verdict:
+            v = (self._last_validator_verdict or "").upper()
+            if not v.startswith("APPROVED"):
+                return True
+        return False
+
+    async def _bon_sample(
+        self,
+    ) -> tuple[dict, str]:
+        """
+        Sample N candidate completions from the primary client, then ask
+        the same client (acting as a verifier with no tools) which is
+        best.
+
+        Returns (chosen_response, rationale).  The chosen response has the
+        same shape as a normal client.chat() return so the caller can keep
+        using extract_message / extract_tool_calls unchanged.
+
+        Falls back to a single greedy call if anything goes wrong — BoN
+        should never make the agent worse than baseline.
+        """
+        history = self._history
+        tools_schema = self._registry.schemas
+
+        # Sample N proposals concurrently with elevated temperature.
+        try:
+            tasks = [
+                self._client.chat(
+                    messages=history,
+                    tools=tools_schema,
+                    temperature=self._bon_temperature,
+                )
+                for _ in range(self._bon_n)
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logger.warning("[agent.py:_bon_sample] gather failed: %s", e)
+            return await self._client.chat(messages=history, tools=tools_schema), "bon-failed-greedy"
+
+        candidates: list[tuple[int, dict, str]] = []
+        for i, resp in enumerate(responses):
+            if isinstance(resp, Exception):
+                continue
+            try:
+                msg = self._client.extract_message(resp)
+                summary = self._summarize_candidate(msg)
+                candidates.append((i, resp, summary))
+            except Exception:
+                continue
+
+        if not candidates:
+            return await self._client.chat(messages=history, tools=tools_schema), "bon-no-candidates-greedy"
+
+        if len(candidates) == 1:
+            return candidates[0][1], "bon-single-candidate"
+
+        # Quick self-consistency check: if a strong majority of candidates
+        # propose the same first tool name + arg signature, pick that without
+        # paying for the verifier round-trip.
+        signatures: dict[str, list[int]] = {}
+        for i, _resp, summary in candidates:
+            signatures.setdefault(summary, []).append(i)
+        if len(candidates) >= 3:
+            best_sig, best_idxs = max(signatures.items(), key=lambda kv: len(kv[1]))
+            if len(best_idxs) >= max(2, (len(candidates) + 1) // 2):
+                idx = best_idxs[0]
+                for i, resp, summary in candidates:
+                    if i == idx:
+                        return resp, f"bon-consensus({len(best_idxs)}/{len(candidates)}): {summary[:120]}"
+
+        # No consensus → ask the verifier model.
+        verifier = self._client
+        block = "\n\n".join(
+            f"[{i+1}] {summary}" for i, _resp, summary in candidates
+        )
+        verifier_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a verifier picking the single best next action for "
+                    "a desktop automation agent. Consider only correctness, "
+                    "safety, and alignment with the user's task. Answer with "
+                    "ONLY the integer index of the best candidate (1-based)."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "User task / current state (recent history follows):\n"
+                    + self._brief_history_summary() + "\n\n"
+                    + "Candidates:\n" + block + "\n\n"
+                    "Reply with just the index, no explanation."
+                ),
+            },
+        ]
+        try:
+            v_resp = await verifier.chat(messages=verifier_messages, tools=None)
+            v_msg = verifier.extract_message(v_resp)
+            v_text = (verifier.extract_text(v_msg) or "").strip()
+            m = re.search(r"\d+", v_text)
+            if m:
+                pick_1based = int(m.group(0))
+                pick_idx = pick_1based - 1
+                if 0 <= pick_idx < len(candidates):
+                    chosen_summary = candidates[pick_idx][2]
+                    return candidates[pick_idx][1], f"bon-verifier picked {pick_1based}: {chosen_summary[:120]}"
+        except Exception as e:
+            logger.warning("[agent.py:_bon_sample] verifier failed: %s", e)
+
+        # Verifier flaked — fall back to the first candidate.
+        return candidates[0][1], "bon-verifier-failed-fallback-first"
+
+    @staticmethod
+    def _summarize_candidate(message: dict) -> str:
+        """One-line description of an assistant message for verifier prompts."""
+        text = ""
+        if isinstance(message.get("content"), str):
+            text = message["content"][:160]
+        tcs = message.get("tool_calls") or []
+        if tcs:
+            parts = []
+            for tc in tcs[:3]:
+                fn = (tc.get("function") or {})
+                name = fn.get("name", "?")
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str) and len(args) > 100:
+                    args = args[:97] + "..."
+                parts.append(f"{name}({args})")
+            return f"tool_calls: {' | '.join(parts)}" + (f"  text: {text}" if text else "")
+        return f"text: {text}" if text else "(empty)"
+
+    def _brief_history_summary(self) -> str:
+        """Compact recent-history blurb for verifier prompts."""
+        out = []
+        for msg in self._history[-6:]:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content if isinstance(p, dict)
+                )
+            content = (content or "")[:200].replace("\n", " ")
+            out.append(f"{role}: {content}")
+        return "\n".join(out)
 
     async def _check_command_coherence(
         self,

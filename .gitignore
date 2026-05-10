@@ -30,6 +30,7 @@ ENV/
 config.json
 logs/
 screenshots/
+skills/
 pi-extension/node_modules/
 pi-extension/runtime/
 pi-extension/.agents/

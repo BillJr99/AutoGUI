@@ -73,6 +73,7 @@ class OpenWebUIClient:
         messages: list[dict],
         tools: list[dict] | None = None,
         stream: bool = False,
+        temperature: float | None = None,
     ) -> dict:
         """
         Send a chat completion request and return the parsed JSON response.
@@ -118,7 +119,9 @@ class OpenWebUIClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": self.temperature,
+            "temperature": (
+                self.temperature if temperature is None else float(temperature)
+            ),
             "max_tokens": self.max_tokens,
             "stream": False,
         }
@@ -150,9 +153,14 @@ class OpenWebUIClient:
                 ) as resp:
                     raw = await resp.text()
                     if resp.status != 200:
-                        raise RuntimeError(
+                        # Tag auth failures so callers can detect them
+                        # programmatically (e.g. fast-client → primary
+                        # auto-demote without needing to grep error text).
+                        err = RuntimeError(
                             f"[client.py:chat] API returned HTTP {resp.status}: {raw[:500]}"
                         )
+                        err.http_status = resp.status  # type: ignore[attr-defined]
+                        raise err
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError as e:

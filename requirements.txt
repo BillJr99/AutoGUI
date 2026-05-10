@@ -41,6 +41,21 @@ Pillow>=10.0.0
 #   Ensure WSL interop is enabled: /etc/wsl.conf [interop] enabled=true
 #   For WSLg (GUI support): upgrade to Windows 11 or Windows 10 21H2+
 
-# ── Optional: browser automation (set "allowed_browser": true in config) ─
+# ── Optional: OCR for desktop_click_text fallback ─────────────────────────
+# Auto-installed when tools.auto_install_tesseract=true. Manual install:
+#   pip install pytesseract && sudo apt install tesseract-ocr   (Linux)
+#   pip install pytesseract && brew install tesseract           (macOS)
+#   pip install pytesseract && winget install UB-Mannheim.TesseractOCR (Windows)
+# pytesseract>=0.3.10
+
+# ── Optional: browser automation (set "allowed_browser": true in config) ──
+# Auto-installed when tools.auto_install_playwright=true (default true when
+# allowed_browser=true). Manual install:
+#   pip install playwright && playwright install chromium
 # playwright>=1.40.0
-# After install: playwright install chromium
+
+# ── Optional: Linux accessibility-tree clicking (desktop_click_element) ───
+# pip is not enough — pyatspi requires the system gobject bindings:
+#   sudo apt install python3-pyatspi gir1.2-atspi-2.0
+# Some apps must be launched with GTK_MODULES=gail:atk-bridge or under a
+# session that has accessibility enabled.

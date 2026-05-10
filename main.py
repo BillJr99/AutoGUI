@@ -46,6 +46,24 @@ import sys
 import traceback
 from pathlib import Path
 
+# Suppress the noisy "Exception ignored in: BaseSubprocessTransport.__del__"
+# traceback that asyncio emits on Ctrl+C when the event loop closes while
+# subprocess transports are still alive.  The process exits correctly; this
+# is purely cosmetic noise.
+_orig_unraisablehook = sys.unraisablehook
+
+
+def _quiet_unraisablehook(unraisable):
+    if (
+        isinstance(unraisable.exc_value, RuntimeError)
+        and "Event loop is closed" in str(unraisable.exc_value)
+    ):
+        return
+    _orig_unraisablehook(unraisable)
+
+
+sys.unraisablehook = _quiet_unraisablehook
+
 from agent import Agent
 from client import OpenWebUIClient
 from tools import ToolRegistry
@@ -141,10 +159,25 @@ def build_components(cfg: dict):
     """
     Construct and return the (client, registry, agent) triple.
 
+    When `install_dependencies` is true at the top level of the config,
+    the appropriate `scripts/install-dependencies.*` script is invoked
+    BEFORE the registry is built so any deps it provides (e.g. tesseract,
+    playwright, pyatspi) are available when tools register.
+
     Returns
     -------
     tuple[OpenWebUIClient, ToolRegistry, Agent]
     """
+    if cfg.get("install_dependencies", False):
+        try:
+            from install_runner import run_installer
+            from pathlib import Path as _Path
+            rc = run_installer(_Path(__file__).resolve().parent)
+            if rc != 0:
+                print(f"[main] install-dependencies script returned exit code {rc} — continuing anyway.")
+        except Exception as e:
+            print(f"[main] install-dependencies invocation failed: {e}")
+
     ow_cfg = cfg.get("openwebui", {})
     client = OpenWebUIClient(
         base_url=ow_cfg.get("base_url", "http://localhost:3000"),
@@ -220,7 +253,10 @@ async def _consume_agent_events(
     _last_was_countdown = False
 
     async for event in agent.run(command):
-        if event.kind == "text":
+        if event.kind == "plan":
+            print(f"{cyan}Plan:{reset}\n{event.content}\n")
+
+        elif event.kind == "text":
             if _last_was_countdown:
                 print()
                 _last_was_countdown = False

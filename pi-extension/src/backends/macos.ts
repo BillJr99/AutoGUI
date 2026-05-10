@@ -1,12 +1,139 @@
 import { readFile } from "node:fs/promises";
 import { execFile, execFileWithStdin } from "../process.js";
-import { DesktopError, type DesktopBackend, type PlatformInfo, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
+import { DesktopError, type BackendCapabilities, type DesktopBackend, type ElementInfo, type Mark, type PlatformInfo, type ScreenshotOptions, type ScreenshotResult, type WindowInfo } from "../types.js";
 import { createPngPath, makeScreenshotResult, parseJsonArray, quoteAppleScript } from "./common.js";
+import { marksFromWindows } from "../som.js";
 
 export class MacBackend implements DesktopBackend {
   readonly name = "macos";
+  readonly capabilities: BackendCapabilities = {
+    findElement: true,
+    richMarks: false,
+    nativeInput: false,
+  };
 
   constructor(readonly platform: PlatformInfo) {}
+
+  async findElement(query: { name?: string; controlType?: string; windowTitle?: string; index?: number }, signal?: AbortSignal): Promise<ElementInfo> {
+    const name = quoteAppleScript(query.name ?? "");
+    const role = quoteAppleScript(query.controlType ?? "");
+    const winTitle = quoteAppleScript(query.windowTitle ?? "");
+    const idx = Math.max(0, Math.floor(query.index ?? 0)) + 1; // AppleScript is 1-indexed
+    // Walk frontmost process's UI element tree.  System Events exposes
+    // descriptions/names/roles plus position+size we can use as a rect.
+    const script = `
+on findInElem(elem, target, role, count)
+  try
+    set elemRole to (role of elem) as string
+  on error
+    set elemRole to ""
+  end try
+  try
+    set elemDesc to (description of elem) as string
+  on error
+    set elemDesc to ""
+  end try
+  try
+    set elemName to (name of elem) as string
+  on error
+    set elemName to ""
+  end try
+  try
+    set elemTitle to (title of elem) as string
+  on error
+    set elemTitle to ""
+  end try
+  set joined to (elemName & " " & elemDesc & " " & elemTitle)
+  set haystack to my toLower(joined)
+  set roleHay to my toLower(elemRole)
+  set nameHit to (target is "" or haystack contains target)
+  set roleHit to (role is "" or roleHay contains role)
+  if nameHit and roleHit then
+    set count to count + 1
+    if count = ${idx} then
+      try
+        set p to position of elem
+        set s to size of elem
+        return "{\\\"name\\\":\\\"" & elemName & "\\\",\\\"controlType\\\":\\\"" & elemRole & "\\\",\\\"rect\\\":{\\\"x\\\":" & item 1 of p & ",\\\"y\\\":" & item 2 of p & ",\\\"width\\\":" & item 1 of s & ",\\\"height\\\":" & item 2 of s & "}}"
+      on error
+        return "{\\\"error\\\":\\\"matched element has no position/size.\\\"}"
+      end try
+    end if
+  end if
+  try
+    set kids to UI elements of elem
+  on error
+    return ""
+  end try
+  repeat with k in kids
+    set out to my findInElem(k, target, role, count)
+    if out is not "" then return out
+    set count to count + (my elementMatchCount(k, target, role))
+  end repeat
+  return ""
+end findInElem
+
+on toLower(s)
+  set chars to {"A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z"}
+  set lowers to {"a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z"}
+  set out to ""
+  repeat with ch in s
+    set found to false
+    repeat with i from 1 to length of chars
+      if (ch as string) is item i of chars then
+        set out to out & item i of lowers
+        set found to true
+        exit repeat
+      end if
+    end repeat
+    if not found then set out to out & (ch as string)
+  end repeat
+  return out
+end toLower
+
+on elementMatchCount(elem, target, role)
+  return 0
+end elementMatchCount
+
+set targetName to "${name}"
+set targetRole to "${role}"
+set winNeedle to "${winTitle}"
+tell application "System Events"
+  set frontProc to first process whose frontmost is true
+  if winNeedle is "" then
+    set candidates to {window 1 of frontProc}
+  else
+    set candidates to (every window of frontProc whose name contains winNeedle)
+  end if
+  repeat with w in candidates
+    set out to my findInElem(w, my toLower(targetName), my toLower(targetRole), 0)
+    if out is not "" then return out
+  end repeat
+end tell
+return "{\\\"error\\\":\\\"No matching AX element found.\\\"}"
+`;
+    const r = await execFile("osascript", ["-e", script], { timeoutMs: 15000, signal });
+    if (r.code !== 0) {
+      throw new DesktopError(
+        "macOS AX query failed. The terminal running Pi needs Accessibility permission " +
+        "(System Settings → Privacy & Security → Accessibility).",
+        { stderr: r.stderr.slice(0, 400) },
+      );
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(r.stdout.trim());
+    } catch {
+      throw new DesktopError(`AX helper returned non-JSON: ${r.stdout.slice(0, 200)}`);
+    }
+    if ("error" in parsed) throw new DesktopError(String(parsed.error));
+    return parsed as unknown as ElementInfo;
+  }
+
+  async getMarks(signal?: AbortSignal): Promise<Mark[]> {
+    const { windows } = await this.listWindows(signal);
+    return marksFromWindows(windows);
+  }
 
   async status(signal?: AbortSignal): Promise<Record<string, unknown>> {
     const commands = await Promise.all(["screencapture", "osascript", "open"].map(async (cmd) => {

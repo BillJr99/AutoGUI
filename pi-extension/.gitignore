@@ -1,4 +1,10 @@
 node_modules/
 runtime/
+frames/
+screenshots/
+traces/
+failures/
+skills/
 .agents/
 .codex/
+config.json

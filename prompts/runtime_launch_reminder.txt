@@ -1,1 +1,1 @@
-REQUIRED NEXT STEP: call desktop_click inside the new window to give it keyboard focus BEFORE desktop_type. Use x=window.x+window.width//2, y=window.y+80 from the bounding box above to land in the client area.
+REQUIRED NEXT STEP: focus the new window before typing. Use desktop_focus_window (pass the window title or app name) or desktop_click at x=window.x+window.width//2, y=window.y+80 to land in the client area. Then call desktop_type. DO NOT stop here — the task is not complete until all steps (including any typing or further interaction) are done.

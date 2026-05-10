@@ -16,10 +16,11 @@ desktop tool functions in the registry then delegate to backend methods.
 New LLM tools (platform-dependent)
 -----------------------------------
   desktop_find_element   — find a UI element by accessibility properties.
-                           Supported: Windows (uiautomation), macOS (osascript),
-                           WSL (PowerShell UIAutomation).
+                           Supported: Windows (uiautomation), Linux X11 +
+                           Wayland (AT-SPI via pyatspi), WSL (PowerShell
+                           UIAutomation).
   desktop_get_window_tree — dump the accessibility tree for a window.
-                           Supported: Windows, macOS.
+                           Supported: Windows.
 
 These tools are registered only when the active backend reports support for
 them via capabilities()["find_element"] / capabilities()["get_window_tree"].
@@ -201,15 +202,41 @@ async def fs_read(path: str, max_bytes: int = 65536) -> dict:
         return {"error": str(e)}
 
 
-async def fs_write(path: str, content: str, mode: str = "w") -> dict:
+async def fs_write(
+    path: str,
+    content: str,
+    mode: str = "w",
+    snapshot_dir: str = "",
+) -> dict:
+    """
+    Write content to a file. When overwriting an existing file and
+    snapshot_dir is non-empty, copy the original aside first so the
+    write is recoverable.
+    """
     path = _coerce_path(path)
     content = content if isinstance(content, str) else str(content)
     try:
         p = Path(path).expanduser()
+        snapshot_path: str | None = None
+        if mode == "w" and snapshot_dir and p.exists() and p.is_file():
+            try:
+                import shutil
+                snap_dir = Path(snapshot_dir).expanduser()
+                snap_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(p))
+                snap = snap_dir / f"{ts}__{slug.strip('_')[:120]}"
+                shutil.copy2(p, snap)
+                snapshot_path = str(snap)
+            except Exception as e:
+                logger.warning("[fs_write] Snapshot failed for %s: %s", p, e)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open(mode, encoding="utf-8") as f:
             f.write(content)
-        return {"success": True, "path": str(p), "bytes_written": len(content.encode())}
+        result = {"success": True, "path": str(p), "bytes_written": len(content.encode())}
+        if snapshot_path:
+            result["snapshot"] = snapshot_path
+        return result
     except Exception as e:
         print(f"[tools.py:fs_write] {e}")
         traceback.print_exc()
@@ -257,6 +284,7 @@ class ToolRegistry:
         self._cfg = cfg
         self._tools_cfg = cfg.get("tools", {})
         self._agent_cfg = cfg.get("agent", {})
+        self._safety_cfg = cfg.get("safety", {})
         self._dispatch: dict[str, Callable] = {}
         self._schemas: list[dict] = []
 
@@ -271,9 +299,35 @@ class ToolRegistry:
                 self._backend = get_backend(self._platform_info)
                 self._backend_caps = self._backend.capabilities()
                 logger.info("[tools.py] Backend capabilities: %s", self._backend_caps)
+                cache_ttl = self._tools_cfg.get("perception_cache_ttl_seconds", 0.5)
+                self._backend.configure_cache(cache_ttl)
             except Exception as e:
                 print(f"[tools.py:ToolRegistry.__init__] Backend init failed: {e}")
                 traceback.print_exc()
+
+        # Browser backend wiring.  Dependencies (Playwright + Chromium)
+        # are NOT installed by the registry — that's the job of
+        # `scripts/install-dependencies.*`, run either by hand or
+        # automatically via the top-level `install_dependencies` config
+        # flag in build_components.  If browser tools are enabled but
+        # the deps are missing, the BrowserBackend simply returns a
+        # helpful "please install" error on first call.
+        self._browser_backend = None
+        if self._tools_cfg.get("allowed_browser", False):
+            try:
+                from browser_backend import BrowserBackend
+                browser_cfg = cfg.get("browser", {}) or {}
+                self._browser_backend = BrowserBackend(
+                    headless=bool(browser_cfg.get("headless", False)),
+                    screenshot_dir=browser_cfg.get(
+                        "screenshot_dir", "screenshots/browser"
+                    ),
+                    user_data_dir=browser_cfg.get("user_data_dir") or None,
+                    viewport=browser_cfg.get("viewport") or None,
+                )
+            except Exception as e:
+                logger.warning("[tools.py] BrowserBackend init failed: %s", e)
+                self._browser_backend = None
 
         self._build()
 
@@ -281,10 +335,19 @@ class ToolRegistry:
         self._schemas.append(schema)
         self._dispatch[schema["function"]["name"]] = fn
 
+    def add_tool(self, schema: dict, fn: Callable):
+        """
+        Public hook so callers (e.g. the agent) can extend the catalog
+        after construction.  Used to inject skill_save / skill_list /
+        skill_run since those need access to the agent's session state.
+        """
+        self._register(schema, fn)
+
     def _build(self):
         shell_ok = self._tools_cfg.get("allowed_shell", True)
         fs_ok = self._tools_cfg.get("allowed_filesystem", True)
         desk_ok = self._tools_cfg.get("allowed_desktop", True) and self._backend is not None
+        browser_ok = self._tools_cfg.get("allowed_browser", False)
         confirm = self._agent_cfg.get("confirm_destructive", True)
         shell_timeout = self._tools_cfg.get("shell_timeout_seconds", 30)
         save_dir = self._tools_cfg.get("screenshot_dir", "screenshots")
@@ -329,6 +392,9 @@ class ToolRegistry:
                 }},
                 fs_read,
             )
+            snapshot_dir = self._safety_cfg.get(
+                "fs_write_snapshot_dir", ""
+            )  # empty string = snapshots disabled
             self._register(
                 {"type": "function", "function": {
                     "name": "fs_write",
@@ -339,7 +405,9 @@ class ToolRegistry:
                         "mode": {"type": "string", "enum": ["w", "a"]},
                     }, "required": ["path", "content"]},
                 }},
-                fs_write,
+                lambda path, content, mode="w": fs_write(
+                    path, content, mode=mode, snapshot_dir=snapshot_dir,
+                ),
             )
             self._register(
                 {"type": "function", "function": {
@@ -362,7 +430,10 @@ class ToolRegistry:
                     "name": "desktop_screenshot",
                     "description": (
                         "Capture a screenshot of the screen or a region. "
-                        "Returns base64-encoded PNG. Use before clicking to verify screen state."
+                        "Returns base64-encoded PNG. Use before clicking to verify screen state. "
+                        "Tip: when you need to click a labelled UI element, prefer "
+                        "desktop_screenshot_marked + desktop_click_mark instead — much more "
+                        "reliable than guessing pixel coordinates."
                     ),
                     "parameters": {"type": "object", "properties": {
                         "region": {"type": "object", "description": "Optional {x,y,width,height}",
@@ -371,6 +442,71 @@ class ToolRegistry:
                     }},
                 }},
                 lambda region=None: b.screenshot(region=region, save_dir=save_dir, resize_width=resize_w),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_screenshot_marked",
+                    "description": (
+                        "Capture a screenshot with numbered Set-of-Mark boxes drawn over "
+                        "detected UI elements (top-level windows, plus accessibility-tree "
+                        "controls when available). Use this BEFORE attempting to click any "
+                        "named element — then call desktop_click_mark(mark_id) using one of "
+                        "the ids returned in the 'marks' list. Far more reliable than "
+                        "guessing pixel coordinates from a plain screenshot."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                }},
+                lambda: b.screenshot_marked(save_dir=save_dir, resize_width=resize_w),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_click_mark",
+                    "description": (
+                        "Click the centre of a previously-marked UI element by its mark id. "
+                        "Requires a recent desktop_screenshot_marked call. "
+                        "If the screen has changed materially since then, refresh the marks "
+                        "first or the id may resolve to the wrong location."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "mark_id": {"type": "integer",
+                                    "description": "Numeric id from the marks list."},
+                    }, "required": ["mark_id"]},
+                }},
+                lambda mark_id: b.click_mark(int(mark_id)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_click_text",
+                    "description": (
+                        "Find a visible text label on screen and click its centre. "
+                        "On Windows/macOS this consults the accessibility tree first; "
+                        "as a fallback (or on Linux) it uses OCR via pytesseract if "
+                        "installed. Prefer this over pixel-coordinate clicks for any "
+                        "text-labelled button or link."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "text": {"type": "string",
+                                 "description": "The visible label to click (case-insensitive)."},
+                        "occurrence": {"type": "integer",
+                                       "description": "0-based index when multiple matches (default 0)."},
+                    }, "required": ["text"]},
+                }},
+                lambda text, occurrence=0: b.click_text(str(text), int(occurrence) if occurrence else 0),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "desktop_find_text",
+                    "description": (
+                        "Locate visible text on screen and return its bounding rect "
+                        "without clicking. Useful for verifying that something is "
+                        "displayed, or for computing a click position relative to a label."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "text": {"type": "string"},
+                        "occurrence": {"type": "integer"},
+                    }, "required": ["text"]},
+                }},
+                lambda text, occurrence=0: b.find_text_on_screen(str(text), int(occurrence) if occurrence else 0),
             )
             self._register(
                 {"type": "function", "function": {
@@ -588,7 +724,7 @@ class ToolRegistry:
                             "Find a UI element by its accessibility properties (name, type). "
                             "Returns the element's name, control type, and screen rect. "
                             "Use this to locate buttons/fields by name without knowing pixel positions. "
-                            "Supported on Windows (UIAutomation), macOS (osascript), and WSL."
+                            "Supported on Windows (UIAutomation), Linux (AT-SPI), and WSL."
                         ),
                         "parameters": {"type": "object", "properties": {
                             "name": {"type": "string", "description": "Element name or label (partial match)."},
@@ -601,6 +737,41 @@ class ToolRegistry:
                     lambda name=None, control_type=None, window_title=None, index=0:
                         b.find_element(name=name, control_type=control_type,
                                        window_title=window_title, index=index),
+                )
+                self._register(
+                    {"type": "function", "function": {
+                        "name": "desktop_click_element",
+                        "description": (
+                            "Find a UI element via the OS accessibility API and click it. "
+                            "PREFER THIS over desktop_click whenever the target has a "
+                            "visible name/label — it talks to the actual control instead "
+                            "of guessing pixel positions, so it survives DPI scaling, "
+                            "window moves, and UI redraws. Fall back to desktop_click_text "
+                            "or desktop_click_mark only when no a11y handle is exposed."
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "name": {"type": "string",
+                                     "description": "Element name or label (partial match)."},
+                            "control_type": {"type": "string",
+                                             "description": "Control type filter, e.g. 'ButtonControl' on Windows or 'push button' on Linux AT-SPI."},
+                            "window_title": {"type": "string",
+                                             "description": "Restrict to this window's subtree."},
+                            "index": {"type": "integer",
+                                      "description": "0-based index when multiple match."},
+                            "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                            "clicks": {"type": "integer",
+                                       "description": "1=single, 2=double."},
+                        }, "required": ["name"]},
+                    }},
+                    lambda name, control_type=None, window_title=None, index=0,
+                           button="left", clicks=1: b.click_element(
+                        name=str(name),
+                        control_type=str(control_type) if control_type else None,
+                        window_title=str(window_title) if window_title else None,
+                        index=int(index) if index else 0,
+                        button=str(button) if button else "left",
+                        clicks=int(clicks) if clicks else 1,
+                    ),
                 )
 
             # ── Extended: get_window_tree ─────────────────────────────
@@ -621,6 +792,147 @@ class ToolRegistry:
                     }},
                     lambda window_title=None, depth=3: b.get_window_tree(window_title=window_title, depth=depth),
                 )
+
+        # ── Browser tools (Phase 9) ───────────────────────────────────
+        # Independent of desk_ok: a config can enable browser tools while
+        # disabling desktop tools, useful for headless CI-style usage.
+        if browser_ok and self._browser_backend is not None:
+            bb_ = self._browser_backend
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_navigate",
+                    "description": (
+                        "Open a URL in the dedicated Playwright-driven Chromium "
+                        "browser. Prefer the browser_* tool family for any task "
+                        "that lives on a web page — it's far more reliable than "
+                        "driving a regular browser via desktop_click coordinates."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "url": {"type": "string"},
+                    }, "required": ["url"]},
+                }},
+                lambda url: bb_.navigate(str(url)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_back",
+                    "description": "Go back one history entry in the browser.",
+                    "parameters": {"type": "object", "properties": {}},
+                }},
+                lambda: bb_.back(),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_forward",
+                    "description": "Go forward one history entry in the browser.",
+                    "parameters": {"type": "object", "properties": {}},
+                }},
+                lambda: bb_.forward(),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_reload",
+                    "description": "Reload the current page.",
+                    "parameters": {"type": "object", "properties": {}},
+                }},
+                lambda: bb_.reload(),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_click",
+                    "description": (
+                        "Click an element matching a Playwright selector. "
+                        "Selectors: CSS ('button.primary'), text ('text=Sign in'), "
+                        "ARIA role ('role=button[name=\"Sign in\"]'), or xpath "
+                        "('xpath=//button[contains(.,\"Sign in\")]')."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "selector": {"type": "string"},
+                    }, "required": ["selector"]},
+                }},
+                lambda selector: bb_.click(str(selector)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_fill",
+                    "description": (
+                        "Fill an input/textarea identified by a Playwright "
+                        "selector with the given value. Replaces existing content."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "selector": {"type": "string"},
+                        "value": {"type": "string"},
+                    }, "required": ["selector", "value"]},
+                }},
+                lambda selector, value: bb_.fill(str(selector), str(value)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_press",
+                    "description": (
+                        "Press a key inside an element (selector required) or in "
+                        "the page focus (selector empty). Examples: 'Enter', "
+                        "'Tab', 'Control+a', 'PageDown'."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "selector": {"type": "string"},
+                        "key": {"type": "string"},
+                    }, "required": ["key"]},
+                }},
+                lambda key, selector="": bb_.press(str(selector or ""), str(key)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_get_text",
+                    "description": (
+                        "Return the visible text of an element (selector) or of "
+                        "the whole page body (no selector). Truncated to "
+                        "max_chars."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "selector": {"type": "string"},
+                        "max_chars": {"type": "integer"},
+                    }},
+                }},
+                lambda selector="", max_chars=50000: bb_.get_text(
+                    str(selector or ""), int(max_chars) if max_chars else 50000
+                ),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_screenshot",
+                    "description": (
+                        "Capture a PNG of the current browser page. "
+                        "full_page=true captures the entire scrolled-out page."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "full_page": {"type": "boolean"},
+                    }},
+                }},
+                lambda full_page=False: bb_.screenshot(bool(full_page)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_eval",
+                    "description": (
+                        "Evaluate a JavaScript expression in the page context "
+                        "and return its value. Useful for reading window state, "
+                        "extracting structured data, or driving rich web apps."
+                    ),
+                    "parameters": {"type": "object", "properties": {
+                        "expression": {"type": "string"},
+                    }, "required": ["expression"]},
+                }},
+                lambda expression: bb_.eval_js(str(expression)),
+            )
+            self._register(
+                {"type": "function", "function": {
+                    "name": "browser_close",
+                    "description": "Shut down the browser instance and free resources.",
+                    "parameters": {"type": "object", "properties": {}},
+                }},
+                lambda: bb_.close(),
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -667,9 +979,104 @@ class ToolRegistry:
         },
         "fs_read": {"file": "path", "filename": "path", "filepath": "path"},
         "fs_write": {"file": "path", "filename": "path", "filepath": "path",
-                     "content": "text", "data": "text"},
+                     "text": "content", "data": "content"},
         "fs_list": {"dir": "path", "directory": "path", "folder": "path"},
     }
+
+    # Tools that mutate desktop / system state — perception cache must be
+    # flushed after them, and they're the ones that dry-run / scoping gate.
+    _STATE_CHANGING_TOOLS = frozenset({
+        "desktop_click", "desktop_click_mark", "desktop_click_text",
+        "desktop_type", "desktop_hotkey", "desktop_scroll",
+        "desktop_launch", "desktop_activate_window", "desktop_mouse_move",
+        "shell_run", "fs_write", "skill_run",
+    })
+
+    # Tools that affect the GUI specifically — used by action scoping to
+    # decide whether the active window should be checked against the
+    # allow / block lists.
+    _GUI_ACTION_TOOLS = frozenset({
+        "desktop_click", "desktop_click_mark", "desktop_click_text",
+        "desktop_type", "desktop_hotkey", "desktop_scroll",
+        "desktop_mouse_move",
+    })
+
+    async def _check_action_scope(
+        self,
+        tool_name: str,
+        arguments: dict,
+    ) -> dict | None:
+        """
+        Apply the safety.allowed_apps / safety.blocked_window_titles policy.
+        Returns a dict (passed back as the tool result) when the action is
+        blocked, or None when it should proceed.
+
+        Both lists default to empty (no enforcement).
+        """
+        allowed = [a.lower() for a in self._safety_cfg.get("allowed_apps") or []]
+        blocked_titles = self._safety_cfg.get("blocked_window_titles") or []
+
+        if not allowed and not blocked_titles:
+            return None
+
+        # desktop_launch: gate on the application argument itself.
+        if tool_name == "desktop_launch":
+            if not allowed:
+                return None
+            app = str(arguments.get("application", "")).lower()
+            stem = app.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].rsplit(".", 1)[0]
+            for entry in allowed:
+                if entry in app or entry in stem:
+                    return None
+            return {
+                "error": (
+                    f"Action scope: application {app!r} is not in safety.allowed_apps "
+                    f"{allowed!r}. Update config or pick a permitted app."
+                )
+            }
+
+        if tool_name not in self._GUI_ACTION_TOOLS:
+            return None
+
+        # GUI action: consult the active window via the backend, if it has
+        # a get_active_window capability.  Without that capability we can't
+        # enforce, so let the action through — better than silent blocking.
+        if self._backend is None or not self._backend_caps.get("get_active_window"):
+            return None
+        try:
+            info = await self._backend.get_active_window()
+        except Exception as e:
+            logger.debug("[scope] get_active_window failed: %s", e)
+            return None
+        if not isinstance(info, dict) or not info.get("found"):
+            return None
+        win = info.get("window") or info
+        title = str(win.get("title", "") or "").lower()
+        app = str(win.get("app", "") or "").lower()
+
+        for pat in blocked_titles:
+            try:
+                if re.search(pat, title, re.IGNORECASE):
+                    return {
+                        "error": (
+                            f"Action scope: active window title {title!r} matches "
+                            f"safety.blocked_window_titles pattern {pat!r}."
+                        )
+                    }
+            except re.error:
+                continue
+
+        if allowed:
+            for entry in allowed:
+                if entry in app or entry in title:
+                    return None
+            return {
+                "error": (
+                    f"Action scope: active window app={app!r} title={title!r} "
+                    f"is not in safety.allowed_apps {allowed!r}."
+                )
+            }
+        return None
 
     async def dispatch(self, tool_name: str, arguments: dict) -> str:
         fn = self._dispatch.get(tool_name)
@@ -681,9 +1088,30 @@ class ToolRegistry:
         if aliases:
             arguments = {aliases.get(k, k): v for k, v in arguments.items()}
 
+        # Dry-run: short-circuit any state-changing tool with a synthetic
+        # result.  Read-only tools still execute so the model can reason
+        # over real screen / filesystem state.
+        if (
+            self._safety_cfg.get("dry_run", False)
+            and tool_name in self._STATE_CHANGING_TOOLS
+        ):
+            return json.dumps({
+                "dry_run": True,
+                "would_execute": {"tool": tool_name, "args": arguments},
+                "note": "safety.dry_run is on — no real action was taken.",
+            })
+
+        # Action scoping: refuse if the request falls outside the allow list
+        # or hits the block list.
+        block = await self._check_action_scope(tool_name, arguments)
+        if block is not None:
+            return json.dumps(block)
+
         try:
             logger.info("[tools.py:dispatch] %s(%s)", tool_name, list(arguments.keys()))
             result = await fn(**arguments)
+            if tool_name in self._STATE_CHANGING_TOOLS and self._backend is not None:
+                self._backend.invalidate_cache()
             return json.dumps(result, default=str)
         except TypeError as e:
             # Print argument types to help diagnose "not str/PathLike" errors
