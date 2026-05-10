@@ -51,10 +51,18 @@ async def wait_for(
     }
     targets = {k: v for k, v in targets.items() if v}
     if not targets:
+        # Return the same shape callers see on a normal timeout so any
+        # consumer that branches on found / target / elapsed doesn't
+        # KeyError on this error path.
         return {
             "error": "wait_for requires at least one of "
                      "window_title, element_name, text, window_id.",
             "found": False,
+            "target": None,
+            "elapsed": 0.0,
+            "timeout": float(timeout) if timeout else 0.0,
+            "targets": targets,
+            "last_observation": {},
         }
 
     # Normalize timeout once so the loop-exit comparison and the sleep

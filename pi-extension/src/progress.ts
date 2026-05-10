@@ -125,9 +125,18 @@ export class ProgressStore {
     rec.status = status;
     rec.updated = Date.now() / 1000;
     await this.atomicWrite(this.pathFor(rec.taskId), rec);
+    // Match openTask()'s index-line shape (and the Python mirror) — the
+    // index is the canonical "list of every task ever seen", so dropping
+    // user_input here would make the schema inconsistent for any
+    // consumer that relies on it for resume / listing.
     await appendFile(
       this.indexPath,
-      JSON.stringify({ task_id: rec.taskId, updated: rec.updated, status }) + "\n",
+      JSON.stringify({
+        task_id: rec.taskId,
+        user_input: rec.userInput.slice(0, 160),
+        updated: rec.updated,
+        status,
+      }) + "\n",
       "utf8",
     );
   }

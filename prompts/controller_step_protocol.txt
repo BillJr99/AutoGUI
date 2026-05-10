@@ -3,7 +3,7 @@ You are running inside a step-scoped executor.  The controller will give you
 ONE plan step at a time.  For each step:
 
 1.  Inspect current state with read-only tools (desktop_list_windows,
-    desktop_active_window, desktop_screenshot, browser_get_text, fs_read,
+    desktop_get_active_window, desktop_screenshot, browser_get_text, fs_read,
     list_artifacts) before you act.  When the same observation has already
     been captured, prefer get_artifact over re-fetching.
 
