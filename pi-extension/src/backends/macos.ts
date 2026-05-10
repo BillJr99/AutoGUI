@@ -22,10 +22,11 @@ export class MacBackend implements DesktopBackend {
     // Walk frontmost process's UI element tree.  System Events exposes
     // descriptions/names/roles plus position+size we can use as a rect.
     const script = `
--- Collect every matching element into |results| (a list passed by reference).
--- AppleScript lists are reference types, so mutations inside the handler are
--- visible to the caller — this avoids the by-value counter bug.
-on collectMatches(elem, target, role, results)
+-- Collect matching elements into |results| (a list, passed by reference so
+-- mutations are visible to the caller).  matchIdx is passed in so the
+-- recursion can short-circuit as soon as enough matches are found — no need
+-- to walk the entire tree when we only want the Nth hit.
+on collectMatches(elem, target, role, results, matchIdx)
   try
     set elemRole to (role of elem) as string
   on error
@@ -55,18 +56,25 @@ on collectMatches(elem, target, role, results)
     try
       set p to position of elem
       set s to size of elem
-      set end of results to "{\\\"name\\\":\\\"" & elemName & "\\\",\\\"controlType\\\":\\\"" & elemRole & "\\\",\\\"rect\\\":{\\\"x\\\":" & item 1 of p & ",\\\"y\\\":" & item 2 of p & ",\\\"width\\\":" & item 1 of s & ",\\\"height\\\":" & item 2 of s & "}}"
+      -- JSON-escape name and controlType so embedded quotes/backslashes
+      -- don't produce invalid JSON (e.g. a button named OK "Cancel").
+      set safeName to my jsonEscape(elemName)
+      set safeRole to my jsonEscape(elemRole)
+      set end of results to "{\\\"name\\\":\\\"" & safeName & "\\\",\\\"controlType\\\":\\\"" & safeRole & "\\\",\\\"rect\\\":{\\\"x\\\":" & item 1 of p & ",\\\"y\\\":" & item 2 of p & ",\\\"width\\\":" & item 1 of s & ",\\\"height\\\":" & item 2 of s & "}}"
     on error
       -- Element matched but has no geometry; skip it.
     end try
   end if
+  -- Short-circuit: stop descending once we have enough matches.
+  if (count of results) >= matchIdx then return
   try
     set kids to UI elements of elem
   on error
     return
   end try
   repeat with k in kids
-    my collectMatches(k, target, role, results)
+    my collectMatches(k, target, role, results, matchIdx)
+    if (count of results) >= matchIdx then exit repeat
   end repeat
 end collectMatches
 
@@ -88,6 +96,25 @@ on toLower(s)
   return out
 end toLower
 
+-- Escape " and \\ so the concatenated JSON string is always valid.
+-- AppleScript has no string escape sequences; use ASCII character codes instead.
+on jsonEscape(s)
+  set bslash to (ASCII character 92)
+  set dquote to (ASCII character 34)
+  set out to ""
+  repeat with ch in characters of s
+    set c to ch as string
+    if c is bslash then
+      set out to out & bslash & bslash
+    else if c is dquote then
+      set out to out & bslash & dquote
+    else
+      set out to out & c
+    end if
+  end repeat
+  return out
+end jsonEscape
+
 set targetName to "${name}"
 set targetRole to "${role}"
 set winNeedle to "${winTitle}"
@@ -101,7 +128,8 @@ tell application "System Events"
     set candidates to (every window of frontProc whose name contains winNeedle)
   end if
   repeat with w in candidates
-    my collectMatches(w, my toLower(targetName), my toLower(targetRole), results)
+    my collectMatches(w, my toLower(targetName), my toLower(targetRole), results, matchIdx)
+    if (count of results) >= matchIdx then exit repeat
   end repeat
 end tell
 if (count of results) >= matchIdx then
