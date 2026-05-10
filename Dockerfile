@@ -47,16 +47,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash curl git \
     # pyautogui / Pillow
     python3-tk python3-dev libx11-dev \
-    # X11 desktop automation
-    xdotool wmctrl scrot x11-utils \
+    # X11 desktop automation (xclip required by get_window_text on X11)
+    xdotool wmctrl scrot x11-utils xclip \
     # OCR — desktop_click_text / desktop_find_text
     tesseract-ocr \
     # ImageMagick — Set-of-Mark overlay + failure GIF recording
     imagemagick \
     # AT-SPI — desktop_click_element on Linux
     python3-pyatspi gir1.2-atspi-2.0 \
-    # Node.js — pi-extension (optional)
-    nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Node.js 20.x ──────────────────────────────────────────────────────────
+# Debian bookworm ships Node 18; @earendil-works/pi-coding-agent requires
+# >=20.6.  Use NodeSource to pin 20.x explicitly.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # The install script uses `sudo apt-get …`; inside Docker we run as root
@@ -76,6 +81,11 @@ COPY . .
 # Playwright installs its Chromium binary to /root/.cache/ms-playwright —
 # outside /app, so it survives volume mounts.
 RUN bash scripts/install-dependencies.sh
+
+# Install Playwright's required OS-level shared libraries for Chromium.
+# The install script downloads the browser binary but not the system libs;
+# playwright install-deps adds them so the browser can actually launch.
+RUN python -m playwright install-deps chromium
 
 # ── Pi Coding Agent ───────────────────────────────────────────────────────
 # Install the Pi Coding Agent CLI globally so `pi` is available on PATH.
