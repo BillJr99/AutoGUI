@@ -1035,7 +1035,16 @@ class Agent:
                     yield AgentEvent(
                         kind="done",
                         content="Controller aborted (preflight)",
-                        data={"plan": plan.to_dict(), "status": "preflight_failed"},
+                        data={
+                            "plan": plan.to_dict(),
+                            "status": "preflight_failed",
+                            # Surface a real iteration count even on early
+                            # exits so the TUI's "done (?, ? iterations)"
+                            # render shows 0 instead of "?", which made it
+                            # look like the controller never ran at all.
+                            "iterations": 0,
+                            "finish_reason": "preflight_failed",
+                        },
                     )
                     return
 
@@ -1071,7 +1080,12 @@ class Agent:
                 yield AgentEvent(
                     kind="done",
                     content="Controller stopped (budget)",
-                    data={"plan": plan.to_dict(), "status": "budget_exceeded"},
+                    data={
+                        "plan": plan.to_dict(),
+                        "status": "budget_exceeded",
+                        "iterations": global_iter,
+                        "finish_reason": "budget_exceeded",
+                    },
                 )
                 return
 
@@ -1168,7 +1182,12 @@ class Agent:
                     yield AgentEvent(
                         kind="done",
                         content="Controller stopped (budget)",
-                        data={"plan": plan.to_dict(), "status": "budget_exceeded"},
+                        data={
+                            "plan": plan.to_dict(),
+                            "status": "budget_exceeded",
+                            "iterations": global_iter,
+                            "finish_reason": "budget_exceeded",
+                        },
                     )
                     return
                 continue
@@ -1276,6 +1295,7 @@ class Agent:
                 "plan": plan.to_dict(),
                 "iterations": global_iter,
                 "status": final_status,
+                "finish_reason": final_status,
             },
         )
 

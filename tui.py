@@ -527,6 +527,82 @@ class AgentTUI(App):
                     self._log_session(f"PLAN: {event.content}")
                     continue
 
+                # ---- Controller-specific events ------------------------
+                # Without these handlers the controller path appears to
+                # do nothing after the plan is shown — the step loop is
+                # actually running but its events drop into the void
+                # because the if/elif chain below only knew about the
+                # legacy executor's events.  Each branch logs to the
+                # session file too so the trace stays informative.
+                if event.kind == "preflight":
+                    failures = event.data.get("results") or []
+                    if not event.data.get("all_passed", True):
+                        log.write(f"[bold red]  ✗ PREFLIGHT FAILED:[/bold red] {event.content}")
+                        for r in failures:
+                            if not r.get("ok"):
+                                check = r.get("check") or {}
+                                log.write(
+                                    f"[red]      - {check.get('kind','?')}={check.get('target','?')}: "
+                                    f"{r.get('detail','')}[/red]"
+                                )
+                    else:
+                        log.write(f"[dim green]  ✓ Preflight: {event.content}[/dim green]")
+                    self._log_session(f"PREFLIGHT: {event.content}")
+                    continue
+
+                if event.kind == "plan_critique":
+                    log.write(f"[yellow]  ⚠ Critique: {event.content}[/yellow]")
+                    self._log_session(f"CRITIQUE: {event.content}")
+                    continue
+
+                if event.kind == "plan_revised":
+                    log.write(f"\n[bold cyan]Plan revised:[/bold cyan]\n[cyan]{event.content}[/cyan]")
+                    self._log_session(f"PLAN_REVISED: {event.content}")
+                    continue
+
+                if event.kind == "step_start":
+                    step_id = (event.data.get("step") or {}).get("id", "?")
+                    self._update_status(f"Running step {step_id}…")
+                    log.write(f"\n[bold magenta]{event.content}[/bold magenta]")
+                    self._log_session(f"STEP_START: {event.content}")
+                    continue
+
+                if event.kind == "step_done":
+                    log.write(f"[green]  ✓ {event.content}[/green]")
+                    self._log_session(f"STEP_DONE: {event.content}")
+                    continue
+
+                if event.kind == "predicate":
+                    ok = event.data.get("ok", True)
+                    colour = "dim green" if ok else "yellow"
+                    icon = "✓" if ok else "✗"
+                    log.write(f"[{colour}]  {icon} predicate: {event.content}[/{colour}]")
+                    self._log_session(f"PREDICATE: {event.content}")
+                    continue
+
+                if event.kind == "step_failure":
+                    log.write(f"[yellow]  ✗ {event.content}[/yellow]")
+                    self._log_session(f"STEP_FAIL: {event.content}")
+                    continue
+
+                if event.kind == "step_escalate":
+                    log.write(f"[bold red]  ⚠ Step escalated to user: {event.content}[/bold red]")
+                    self._log_session(f"STEP_ESCALATE: {event.content}")
+                    continue
+
+                if event.kind == "budget_exceeded":
+                    log.write(f"[bold red]  ⚠ Budget exceeded: {event.content}[/bold red]")
+                    self._log_session(f"BUDGET_EXCEEDED: {event.content}")
+                    continue
+
+                if event.kind == "failure_recording" or event.kind == "state_diff":
+                    # Diagnostic-level; only show when the user has tools
+                    # turned on, mirroring tool_call / tool_result.
+                    if self.show_tools:
+                        log.write(f"[dim]  • {event.kind}: {event.content}[/dim]")
+                    self._log_session(f"{event.kind.upper()}: {event.content}")
+                    continue
+
                 iteration = event.data.get("iteration", "?")
                 self._update_status(f"Running… iteration {iteration}")
 
