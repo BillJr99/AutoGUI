@@ -236,7 +236,11 @@ export async function checkPredicate(
         }
         cmd = `tasklist /FI "IMAGENAME eq ${needle}*"`;
       } else {
-        cmd = `pgrep -lf ${shellQuote(needle)}`;
+        // `--` defangs a needle that starts with `-` so pgrep treats it
+        // as a pattern instead of an unknown option.  shellQuote still
+        // handles the value's metacharacters.  Mirrors the Python
+        // predicates._check_process fix.
+        cmd = `pgrep -lf -- ${shellQuote(needle)}`;
       }
       try {
         const r = await helpers.runShell(cmd);

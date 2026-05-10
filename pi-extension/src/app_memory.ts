@@ -136,7 +136,16 @@ export class AppMemory {
     // level, but a misuse never accidentally writes a memory file when
     // allowWrites is false.
     if (!this.allowWrites) return;
-    await this.ensureDir();
+    // ensureDir() is part of the best-effort write path: a read-only
+    // FS / ENOSPC / permission error here must NOT reject the
+    // recordFailure/recordSuccess/addNote caller, since those callers
+    // surface as tool errors otherwise.  Mirrors the Python mirror's
+    // best-effort contract.
+    try {
+      await this.ensureDir();
+    } catch {
+      return;
+    }
     const p = this.pathFor(rec.app);
     const tmp = p + ".tmp";
     try {

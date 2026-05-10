@@ -43,10 +43,20 @@ export class ArtifactStore {
     this.indexPath = join(directory, "index.jsonl");
   }
 
-  /** Lazy load + ensure dir exists. */
+  /** Lazy load + ensure dir exists.  Best-effort everywhere — if the
+   *  runtime directory is read-only / permission-denied / ENOSPC, the
+   *  store degrades to an in-memory-only capture log so a failed mkdir
+   *  here never breaks the surrounding tool call.  We still mark
+   *  `loaded=true` afterwards so we don't retry the failing mkdir on
+   *  every put(). */
   private async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
-    await mkdir(this.dir, { recursive: true });
+    try {
+      await mkdir(this.dir, { recursive: true });
+    } catch {
+      // proceed in-memory; subsequent writes also catch their own
+      // failures and degrade to inline preview only.
+    }
     if (existsSync(this.indexPath)) {
       try {
         const text = await readFile(this.indexPath, "utf8");
