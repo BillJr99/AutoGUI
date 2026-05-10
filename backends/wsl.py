@@ -232,10 +232,22 @@ class WSLBackend(DesktopBackend):
             #   - NO try/catch wrapper.  PowerShell's default behaviour
             #     prints a real exception to stderr; our _decode_clixml
             #     helper cleans up the CLIXML envelope downstream.
+            # System.Drawing.Bitmap's 2-arg constructor (width, height)
+            # picks a default pixel format that's incompatible with
+            # CopyFromScreen on some multi-monitor / WSL-interop setups
+            # — the user hits "New-Object : Exception calling .ctor with
+            # 2 argument(s): Parameter is not valid".  Passing an
+            # explicit Format32bppArgb (3-arg constructor) makes the
+            # bitmap-creation deterministic across machines.  Same fix
+            # applies to both region and full-screen capture.
+            pixfmt_setup = (
+                "$pixfmt = [System.Drawing.Imaging.PixelFormat]::Format32bppArgb\n"
+            )
             if region:
                 script = (
                     "Add-Type -AssemblyName System.Drawing\n"
-                    "$bmp = New-Object System.Drawing.Bitmap __W__, __H__\n"
+                    + pixfmt_setup +
+                    "$bmp = New-Object System.Drawing.Bitmap __W__, __H__, $pixfmt\n"
                     "$g   = [System.Drawing.Graphics]::FromImage($bmp)\n"
                     "$g.CopyFromScreen(__X__, __Y__, 0, 0, $bmp.Size)\n"
                     "$g.Dispose()\n"
@@ -257,10 +269,11 @@ class WSLBackend(DesktopBackend):
                     "$top    = ($scr | % { $_.Bounds.Top    } | Measure-Object -Min).Minimum\n"
                     "$right  = ($scr | % { $_.Bounds.Right  } | Measure-Object -Max).Maximum\n"
                     "$bottom = ($scr | % { $_.Bounds.Bottom } | Measure-Object -Max).Maximum\n"
-                    "$w      = $right - $left\n"
-                    "$h      = $bottom - $top\n"
+                    "$w      = [int]($right - $left)\n"
+                    "$h      = [int]($bottom - $top)\n"
                     "$n      = $scr.Count\n"
-                    "$bmp    = New-Object System.Drawing.Bitmap $w, $h\n"
+                    + pixfmt_setup +
+                    "$bmp    = New-Object System.Drawing.Bitmap $w, $h, $pixfmt\n"
                     "$g      = [System.Drawing.Graphics]::FromImage($bmp)\n"
                     "$g.CopyFromScreen($left, $top, 0, 0, (New-Object System.Drawing.Size $w, $h))\n"
                     "$g.Dispose()\n"
