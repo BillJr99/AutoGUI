@@ -30,7 +30,7 @@ ENV/
 config.json
 logs/
 screenshots/
-skills/
+/skills/
 memory/
 pi-extension/node_modules/
 pi-extension/runtime/
