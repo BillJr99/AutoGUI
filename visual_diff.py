@@ -22,6 +22,7 @@ hash diff and degrade gracefully.
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 from dataclasses import dataclass
 from io import BytesIO
@@ -73,12 +74,18 @@ def hash_png_bytes(png_bytes: bytes) -> Optional[bytes]:
 
 
 def hash_b64(b64: str) -> Optional[bytes]:
-    """Convenience: hash a base64-encoded PNG string."""
+    """Convenience: hash a base64-encoded PNG string.
+
+    Returns ``None`` for unusable input (empty / invalid base64 / decode
+    error).  ``binascii.Error`` is technically a ``ValueError`` subclass
+    in CPython but is named explicitly here so a future stdlib change
+    in the type hierarchy can't quietly let an exception escape.
+    """
     if not b64:
         return None
     try:
         return hash_png_bytes(base64.b64decode(b64))
-    except (ValueError, TypeError):
+    except (binascii.Error, ValueError, TypeError):
         return None
 
 

@@ -947,15 +947,22 @@ class ToolRegistry:
                 element_name: str = "",
                 text: str = "",
                 window_id: str = "",
-                timeout: float = 15.0,
+                timeout: float | None = None,
             ) -> dict:
+                # ``timeout=None`` (or omitted) takes the wait_for default
+                # of 15.0 s.  An explicit ``timeout=0`` is preserved and
+                # passed through so wait_for can clamp it to its 0.5 s
+                # floor (one quick poll); the previous ``or 15.0``
+                # fallback silently turned 0 into 15 and made an
+                # immediate-poll request impossible.
+                effective_timeout = 15.0 if timeout is None else float(timeout)
                 return await _wait_for_impl(
                     backend=backend_ref,
                     window_title=str(window_title or ""),
                     element_name=str(element_name or ""),
                     text=str(text or ""),
                     window_id=str(window_id or ""),
-                    timeout=float(timeout) if timeout else 15.0,
+                    timeout=effective_timeout,
                 )
 
             self._register(

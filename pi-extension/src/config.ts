@@ -16,14 +16,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export interface ExtensionConfig {
-  /** When true, skill_save / skill_list / skill_run are registered and a
-   *  SkillStore is created on disk.  Defaults to false so the extension
-   *  doesn't write a skills file unless the user opts in. */
+  /** Creation gate ONLY (mirrors memoryEnabled).  When true, skill_save
+   *  is registered so new skills can be persisted.  When false (the
+   *  default), skill_save is omitted and the controller never writes a
+   *  skills file — but skill_list / skill_run register whenever a
+   *  SkillStore is constructed (it always is, lazily, with no disk
+   *  side effects), so any pre-existing library at skillsPath remains
+   *  readable and replayable. */
   skillsEnabled: boolean;
-  /** Where saved skills (replayable macros) live when skillsEnabled=true.
-   *  Empty string resolves to <extensionRoot>/runtime/skills/skills.jsonl,
-   *  which is intentionally distinct from the standalone Python agent's
-   *  ./skills/skills.jsonl so the two libraries don't shadow each other. */
+  /** Where saved skills (replayable macros) live.  Empty string resolves
+   *  to <extensionRoot>/runtime/skills/skills.jsonl, intentionally
+   *  distinct from the standalone Python agent's ./skills/skills.jsonl
+   *  so the two libraries don't shadow each other.  The file is
+   *  created lazily on first write (only when skillsEnabled is true). */
   skillsPath: string;
   /** When true, the extension records a JSONL trace of every tool call. */
   recordTrace: boolean;
