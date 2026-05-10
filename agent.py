@@ -1038,11 +1038,14 @@ class Agent:
                     data=report.to_dict(),
                 )
                 if not report.all_passed:
-                    yield AgentEvent(
-                        kind="step_escalate",
-                        content="Preflight resources missing; aborting before any UI action.",
-                        data={"report": report.to_dict()},
-                    )
+                    # The preflight event above already announced the
+                    # failure (with per-check details).  Skip the
+                    # follow-up step_escalate yield — both rendered the
+                    # same "preflight failed" line in the TUI, which
+                    # made it look like the agent aborted twice for
+                    # different reasons.  The done event below carries
+                    # the same report under data["report"] for any
+                    # consumer that wanted it.
                     if self._task_progress is not None:
                         self._progress.finalize(self._task_progress, status="failed")
                     yield AgentEvent(
@@ -1057,6 +1060,10 @@ class Agent:
                             # look like the controller never ran at all.
                             "iterations": 0,
                             "finish_reason": "preflight_failed",
+                            # Carried forward from the preflight event so
+                            # programmatic consumers (replay, dashboards)
+                            # can still see what the actual checks were.
+                            "report": report.to_dict(),
                         },
                     )
                     return

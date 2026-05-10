@@ -538,11 +538,17 @@ class AgentTUI(App):
                     failures = event.data.get("results") or []
                     if not event.data.get("all_passed", True):
                         log.write(f"[bold red]  ✗ PREFLIGHT FAILED:[/bold red] {event.content}")
+                        # PreflightReport.to_dict flattens kind/target/ok/
+                        # detail onto each result entry — they are NOT
+                        # nested under a "check" key, so reading
+                        # `r.get("check", {}).get(...)` would always
+                        # produce "?=?" placeholders instead of the
+                        # actual "tool=foo" diagnosis.
                         for r in failures:
-                            if not r.get("ok"):
-                                check = r.get("check") or {}
+                            if not r.get("ok", True):
                                 log.write(
-                                    f"[red]      - {check.get('kind','?')}={check.get('target','?')}: "
+                                    f"[red]      - {r.get('kind','?')}="
+                                    f"{r.get('target','?')}: "
                                     f"{r.get('detail','')}[/red]"
                                 )
                     else:

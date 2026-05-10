@@ -41,6 +41,31 @@ def test_infer_explicit_preflight_block():
     assert ("url", "https://example.com") in targets
 
 
+def test_tools_hint_does_not_become_a_preflight_check():
+    """tools_hint is a HINT to the executor about what the model thinks
+    it might use — NOT a hard requirement.  Auto-promoting every hint
+    to a blocking preflight tool check used to abort whole tasks when
+    the model hallucinated a tool name (e.g. listing a non-existent
+    "desktop_excel_open") or hinted a tool that's optional on the
+    current backend.  Plans that genuinely need a tool can list it
+    explicitly under the ``preflight`` array."""
+    plan = {
+        "steps": [
+            {"id": "s1", "tools_hint": ["definitely_not_a_real_tool",
+                                          "another_made_up_one"]},
+        ],
+    }
+
+    # Empty registry — the old behaviour would have produced 2 tool
+    # checks here, both failing with "not registered".
+    class _StubRegistry:
+        def list_tools(self):
+            return []
+
+    checks = infer_checks_from_plan(plan, registry=_StubRegistry())
+    assert checks == []
+
+
 def test_dedup_same_target():
     plan = {
         "preflight": [{"kind": "file", "target": "/tmp/x"}],

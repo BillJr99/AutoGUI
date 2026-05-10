@@ -296,8 +296,20 @@ def infer_checks_from_plan(plan_dict: dict, *, registry=None) -> list[PreflightC
 
     Looks at:
       * ``plan.preflight``               — explicit list of {kind,target,note}
-      * each step's ``tools_hint``       — proposed tool requires a registered name
       * each step's ``predicate.path``   — file_exists / file_contains imply an existing path
+
+    ``tools_hint`` is intentionally NOT inferred into a preflight tool
+    check: it's a HINT to the executor about what the model thinks it
+    might use, not a hard requirement.  Promoting every hint to a
+    blocking preflight check causes the controller to abort whole
+    tasks when the model hallucinates a tool name (e.g. listing a non-
+    existent ``desktop_excel_open``) or hints a tool that's optional
+    on the current backend.  The executor will surface a clear "tool
+    not found" error if the model actually tries to call an
+    unregistered tool — that's the right place to fail, not at
+    preflight.  Plans that genuinely need a specific tool can list it
+    in the explicit ``preflight`` array as ``{"kind":"tool",
+    "target":"..."}``.
 
     Duplicates are merged.  Returns a possibly-empty list.
     """
@@ -316,22 +328,9 @@ def infer_checks_from_plan(plan_dict: dict, *, registry=None) -> list[PreflightC
                 seen.add((kind, target))
                 out.append(PreflightCheck(kind, target, note))
 
-    available_tools = set(registry.list_tools()) if registry is not None else set()
     for step in plan_dict.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        for hint in step.get("tools_hint") or []:
-            tname = str(hint)
-            if not tname or (("tool", tname) in seen):
-                continue
-            # Worth checking whenever we have any registry — even an
-            # empty one — so the truthiness of available_tools doesn't
-            # silently drop hinted tools when the caller's registry
-            # happens to expose nothing yet.
-            if registry is not None and tname not in available_tools:
-                seen.add(("tool", tname))
-                out.append(PreflightCheck("tool", tname,
-                                          note=f"step {step.get('id')} hints {tname}"))
         pred = step.get("predicate") if isinstance(step, dict) else None
         if isinstance(pred, dict) and pred.get("kind") in (
             "file_exists", "file_contains"
