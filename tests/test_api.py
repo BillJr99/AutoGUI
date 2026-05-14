@@ -15,10 +15,12 @@ import time
 import pytest
 
 # Force dry-run mode before api.py is imported (it reads env at module load).
-os.environ.setdefault("AUTOGUI_DRY_RUN", "true")
+# Use unconditional assignment so an existing env value cannot silently
+# override the test fixtures and cause tests to hit the real Agent or config.
+os.environ["AUTOGUI_DRY_RUN"] = "true"
 # Use a clearly-nonexistent filename so api.py takes the env-var-defaults path
 # cleanly without Path("") accidentally resolving to the current directory.
-os.environ.setdefault("AUTOGUI_CONFIG", "__no_config__.json")
+os.environ["AUTOGUI_CONFIG"] = "__no_config__.json"
 
 from fastapi.testclient import TestClient  # noqa: E402 — must come after env setup
 from api import app, TASKS  # noqa: E402
@@ -32,7 +34,7 @@ def _fresh_client() -> TestClient:
     """Return a TestClient with a clean TASKS store.
 
     Cancels any outstanding background asyncio tasks before clearing so that
-    lingering coroutines don’t crash with KeyError when they next access TASKS.
+    lingering coroutines don't crash with KeyError when they next access TASKS.
     """
     for task in list(TASKS.values()):
         asyncio_task = task.get("_asyncio_task")

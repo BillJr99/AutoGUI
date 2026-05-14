@@ -166,12 +166,14 @@ async def _validation_exception_handler(request: Request, exc: RequestValidation
 
 @app.exception_handler(Exception)
 async def _global_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Log full details server-side; return a generic message to the client to
+    # avoid leaking internal paths, config hints, or stack-adjacent information.
     logger.exception("Unhandled exception on %s", request.url)
     return JSONResponse(
         status_code=500,
         content={
             "ok": False,
-            "error": {"code": "internal_error", "message": str(exc)},
+            "error": {"code": "internal_error", "message": "An internal server error occurred."},
         },
     )
 
@@ -235,18 +237,24 @@ def _build_agent(cfg: dict, dry_run: bool):
 
 
 def _merge_allow_overrides(cfg: dict, allow: dict | None) -> dict:
-    """Return a new config dict with tools.allowed_* flags overridden."""
+    """Return a new config dict with tools.allowed_* flags restricted by overrides.
+
+    Per-request overrides can only *restrict* capabilities — they are ANDed
+    with the server’s base configuration.  A request cannot enable a surface
+    (e.g. browser) that is disabled in the server config, preventing
+    privilege escalation through the request body.
+    """
     if not allow:
         return cfg
     import copy
     cfg2 = copy.deepcopy(cfg)
     tools_cfg = cfg2.setdefault("tools", {})
     if "desktop" in allow:
-        tools_cfg["allowed_desktop"] = bool(allow["desktop"])
+        tools_cfg["allowed_desktop"] = tools_cfg.get("allowed_desktop", True) and bool(allow["desktop"])
     if "shell" in allow:
-        tools_cfg["allowed_shell"] = bool(allow["shell"])
+        tools_cfg["allowed_shell"] = tools_cfg.get("allowed_shell", True) and bool(allow["shell"])
     if "browser" in allow:
-        tools_cfg["allowed_browser"] = bool(allow["browser"])
+        tools_cfg["allowed_browser"] = tools_cfg.get("allowed_browser", False) and bool(allow["browser"])
     if allow.get("model"):
         cfg2.setdefault("openwebui", {})["model"] = allow["model"]
     return cfg2
@@ -398,7 +406,7 @@ async def list_tools():
         return {"ok": True, "tools": tools}
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not build ToolRegistry for /api/tools: %s", exc)
-        return {"ok": True, "tools": [], "warning": str(exc)}
+        return {"ok": True, "tools": [], "warning": "Tool registry unavailable."}
 
 
 @app.post("/api/task", status_code=202)
