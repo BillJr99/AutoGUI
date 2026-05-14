@@ -92,7 +92,7 @@
     "allowed_shell": true,
     "allowed_filesystem": true,
     "allowed_desktop": true,
-    "allowed_browser": true
+    "allowed_browser": false
   },
   "browser": {
     "_comment": "Settings for the Playwright-driven browser backend (used when allowed_browser=true).",

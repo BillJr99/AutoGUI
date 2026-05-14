@@ -15,6 +15,10 @@ rich>=13.7.0,<14.0.0
 pyautogui>=0.9.54
 Pillow>=10.0.0
 
+# REST API server
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
 # ── Platform-specific (install only what applies to your OS) ──────────────
 
 # Windows native: UIAutomation element access (accessibility tree)
