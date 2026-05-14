@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 @dataclass
 class AgentEvent:
     """
-    Mirrors the AgentEvent dataclass from agent.py so DryRunAgent yields
-    the same type as the real Agent without importing the full agent module
+    Mirrors the AgentEvent interface from agent.py so DryRunAgent yields
+    events with the same shape without importing the full agent module
     (which has many heavy dependencies).
     """
     kind: str
@@ -46,7 +46,9 @@ class DryRunAgent:
       done        → task complete
 
     All events are tagged with ``[DRY RUN]`` in their content so callers
-    can distinguish simulated output from real output.
+    can distinguish simulated output from real output.  Every event also
+    includes ``dry_run: true`` in its ``data`` dict so consumers can filter
+    or label dry-run events programmatically.
     """
 
     async def run(self, command: str):
@@ -68,19 +70,19 @@ class DryRunAgent:
         yield AgentEvent(
             kind="plan",
             content=f"[DRY RUN] Plan to execute: {command}",
-            data={"steps": ["Observe screen", "Simulate action", "Confirm result"]},
+            data={"steps": ["Observe screen", "Simulate action", "Confirm result"], "dry_run": True},
         )
 
         yield AgentEvent(
             kind="text",
             content="[DRY RUN] Simulating task execution without touching the desktop.",
-            data={},
+            data={"dry_run": True},
         )
 
         yield AgentEvent(
             kind="tool_call",
             content="desktop_screenshot()",
-            data={"tool": "desktop_screenshot", "args": {}},
+            data={"tool": "desktop_screenshot", "args": {}, "dry_run": True},
         )
 
         await asyncio.sleep(0.05)  # brief pause to simulate tool dispatch latency
@@ -94,5 +96,5 @@ class DryRunAgent:
         yield AgentEvent(
             kind="done",
             content="[DRY RUN] Task complete (simulated)",
-            data={"iterations": 1, "finish_reason": "dry_run"},
+            data={"iterations": 1, "finish_reason": "dry_run", "dry_run": True},
         )
