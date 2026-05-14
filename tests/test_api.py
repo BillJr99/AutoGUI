@@ -16,7 +16,9 @@ import pytest
 
 # Force dry-run mode before api.py is imported (it reads env at module load).
 os.environ.setdefault("AUTOGUI_DRY_RUN", "true")
-os.environ.setdefault("AUTOGUI_CONFIG", "")  # no config file needed
+# Use a clearly-nonexistent filename so api.py takes the env-var-defaults path
+# cleanly without Path("") accidentally resolving to the current directory.
+os.environ.setdefault("AUTOGUI_CONFIG", "__no_config__.json")
 
 from fastapi.testclient import TestClient  # noqa: E402 — must come after env setup
 from api import app, TASKS  # noqa: E402
@@ -27,7 +29,15 @@ from api import app, TASKS  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _fresh_client() -> TestClient:
-    """Return a TestClient with a clean TASKS store."""
+    """Return a TestClient with a clean TASKS store.
+
+    Cancels any outstanding background asyncio tasks before clearing so that
+    lingering coroutines don’t crash with KeyError when they next access TASKS.
+    """
+    for task in list(TASKS.values()):
+        asyncio_task = task.get("_asyncio_task")
+        if asyncio_task and not asyncio_task.done():
+            asyncio_task.cancel()
     TASKS.clear()
     return TestClient(app, raise_server_exceptions=True)
 
@@ -213,14 +223,14 @@ class TestGetTask:
         r = client.get("/api/task/nonexistent-task-id")
         assert r.status_code == 404
 
-    def test_404_detail_has_error_shape(self):
+    def test_404_has_error_envelope(self):
+        """404 errors must use the top-level {ok, error} envelope (via HTTPException handler)."""
         client = _fresh_client()
-        detail = client.get("/api/task/no-such-id").json()
-        # FastAPI wraps HTTPException detail under "detail"
-        assert "detail" in detail
-        err = detail["detail"]
-        assert err["ok"] is False
-        assert "error" in err
+        data = client.get("/api/task/no-such-id").json()
+        assert data["ok"] is False
+        assert "error" in data
+        assert "code" in data["error"]
+        assert "message" in data["error"]
 
     def test_task_has_expected_fields(self):
         client = _fresh_client()
@@ -251,19 +261,21 @@ class TestGetTask:
 
     def test_completed_task_has_steps(self):
         """After completion, steps list should be non-empty."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "steps check"}).json()["task_id"]
-        data = _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        assert isinstance(data["steps"], list)
-        assert len(data["steps"]) > 0
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "steps check"}).json()["task_id"]
+            data = _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            assert isinstance(data["steps"], list)
+            assert len(data["steps"]) > 0
 
     def test_completed_task_has_timestamps(self):
         """started_at and finished_at should be set after completion."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "timestamp check"}).json()["task_id"]
-        data = _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        assert data["started_at"] is not None
-        assert data["finished_at"] is not None
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "timestamp check"}).json()["task_id"]
+            data = _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            assert data["started_at"] is not None
+            assert data["finished_at"] is not None
 
     def test_steps_have_expected_fields(self):
         """Each step should have seq, kind, content, data.
@@ -315,11 +327,12 @@ class TestCancelTask:
 
     def test_cancel_finished_task_returns_ok(self):
         """Cancelling an already-finished task should still return ok."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "finish first"}).json()["task_id"]
-        _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        data = client.post(f"/api/task/{task_id}/cancel").json()
-        assert data["ok"] is True
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "finish first"}).json()["task_id"]
+            _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            data = client.post(f"/api/task/{task_id}/cancel").json()
+            assert data["ok"] is True
 
     def test_cancel_nonexistent_task_returns_404(self):
         client = _fresh_client()
@@ -364,18 +377,20 @@ class TestApproveTask:
 class TestStreamTask:
     def test_stream_already_done_task_returns_200(self):
         """For a completed task, the stream endpoint should respond with 200."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "stream me"}).json()["task_id"]
-        _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        r = client.get(f"/api/task/{task_id}/stream")
-        assert r.status_code == 200
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "stream me"}).json()["task_id"]
+            _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            r = client.get(f"/api/task/{task_id}/stream")
+            assert r.status_code == 200
 
     def test_stream_content_type_is_event_stream(self):
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "stream ct"}).json()["task_id"]
-        _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        r = client.get(f"/api/task/{task_id}/stream")
-        assert "text/event-stream" in r.headers.get("content-type", "")
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "stream ct"}).json()["task_id"]
+            _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            r = client.get(f"/api/task/{task_id}/stream")
+            assert "text/event-stream" in r.headers.get("content-type", "")
 
     def test_stream_nonexistent_task_returns_404(self):
         client = _fresh_client()
@@ -384,33 +399,35 @@ class TestStreamTask:
 
     def test_stream_body_contains_data_lines(self):
         """SSE format: each event should be a 'data: ...' line."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "stream body"}).json()["task_id"]
-        _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        r = client.get(f"/api/task/{task_id}/stream")
-        body = r.text
-        data_lines = [line for line in body.splitlines() if line.startswith("data:")]
-        assert len(data_lines) > 0
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "stream body"}).json()["task_id"]
+            _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            r = client.get(f"/api/task/{task_id}/stream")
+            body = r.text
+            data_lines = [line for line in body.splitlines() if line.startswith("data:")]
+            assert len(data_lines) > 0
 
     def test_stream_contains_done_event(self):
         """The stream must include a terminal 'done' sentinel."""
         import json as _json
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "stream done"}).json()["task_id"]
-        _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        r = client.get(f"/api/task/{task_id}/stream")
-        body = r.text
-        found_done = False
-        for line in body.splitlines():
-            if line.startswith("data:"):
-                try:
-                    payload = _json.loads(line[len("data:"):].strip())
-                    if payload.get("kind") == "done":
-                        found_done = True
-                        break
-                except _json.JSONDecodeError:
-                    pass
-        assert found_done, "stream did not include a 'done' event"
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "stream done"}).json()["task_id"]
+            _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            r = client.get(f"/api/task/{task_id}/stream")
+            body = r.text
+            found_done = False
+            for line in body.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        payload = _json.loads(line[len("data:"):].strip())
+                        if payload.get("kind") == "done":
+                            found_done = True
+                            break
+                    except _json.JSONDecodeError:
+                        pass
+            assert found_done, "stream did not include a 'done' event"
 
 
 # ---------------------------------------------------------------------------
@@ -418,24 +435,28 @@ class TestStreamTask:
 # ---------------------------------------------------------------------------
 
 class TestErrorShapes:
-    """Verify that all 404 responses follow the {ok, error: {code, message}} shape."""
+    """Verify that all 4xx responses follow the top-level {ok, error: {code, message}} shape.
+
+    The HTTPException handler in api.py normalises all HTTPExceptions so the
+    body is always at the top level (not wrapped under 'detail').
+    """
 
     def test_get_unknown_task_error_shape(self):
         client = _fresh_client()
-        detail = client.get("/api/task/bogus").json()["detail"]
-        assert detail["ok"] is False
-        assert "error" in detail
-        assert "code" in detail["error"]
-        assert "message" in detail["error"]
+        data = client.get("/api/task/bogus").json()
+        assert data["ok"] is False
+        assert "error" in data
+        assert "code" in data["error"]
+        assert "message" in data["error"]
 
     def test_cancel_unknown_task_error_shape(self):
         client = _fresh_client()
-        detail = client.post("/api/task/bogus/cancel").json()["detail"]
-        assert detail["ok"] is False
-        assert "error" in detail
+        data = client.post("/api/task/bogus/cancel").json()
+        assert data["ok"] is False
+        assert "error" in data
 
     def test_approve_unknown_task_error_shape(self):
         client = _fresh_client()
-        detail = client.post("/api/task/bogus/approve").json()["detail"]
-        assert detail["ok"] is False
-        assert "error" in detail
+        data = client.post("/api/task/bogus/approve").json()
+        assert data["ok"] is False
+        assert "error" in data

@@ -41,7 +41,7 @@ class DryRunAgent:
 
       plan        → high-level plan
       text        → reasoning step
-      tool_call   → observe_screen (read-only, no side effects)
+      tool_call   → desktop_screenshot (read-only, no side effects)
       tool_result → mock screen state
       done        → task complete
 
@@ -79,8 +79,8 @@ class DryRunAgent:
 
         yield AgentEvent(
             kind="tool_call",
-            content="observe_screen()",
-            data={"tool": "observe_screen", "args": {}},
+            content="desktop_screenshot()",
+            data={"tool": "desktop_screenshot", "args": {}},
         )
 
         await asyncio.sleep(0.05)  # brief pause to simulate tool dispatch latency

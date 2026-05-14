@@ -12,9 +12,9 @@ Quick start::
     python api.py
 
     # Without a config file — use environment variables:
-    OPENWEBUI_BASE_URL=http://localhost:3000 \
-    OPENWEBUI_API_KEY=sk-... \
-    OPENWEBUI_MODEL=llama3.1:70b \
+    OPENWEBUI_BASE_URL=http://localhost:3000 \\
+    OPENWEBUI_API_KEY=sk-... \\
+    OPENWEBUI_MODEL=llama3.1:70b \\
     python api.py
 
     # Test without a real desktop or OpenWebUI instance:
@@ -23,8 +23,11 @@ Quick start::
 Environment variables
 ---------------------
 AUTOGUI_CONFIG      Path to config.json (default: ``config.json``).
+                    An empty string is treated as "no config file".
 AUTOGUI_DRY_RUN     ``true`` forces all tasks through DryRunAgent.
 AUTOGUI_API_PORT    Listening port (default: ``8002``).
+AUTOGUI_API_HOST    Bind address (default: ``127.0.0.1``).
+                    Set to ``0.0.0.0`` only in trusted network environments.
 OPENWEBUI_BASE_URL  OpenWebUI base URL when no config file is present.
 OPENWEBUI_API_KEY   API key when no config file is present.
 OPENWEBUI_MODEL     Model name when no config file is present.
@@ -45,9 +48,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -65,15 +69,19 @@ logger = logging.getLogger("autogui.api")
 # Configuration
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH = Path(os.environ.get("AUTOGUI_CONFIG", "config.json"))
+# Treat an empty AUTOGUI_CONFIG as "no config file" so that Path("") (which
+# resolves to the current directory) never triggers a spurious open() call.
+_config_env = os.environ.get("AUTOGUI_CONFIG", "config.json").strip()
+CONFIG_PATH = Path(_config_env) if _config_env else Path("config.json")
+
 DRY_RUN: bool = os.environ.get("AUTOGUI_DRY_RUN", "false").lower() == "true"
 API_VERSION = "1.0.0"
 _START_TIME = time.monotonic()
 
 
 def _load_config() -> dict:
-    """Load config.json if it exists, otherwise build defaults from env vars."""
-    if CONFIG_PATH.exists():
+    """Load config.json if it exists as a file; otherwise build defaults from env vars."""
+    if CONFIG_PATH.exists() and CONFIG_PATH.is_file():
         try:
             with CONFIG_PATH.open() as fh:
                 cfg = json.load(fh)
@@ -95,7 +103,7 @@ def _load_config() -> dict:
         "tools": {
             "allowed_desktop": True,
             "allowed_shell": True,
-            "allowed_browser": True,
+            "allowed_browser": False,  # off by default; opt-in per config or per request
         },
     }
 
@@ -107,13 +115,13 @@ BASE_CONFIG: dict = _load_config()
 # ---------------------------------------------------------------------------
 # TASKS maps task_id -> task dict.
 # task dict shape:
-#   task_id   : str
-#   task      : str          — original task string
-#   status    : str          — "pending", "running", "done", "error", "cancelled"
-#   steps     : list[dict]   — accumulated events
-#   started_at: str | None   — ISO-8601
-#   finished_at: str | None  — ISO-8601
-#   _queue    : asyncio.Queue — per-task SSE queue (not serialised)
+#   task_id      : str
+#   task         : str          — original task string
+#   status       : str          — "pending", "running", "done", "error", "cancelled"
+#   steps        : list[dict]   — accumulated events (append-only; safe to read at any offset)
+#   started_at   : str | None   — ISO-8601
+#   finished_at  : str | None   — ISO-8601
+#   _asyncio_task: asyncio.Task | None  — background coroutine handle
 
 TASKS: dict[str, dict] = {}
 
@@ -131,6 +139,41 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+# ---------------------------------------------------------------------------
+# Exception handlers — ensure all errors use the {ok, error} envelope
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Normalise HTTPException so the body is always {ok:false, error:{code,message}}."""
+    if isinstance(exc.detail, dict):
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"ok": False, "error": {"code": str(exc.status_code), "message": exc.detail}},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "error": {"code": "validation_error", "message": str(exc)}},
+    )
+
+
+@app.exception_handler(Exception)
+async def _global_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception on %s", request.url)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "ok": False,
+            "error": {"code": "internal_error", "message": str(exc)},
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +219,9 @@ def _build_agent(cfg: dict, dry_run: bool):
     from main import build_components
 
     try:
-        client, registry = build_components(cfg)
+        # build_components returns (client, registry, agent)
+        client, registry, agent = build_components(cfg)
+        return agent
     except Exception as exc:  # noqa: BLE001
         logger.warning("build_components failed (%s); falling back to env defaults", exc)
         ow = cfg.get("openwebui", {})
@@ -186,8 +231,7 @@ def _build_agent(cfg: dict, dry_run: bool):
             model=ow.get("model", ""),
         )
         registry = ToolRegistry(cfg)
-
-    return Agent(client=client, registry=registry, cfg=cfg)
+        return Agent(client=client, registry=registry, cfg=cfg)
 
 
 def _merge_allow_overrides(cfg: dict, allow: dict | None) -> dict:
@@ -216,12 +260,13 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
     """
     Drive the agent loop for a single task and persist events to TASKS.
 
-    This coroutine is scheduled as an asyncio background task by POST /api/task.
-    It writes to TASKS[task_id] and to the per-task asyncio.Queue so SSE
-    subscribers receive events in real-time.
+    This coroutine is scheduled as an asyncio.Task by POST /api/task.
+    It appends steps to task["steps"] so SSE subscribers can read by index
+    without sharing a queue.
     """
-    task = TASKS[task_id]
-    queue: asyncio.Queue = task["_queue"]
+    task = TASKS.get(task_id)
+    if task is None:
+        return  # Task was cleared (e.g. test teardown) before we started
 
     task["status"] = "running"
     task["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -238,7 +283,6 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
                 "data": event.data if isinstance(event.data, dict) else {},
             }
             task["steps"].append(step)
-            await queue.put(step)
             seq += 1
 
             if event.kind == "done":
@@ -259,13 +303,14 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
             "data": {"exception": type(exc).__name__},
         }
         task["steps"].append(err_step)
-        await queue.put(err_step)
         task["status"] = "error"
 
     finally:
-        task["finished_at"] = datetime.now(timezone.utc).isoformat()
-        # Sentinel so SSE consumer knows the stream is done.
-        await queue.put(None)
+        # Guard against task being cleared between the early-return check above
+        # and here (e.g. rapid test teardown).
+        task = TASKS.get(task_id)
+        if task is not None:
+            task["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +393,7 @@ async def list_tools():
                 "name": schema["function"]["name"],
                 "description": schema["function"].get("description", ""),
             }
-            for schema in registry.schemas()
+            for schema in registry.schemas  # schemas is a property, not a callable
         ]
         return {"ok": True, "tools": tools}
     except Exception as exc:  # noqa: BLE001
@@ -357,7 +402,7 @@ async def list_tools():
 
 
 @app.post("/api/task", status_code=202)
-async def create_task(req: TaskRequest, background_tasks: BackgroundTasks):
+async def create_task(req: TaskRequest):
     """Submit a new task.  Returns immediately with a task_id."""
     if not req.task.strip():
         return _err("empty_task", "The 'task' field must not be empty.")
@@ -378,13 +423,11 @@ async def create_task(req: TaskRequest, background_tasks: BackgroundTasks):
         "steps": [],
         "started_at": None,
         "finished_at": None,
-        "_queue": asyncio.Queue(),
         "_asyncio_task": None,
     }
 
-    # Schedule the agent loop as a background coroutine.
-    loop = asyncio.get_event_loop()
-    async_task = loop.create_task(
+    # Schedule the agent loop as an asyncio background task.
+    async_task = asyncio.create_task(
         _run_task_async(task_id, req.task, cfg, effective_dry_run)
     )
     TASKS[task_id]["_asyncio_task"] = async_task
@@ -405,44 +448,41 @@ async def stream_task(task_id: str):
     """
     Stream task events as Server-Sent Events (SSE).
 
+    Events are delivered by polling task["steps"] by index so that every
+    subscriber gets the full event history independently — no shared queue
+    to contend with.  Events already emitted are replayed first, then live
+    events follow until the task finishes.
+
     Each event is a JSON object on a ``data:`` line::
 
         data: {"seq": 0, "kind": "plan", "content": "...", "data": {}}\n\n
 
     The stream closes after a ``{"kind": "done", "finished": true}`` sentinel.
-
-    Connect with ``Accept: text/event-stream`` or any SSE client library.
     """
     task = _task_or_404(task_id)
-    queue: asyncio.Queue = task["_queue"]
 
     async def _event_gen() -> AsyncIterator[str]:
-        # First, replay events that already arrived before the client connected.
-        for step in list(task["steps"]):
-            payload = json.dumps(step, default=str)
-            yield f"data: {payload}\n\n"
-
-        # Then stream live events until the sentinel (None) arrives.
-        if task["status"] in ("done", "error", "cancelled"):
-            # Task already finished — send final sentinel and close.
-            yield f'data: {{"kind": "done", "finished": true}}\n\n'
-            return
-
+        sent = 0
         while True:
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                # Send a keep-alive comment so the connection doesn't time out.
-                yield ": keepalive\n\n"
-                continue
+            # Drain any steps that have arrived since last iteration.
+            steps = task["steps"]
+            while sent < len(steps):
+                payload = json.dumps(steps[sent], default=str)
+                yield f"data: {payload}\n\n"
+                sent += 1
 
-            if item is None:
-                # Sentinel from _run_task_async — stream is over.
+            # Task finished — flush any trailing steps and close stream.
+            if task["status"] in ("done", "error", "cancelled"):
+                steps = task["steps"]
+                while sent < len(steps):
+                    payload = json.dumps(steps[sent], default=str)
+                    yield f"data: {payload}\n\n"
+                    sent += 1
                 yield f'data: {{"kind": "done", "finished": true}}\n\n'
                 return
 
-            payload = json.dumps(item, default=str)
-            yield f"data: {payload}\n\n"
+            # Not done yet — brief poll interval (also acts as a keep-alive).
+            await asyncio.sleep(0.1)
 
     return StreamingResponse(
         _event_gen(),
@@ -482,22 +522,6 @@ async def approve_task(task_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Global exception handler
-# ---------------------------------------------------------------------------
-
-@app.exception_handler(Exception)
-async def _global_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled exception on %s", request.url)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "ok": False,
-            "error": {"code": "internal_error", "message": str(exc)},
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -505,5 +529,8 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("AUTOGUI_API_PORT", "8002"))
-    logger.info("Starting AutoGUI REST API on port %d (dry_run=%s)", port, DRY_RUN)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Default to localhost; set AUTOGUI_API_HOST=0.0.0.0 only in trusted network
+    # environments — the API has no authentication.
+    host = os.environ.get("AUTOGUI_API_HOST", "127.0.0.1")
+    logger.info("Starting AutoGUI REST API on %s:%d (dry_run=%s)", host, port, DRY_RUN)
+    uvicorn.run(app, host=host, port=port)
