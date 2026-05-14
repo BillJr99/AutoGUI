@@ -237,11 +237,17 @@ class TestGetTask:
         assert data["status"] in valid_statuses
 
     def test_task_completes_in_dry_run(self):
-        """DryRunAgent finishes quickly; wait for done/error status."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "complete me"}).json()["task_id"]
-        data = _wait_for_status(client, task_id, {"done", "error", "cancelled"})
-        assert data["status"] == "done"
+        """DryRunAgent finishes quickly; wait for done/error status.
+
+        Uses a context-manager TestClient so Starlette's anyio event loop
+        stays alive for the duration of the test, preventing the background
+        asyncio task from being spuriously cancelled when the client is GC'd.
+        """
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "complete me"}).json()["task_id"]
+            data = _wait_for_status(client, task_id, {"done", "error"}, timeout=10.0)
+            assert data["status"] == "done"
 
     def test_completed_task_has_steps(self):
         """After completion, steps list should be non-empty."""
@@ -260,23 +266,34 @@ class TestGetTask:
         assert data["finished_at"] is not None
 
     def test_steps_have_expected_fields(self):
-        """Each step should have seq, kind, content, data."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "step fields"}).json()["task_id"]
-        data = _wait_for_status(client, task_id, {"done", "error"})
-        for step in data["steps"]:
-            for field in ("seq", "kind", "content", "data"):
-                assert field in step, f"step missing field: {field}"
+        """Each step should have seq, kind, content, data.
+
+        Uses a context-manager TestClient so the event loop stays alive and
+        the background task is not spuriously cancelled before steps are written.
+        """
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "step fields"}).json()["task_id"]
+            data = _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
+            for step in data["steps"]:
+                for field in ("seq", "kind", "content", "data"):
+                    assert field in step, f"step missing field: {field}"
 
     def test_step_kinds_from_dry_run(self):
-        """DryRunAgent should produce plan, text, tool_call, tool_result, done events."""
-        client = _fresh_client()
-        task_id = client.post("/api/task", json={"task": "event kinds"}).json()["task_id"]
-        data = _wait_for_status(client, task_id, {"done"})
-        kinds = {step["kind"] for step in data["steps"]}
-        # DryRunAgent always yields at least these
-        assert "plan" in kinds
-        assert "done" in kinds
+        """DryRunAgent should produce plan, text, tool_call, tool_result, done events.
+
+        Uses a context-manager TestClient so the event loop stays alive and
+        the background task is not spuriously cancelled before all events are
+        emitted.
+        """
+        TASKS.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            task_id = client.post("/api/task", json={"task": "event kinds"}).json()["task_id"]
+            data = _wait_for_status(client, task_id, {"done"}, timeout=10.0)
+            kinds = {step["kind"] for step in data["steps"]}
+            # DryRunAgent always yields at least these
+            assert "plan" in kinds
+            assert "done" in kinds
 
 
 # ---------------------------------------------------------------------------
