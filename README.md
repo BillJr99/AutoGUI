@@ -23,7 +23,7 @@ is configured to use and exposes desktop tools plus `/autogui`.
 ## Features
 
 | Category | What it does |
-|----------|--------------|
+|----------|-------------|
 | **Planner** | One LLM call up front produces a numbered plan; executor follows it across the ReAct loop. Off-switchable, defaults on |
 | **ReAct loop** | Reason → tool call → observe result → repeat, up to configurable iteration limit |
 | **Shell** | Run any shell command with timeout, destructive-pattern guard, and confirmation delay |
@@ -428,7 +428,7 @@ pip install -r requirements.txt   # fastapi and uvicorn are already included
 ```bash
 # With config.json present:
 python api.py
-# Listening on http://0.0.0.0:8002
+# Listening on http://127.0.0.1:8002
 
 # Without a config file — use environment variables:
 OPENWEBUI_BASE_URL=http://localhost:3000 \
@@ -692,7 +692,7 @@ Open the model picker via **Ctrl+P** (the command palette) — type "model" and 
 **Change Model**:
 
 ```
-┌─ Select Model ──────────────────────────────────┐
+┌─ Select Model ───────────────────────────────────────────────┐
 │ 12 models  ·  ↑↓ to navigate                    │
 │ ┌─────────────────────────────────────────────┐ │
 │ │ llama3.1:70b  ●                             │ │  ← current model (green dot)
