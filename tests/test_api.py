@@ -23,7 +23,7 @@ os.environ["AUTOGUI_DRY_RUN"] = "true"
 os.environ["AUTOGUI_CONFIG"] = "__no_config__.json"
 
 from fastapi.testclient import TestClient  # noqa: E402 — must come after env setup
-from api import app, TASKS  # noqa: E402
+from api import app, TASKS, _TASK_HANDLES  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +36,10 @@ def _fresh_client() -> TestClient:
     Cancels any outstanding background asyncio tasks before clearing so that
     lingering coroutines don't crash with KeyError when they next access TASKS.
     """
+    for task_id, async_task in list(_TASK_HANDLES.items()):
+        if not async_task.done():
+            async_task.cancel()
+    _TASK_HANDLES.clear()
     for task in list(TASKS.values()):
         asyncio_task = task.get("_asyncio_task")
         if asyncio_task and not asyncio_task.done():
@@ -256,6 +260,7 @@ class TestGetTask:
         asyncio task from being spuriously cancelled when the client is GC'd.
         """
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "complete me"}).json()["task_id"]
             data = _wait_for_status(client, task_id, {"done", "error"}, timeout=10.0)
@@ -264,6 +269,7 @@ class TestGetTask:
     def test_completed_task_has_steps(self):
         """After completion, steps list should be non-empty."""
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "steps check"}).json()["task_id"]
             data = _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
@@ -273,6 +279,7 @@ class TestGetTask:
     def test_completed_task_has_timestamps(self):
         """started_at and finished_at should be set after completion."""
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "timestamp check"}).json()["task_id"]
             data = _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
@@ -286,6 +293,7 @@ class TestGetTask:
         the background task is not spuriously cancelled before steps are written.
         """
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "step fields"}).json()["task_id"]
             data = _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
@@ -301,6 +309,7 @@ class TestGetTask:
         emitted.
         """
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "event kinds"}).json()["task_id"]
             data = _wait_for_status(client, task_id, {"done"}, timeout=10.0)
@@ -330,6 +339,7 @@ class TestCancelTask:
     def test_cancel_finished_task_returns_ok(self):
         """Cancelling an already-finished task should still return ok."""
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "finish first"}).json()["task_id"]
             _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
@@ -380,6 +390,7 @@ class TestStreamTask:
     def test_stream_already_done_task_returns_200(self):
         """For a completed task, the stream endpoint should respond with 200."""
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "stream me"}).json()["task_id"]
             _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
@@ -388,6 +399,7 @@ class TestStreamTask:
 
     def test_stream_content_type_is_event_stream(self):
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "stream ct"}).json()["task_id"]
             _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
@@ -402,6 +414,7 @@ class TestStreamTask:
     def test_stream_body_contains_data_lines(self):
         """SSE format: each event should be a 'data: ...' line."""
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "stream body"}).json()["task_id"]
             _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)
@@ -414,6 +427,7 @@ class TestStreamTask:
         """The stream must include a terminal 'done' sentinel."""
         import json as _json
         TASKS.clear()
+        _TASK_HANDLES.clear()
         with TestClient(app, raise_server_exceptions=True) as client:
             task_id = client.post("/api/task", json={"task": "stream done"}).json()["task_id"]
             _wait_for_status(client, task_id, {"done", "error", "cancelled"}, timeout=10.0)

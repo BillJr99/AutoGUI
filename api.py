@@ -48,7 +48,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -71,8 +71,10 @@ logger = logging.getLogger("autogui.api")
 
 # Treat an empty AUTOGUI_CONFIG as "no config file" so that Path("") (which
 # resolves to the current directory) never triggers a spurious open() call.
+# CONFIG_PATH is None when the env var is absent or empty — _load_config()
+# skips file loading in that case and falls back to env-var defaults.
 _config_env = os.environ.get("AUTOGUI_CONFIG", "config.json").strip()
-CONFIG_PATH = Path(_config_env) if _config_env else Path("config.json")
+CONFIG_PATH: Optional[Path] = Path(_config_env) if _config_env else None
 
 DRY_RUN: bool = os.environ.get("AUTOGUI_DRY_RUN", "false").lower() == "true"
 API_VERSION = "1.0.0"
@@ -81,7 +83,7 @@ _START_TIME = time.monotonic()
 
 def _load_config() -> dict:
     """Load config.json if it exists as a file; otherwise build defaults from env vars."""
-    if CONFIG_PATH.exists() and CONFIG_PATH.is_file():
+    if CONFIG_PATH is not None and CONFIG_PATH.exists() and CONFIG_PATH.is_file():
         try:
             with CONFIG_PATH.open() as fh:
                 cfg = json.load(fh)
@@ -90,10 +92,13 @@ def _load_config() -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to parse %s: %s — using env-var defaults", CONFIG_PATH, exc)
 
-    logger.info(
-        "Config file %s not found — building config from environment variables",
-        CONFIG_PATH,
-    )
+    if CONFIG_PATH is None:
+        logger.info("AUTOGUI_CONFIG is empty — building config from environment variables")
+    else:
+        logger.info(
+            "Config file %s not found — building config from environment variables",
+            CONFIG_PATH,
+        )
     return {
         "openwebui": {
             "base_url": os.environ.get("OPENWEBUI_BASE_URL", "http://localhost:3000"),
@@ -115,15 +120,22 @@ BASE_CONFIG: dict = _load_config()
 # ---------------------------------------------------------------------------
 # TASKS maps task_id -> task dict.
 # task dict shape:
-#   task_id      : str
-#   task         : str          — original task string
-#   status       : str          — "pending", "running", "done", "error", "cancelled"
-#   steps        : list[dict]   — accumulated events (append-only; safe to read at any offset)
-#   started_at   : str | None   — ISO-8601
-#   finished_at  : str | None   — ISO-8601
-#   _asyncio_task: asyncio.Task | None  — background coroutine handle
+#   task_id               : str
+#   task                  : str          — original task string
+#   status                : str          — "pending", "running", "done", "error", "cancelled"
+#   steps                 : list[dict]   — accumulated events (append-only; safe to read at any offset)
+#   started_at            : str | None   — ISO-8601
+#   finished_at           : str | None   — ISO-8601
+#   cancellation_requested: bool         — set by cancel_task; checked in _run_task_async
 
 TASKS: dict[str, dict] = {}
+
+# Module-level dict that maps task_id -> asyncio.Task handle so that
+# cancel_task can cancel the handle and test teardown can await it.
+_TASK_HANDLES: dict[str, asyncio.Task] = {}
+
+# Maximum number of tasks to keep in TASKS before evicting completed ones.
+MAX_TASKS = 500
 
 # ---------------------------------------------------------------------------
 # FastAPI application
@@ -240,7 +252,7 @@ def _merge_allow_overrides(cfg: dict, allow: dict | None) -> dict:
     """Return a new config dict with tools.allowed_* flags restricted by overrides.
 
     Per-request overrides can only *restrict* capabilities — they are ANDed
-    with the server’s base configuration.  A request cannot enable a surface
+    with the server's base configuration.  A request cannot enable a surface
     (e.g. browser) that is disabled in the server config, preventing
     privilege escalation through the request body.
     """
@@ -275,6 +287,12 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
     task = TASKS.get(task_id)
     if task is None:
         return  # Task was cleared (e.g. test teardown) before we started
+
+    # Check if cancellation was requested before we even set status=running.
+    if task.get("cancellation_requested"):
+        task["status"] = "cancelled"
+        task["finished_at"] = datetime.now(timezone.utc).isoformat()
+        return
 
     task["status"] = "running"
     task["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -319,6 +337,8 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
         task = TASKS.get(task_id)
         if task is not None:
             task["finished_at"] = datetime.now(timezone.utc).isoformat()
+        # Remove the handle from _TASK_HANDLES once the coroutine is done.
+        _TASK_HANDLES.pop(task_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +435,18 @@ async def create_task(req: TaskRequest):
     if not req.task.strip():
         return _err("empty_task", "The 'task' field must not be empty.")
 
+    # Enforce task store cap: evict the oldest completed task if at capacity.
+    if len(TASKS) >= MAX_TASKS:
+        terminal_statuses = {"done", "error", "cancelled"}
+        oldest_completed_id = next(
+            (tid for tid, t in TASKS.items() if t["status"] in terminal_statuses),
+            None,
+        )
+        if oldest_completed_id is None:
+            return _err("server_busy", "Task store is full; all tasks are still running.", status=503)
+        del TASKS[oldest_completed_id]
+        _TASK_HANDLES.pop(oldest_completed_id, None)
+
     task_id = str(uuid.uuid4())
     effective_dry_run = DRY_RUN or req.dry_run
 
@@ -431,14 +463,14 @@ async def create_task(req: TaskRequest):
         "steps": [],
         "started_at": None,
         "finished_at": None,
-        "_asyncio_task": None,
+        "cancellation_requested": False,
     }
 
     # Schedule the agent loop as an asyncio background task.
     async_task = asyncio.create_task(
         _run_task_async(task_id, req.task, cfg, effective_dry_run)
     )
-    TASKS[task_id]["_asyncio_task"] = async_task
+    _TASK_HANDLES[task_id] = async_task
 
     logger.info("Created task %s: %r (dry_run=%s)", task_id, req.task[:80], effective_dry_run)
     return {"ok": True, "task_id": task_id}
@@ -506,7 +538,11 @@ async def stream_task(task_id: str):
 async def cancel_task(task_id: str):
     """Cancel a running task (best-effort)."""
     task = _task_or_404(task_id)
-    asyncio_task = task.get("_asyncio_task")
+
+    # Set the flag so _run_task_async won't overwrite a cancelled status.
+    task["cancellation_requested"] = True
+
+    asyncio_task = _TASK_HANDLES.get(task_id)
     if asyncio_task and not asyncio_task.done():
         asyncio_task.cancel()
         task["status"] = "cancelled"
