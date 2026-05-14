@@ -50,6 +50,7 @@ is configured to use and exposes desktop tools plus `/autogui`.
 | **Step verification** | System prompt instructs the model to verify each result and self-continue |
 | **TUI** | Textual-based interactive session with status bar, tool visibility toggle, history save |
 | **CLI** | Single-command non-interactive mode for scripting and automation |
+| **REST API** | FastAPI HTTP server for programmatic task submission and live event streaming |
 
 ---
 
@@ -93,6 +94,15 @@ main.py             Entry point — argparse, validation, component wiring, TUI/
 │   ├─ Agent.run(input)      Async generator → AgentEvent stream
 │   ├─ Agent.reset()         Clear conversation history
 │   └─ Guardrails: hallucination detection, error-retry injection, step-continue
+│
+├── api.py          REST API server (FastAPI)
+│   ├─ POST /api/task        Submit task → task_id
+│   ├─ GET  /api/task/{id}   Poll task state + steps
+│   ├─ GET  /api/task/{id}/stream  SSE live event stream
+│   ├─ POST /api/task/{id}/cancel  Cancel running task
+│   └─ GET  /api/healthz     Liveness probe
+│
+├── dry_run.py      DryRunAgent — canned events, no desktop needed
 │
 ├── tui.py          Textual TUI
 │   ├─ AgentTUI              Main app (status bar, conversation log, input)
@@ -402,6 +412,73 @@ Prints connection status, configured model, and registered tool list.
 
 ---
 
+## REST API
+
+AutoGUI ships a FastAPI REST server that wraps the Agent class, making it
+accessible to web UIs, scripts, and CI pipelines without the TUI.
+
+### Install API dependencies
+
+```bash
+pip install -r requirements.txt   # fastapi and uvicorn are already included
+```
+
+### Start the server
+
+```bash
+# With config.json present:
+python api.py
+# Listening on http://0.0.0.0:8002
+
+# Without a config file — use environment variables:
+OPENWEBUI_BASE_URL=http://localhost:3000 \
+OPENWEBUI_API_KEY=sk-my-key \
+OPENWEBUI_MODEL=llama3.1:70b \
+python api.py
+
+# Test without a real desktop or OpenWebUI instance:
+AUTOGUI_DRY_RUN=true python api.py
+```
+
+### Docker
+
+```bash
+# Real agent (needs X11 and OpenWebUI):
+docker run -p 8002:8002 \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -e OPENWEBUI_BASE_URL=http://host.docker.internal:3000 \
+  -e OPENWEBUI_API_KEY=sk-my-key \
+  autogui python api.py
+
+# Dry-run (no display or OpenWebUI needed):
+docker run -p 8002:8002 -e AUTOGUI_DRY_RUN=true autogui python api.py
+```
+
+### Quick curl example
+
+```bash
+# Submit a task
+TASK_ID=$(curl -s -X POST http://localhost:8002/api/task \
+  -H 'Content-Type: application/json' \
+  -d '{"task": "Take a screenshot of the desktop"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["task_id"])')
+
+# Stream live events
+curl -N http://localhost:8002/api/task/$TASK_ID/stream
+
+# Or poll for the finished result
+curl -s http://localhost:8002/api/task/$TASK_ID | python3 -m json.tool
+```
+
+Full endpoint reference, SSE event format, and all environment variables: **[docs/REST_API.md](docs/REST_API.md)**
+
+Interactive docs (once the server is running):
+- Swagger UI: `http://localhost:8002/docs`
+- ReDoc: `http://localhost:8002/redoc`
+
+---
+
 ## Usage
 
 ### Pi extension
@@ -440,7 +517,7 @@ with `skill_save`, listed with `skill_list`, replayed with `skill_run`
 allowed:
 
 | `skills_enabled` | `skill_list` | `skill_run` | `skill_save` | Candidate suggestion at task start |
-|------------------|--------------|-------------|--------------|------------------------------------|
+|------------------|--------------|-------------|--------------|---------------------------------|
 | `false` (default) | ✓ | ✓ | — (not registered) | ✓ |
 | `true`            | ✓ | ✓ | ✓ | ✓ |
 
@@ -735,7 +812,7 @@ the same step.
 ## Platform Support
 
 | Platform | Screenshot | Click/Type | Hotkey | Windows | Launch | Find Element |
-|----------|-----------|------------|--------|---------|--------|--------------|
+|----------|-----------|------------|--------|---------|--------|----------|
 | **WSL (WSLg)** | pyautogui | pyautogui | pyautogui | PowerShell | PowerShell | PowerShell UIAutomation |
 | **Windows** | pyautogui | pyautogui | pyautogui | PowerShell | PowerShell | uiautomation (optional) |
 | **macOS** | screencapture | pyautogui | pyautogui | osascript | open -a | osascript |
@@ -897,6 +974,8 @@ self._register(
   excluded from git via `.gitignore`.
 - **Desktop control** — the agent operates at OS level: it can click anything and type
   anywhere.  Only run on machines and accounts where you accept this capability.
+- **REST API** — no authentication is enforced; run behind a trusted network boundary.
+  See [docs/REST_API.md](docs/REST_API.md) for details.
 
 ---
 

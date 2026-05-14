@@ -28,6 +28,25 @@
 # local clone that has not had `cd pi-extension && npm install` run, the
 # pi-extension will not be available.  All other Python and system deps
 # are installed outside /app and survive volume mounts.
+#
+# ── REST API mode ──────────────────────────────────────────────────────────
+# Default: TUI/CLI mode (python main.py)
+#
+# Run API server (real agent — requires X11 display and OpenWebUI):
+#   docker run -p 8002:8002 \
+#     -e DISPLAY=$DISPLAY \
+#     -v /tmp/.X11-unix:/tmp/.X11-unix \
+#     -e OPENWEBUI_BASE_URL=http://host.docker.internal:3000 \
+#     -e OPENWEBUI_API_KEY=sk-... \
+#     -e OPENWEBUI_MODEL=llama3.1:70b \
+#     autogui python api.py
+#
+# Run API server (dry-run mode — no display or OpenWebUI needed):
+#   docker run -p 8002:8002 \
+#     -e AUTOGUI_DRY_RUN=true \
+#     autogui python api.py
+#
+# See docs/REST_API.md for the full endpoint reference.
 
 FROM python:3.12-slim
 
@@ -37,6 +56,10 @@ LABEL org.opencontainers.image.title="AutoGUI" \
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
+
+# REST API server settings (override at runtime with -e)
+ENV AUTOGUI_DRY_RUN=false
+ENV AUTOGUI_API_PORT=8002
 
 # ── System packages ────────────────────────────────────────────────────────
 # These match what scripts/install-dependencies.sh installs on Linux/X11.
