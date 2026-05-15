@@ -425,10 +425,15 @@ pip install -r requirements.txt   # fastapi and uvicorn are already included
 
 ### Start the server
 
+The REST API starts **automatically in the background** whenever you run
+`python main.py` (any mode — TUI or single-command). A
+`[autogui] REST API listening on http://…` banner is printed to stderr at
+startup. You can also start it standalone:
+
 ```bash
 # With config.json present:
 python api.py
-# Listening on http://127.0.0.1:8002
+# Listening on http://0.0.0.0:8002
 
 # Without a config file — use environment variables:
 OPENWEBUI_BASE_URL=http://localhost:3000 \
@@ -439,6 +444,24 @@ python api.py
 # Test without a real desktop or OpenWebUI instance:
 AUTOGUI_DRY_RUN=true python api.py
 ```
+
+### Security and network bind address
+
+> **Warning: the REST API has no authentication and binds to `0.0.0.0`
+> (all interfaces) by default.**  This default suits sandbox / container
+> environments where network isolation is provided by the runtime.
+> **Do not expose the API port to an untrusted network without additional
+> access controls.**  For local development, restrict the server to
+> loopback (`127.0.0.1`) using the mechanisms below.
+
+| Mechanism | Effect |
+|---|---|
+| `AUTOGUI_API_HOST=127.0.0.1` | Restrict the API to loopback (recommended for local dev) |
+| `AUTOGUI_API_PORT=<port>` | Change the listen port (default `8002`) |
+| `AUTOGUI_DISABLE_API=1` | Disable the background API for all `main.py` invocations |
+
+If `fastapi` and `uvicorn` are not installed, the background thread is
+silently skipped and the main agent works normally.
 
 ### Docker
 
@@ -974,8 +997,10 @@ self._register(
   excluded from git via `.gitignore`.
 - **Desktop control** — the agent operates at OS level: it can click anything and type
   anywhere.  Only run on machines and accounts where you accept this capability.
-- **REST API** — no authentication is enforced; run behind a trusted network boundary.
-  See [docs/REST_API.md](docs/REST_API.md) for details.
+- **REST API** — no authentication is enforced; the server binds to `0.0.0.0` by default
+  (all interfaces).  Set `AUTOGUI_API_HOST=127.0.0.1` for loopback-only use, or
+  `AUTOGUI_DISABLE_API=1` to disable the background API entirely.  See
+  [docs/REST_API.md](docs/REST_API.md) for details.
 
 ---
 
