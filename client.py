@@ -175,11 +175,19 @@ class OpenWebUIClient:
                 ) as resp:
                     raw = await resp.text()
                     if resp.status != 200:
-                        print(
-                            f"[client.py:chat] HTTP {resp.status} | model={self.model!r}"
-                            f"\n--- response body ---\n{raw}\n--- end body ---"
+                        import sys
+                        msg = (
+                            f"\n========== OpenWebUI HTTP {resp.status} ==========\n"
+                            f"endpoint: {self._endpoint}\n"
+                            f"model:    {self.model!r}\n"
+                            f"--- response body ({len(raw)} bytes) ---\n"
+                            f"{raw}\n"
+                            f"--- end body ---\n"
+                            f"==================================================\n"
                         )
-                        logger.warning(
+                        print(msg, flush=True)
+                        print(msg, file=sys.stderr, flush=True)
+                        logger.error(
                             "[client.py:chat] HTTP %d from %s | model=%r | body=%s",
                             resp.status,
                             self._endpoint,
