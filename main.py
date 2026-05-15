@@ -193,6 +193,55 @@ def build_components(cfg: dict):
 
 
 # ---------------------------------------------------------------------------
+# Background REST API launcher
+# ---------------------------------------------------------------------------
+
+def _start_api_background():
+    """
+    Start the FastAPI REST API server on a background daemon thread.
+
+    The server is launched only when fastapi and uvicorn are installed.
+    Set AUTOGUI_DISABLE_API=1 to suppress the server entirely.
+    The bind host and port can be overridden via AUTOGUI_API_HOST and
+    AUTOGUI_API_PORT (defaults: 0.0.0.0 and 8002).
+
+    WARNING: The default host 0.0.0.0 binds on ALL network interfaces.
+    This is intended for isolated sandbox/container testing only.
+    Set AUTOGUI_API_HOST=127.0.0.1 for loopback-only use, or set
+    AUTOGUI_DISABLE_API=1 to disable the API entirely.  The API has
+    no authentication.
+    """
+    import os
+    import sys
+    import threading
+
+    if os.environ.get("AUTOGUI_DISABLE_API", "").lower() in ("1", "true", "yes"):
+        return
+    try:
+        import uvicorn
+        from api import app
+        host = os.environ.get("AUTOGUI_API_HOST", "0.0.0.0")
+        port = int(os.environ.get("AUTOGUI_API_PORT", "8002"))
+
+        def _run():
+            uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
+
+        t = threading.Thread(target=_run, name="autogui-api", daemon=True)
+        t.start()
+        print(f"[autogui] REST API listening on http://{host}:{port}", file=sys.stderr)
+        if host == "0.0.0.0":
+            print(
+                "[autogui] WARNING: REST API bound to 0.0.0.0 (all interfaces), no auth. "
+                "Set AUTOGUI_API_HOST=127.0.0.1 for loopback-only or AUTOGUI_DISABLE_API=1 to disable.",
+                file=sys.stderr,
+            )
+    except ImportError:
+        print("[autogui] REST API disabled: fastapi/uvicorn not installed.", file=sys.stderr)
+    except Exception as e:
+        print(f"[autogui] REST API failed to start: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Single-command (non-interactive) mode
 # ---------------------------------------------------------------------------
 
@@ -735,6 +784,9 @@ def _suppress_windows_proactor_resource_warnings() -> None:
 def main():
     args = parse_args()
     _suppress_windows_proactor_resource_warnings()
+
+    # -- Start background REST API server -----------------------------------
+    _start_api_background()
 
     # -- Load and patch configuration -----------------------------------
     try:
