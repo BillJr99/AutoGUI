@@ -17,6 +17,7 @@ Predicate kinds
   file_contains           — a file's body contains a substring
   url_contains            — the browser's current URL contains a substring
   text_visible            — a visible label is on screen (a11y or OCR)
+  text_in_window          — alias for text_visible (model-generated synonym)
   process_running         — a process matching a name pattern is running
   shell_returns           — a probe shell command exits 0 with optional stdout match
 
@@ -62,6 +63,7 @@ _KNOWN_KINDS = frozenset({
     "file_contains",
     "url_contains",
     "text_visible",
+    "text_in_window",
     "process_running",
     "shell_returns",
 })
@@ -107,7 +109,7 @@ def render(predicate: dict) -> str:
         return f"file {predicate.get('path')!r} contains {predicate.get('value')!r}"
     if kind == "url_contains":
         return f"browser URL contains {predicate.get('value')!r}"
-    if kind == "text_visible":
+    if kind in ("text_visible", "text_in_window"):
         return f"text visible on screen: {predicate.get('value')!r}"
     if kind == "process_running":
         return f"process matching {predicate.get('value')!r} is running"
@@ -150,7 +152,7 @@ async def check_predicate(predicate: dict, registry) -> PredicateResult:
             return _check_file_contains(p)
         if kind == "url_contains":
             return await _check_url(p, registry)
-        if kind == "text_visible":
+        if kind in ("text_visible", "text_in_window"):
             return await _check_text_visible(p, registry)
         if kind == "process_running":
             return await _check_process(p, registry)
