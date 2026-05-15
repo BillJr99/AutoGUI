@@ -14,8 +14,10 @@ the final-state screenshot the auto-verify already captures.
 
 Design
 ------
-- Capture uses Pillow.ImageGrab (cross-platform, no extra deps beyond
-  the existing Pillow requirement).
+- Capture prefers mss (already a project dependency) which enumerates
+  physical monitors individually — this handles asymmetric multi-monitor
+  X11 correctly (no BadMatch, monitors at different heights supported).
+  Falls back to Pillow.ImageGrab when mss is not importable.
 - Frames are stored as raw PIL Images in a deque(maxlen=N), so memory
   usage is bounded.
 - All timing parameters are config-driven; the default is a 5-second
@@ -23,11 +25,9 @@ Design
 - `flush()` writes a GIF.  GIF was chosen over MP4 because no ffmpeg
   dependency is required; Pillow can write animated GIFs natively.
 - The recorder is a singleton attached to the agent at construction.
-- If the underlying ``ImageGrab`` call fails repeatedly (e.g. an X11
-  ``BadMatch`` when ``all_screens=True`` overflows the root window
-  geometry), the loop self-disables instead of spamming the log every
-  ``1/fps`` seconds.  A single warning is logged that points at the
-  config knob to suppress it permanently.
+- If the underlying capture call fails repeatedly, the loop self-disables
+  instead of spamming the log every 1/fps seconds.  A single warning is
+  logged that points at the config knob to suppress it permanently.
 """
 
 from __future__ import annotations
@@ -43,9 +43,6 @@ logger = logging.getLogger(__name__)
 
 
 # After this many consecutive capture failures the loop gives up and exits.
-# Set high enough to ride out a transient glitch (e.g. the screen blanking
-# briefly) but low enough that a misconfigured X11 session does not spam the
-# debug log for the entire session.
 _MAX_CONSECUTIVE_FAILURES = 5
 
 
@@ -69,14 +66,20 @@ class ScreenRecorder:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._capture_available = self._check_capture()
-        # Sticky flag: once we drop ``all_screens=True`` because it raised a
-        # non-TypeError exception (e.g. X11 BadMatch on a multi-monitor setup
-        # where the virtual root extends past any real screen), don't try it
-        # again for the rest of the session.
+        # None = not yet attempted; False = permanently disabled (import failed
+        # or runtime error).
+        self._use_mss: bool | None = None
+        # Sticky flag: if all_screens=True raises on Pillow ImageGrab, fall
+        # back to single-screen for the rest of the session.
         self._all_screens_supported = True
 
     @staticmethod
     def _check_capture() -> bool:
+        try:
+            import mss  # noqa: F401
+            return True
+        except ImportError:
+            pass
         try:
             from PIL import ImageGrab  # noqa: F401
             return True
@@ -89,7 +92,7 @@ class ScreenRecorder:
 
     def start(self):
         if not self._capture_available:
-            logger.warning("[screen_record] Pillow.ImageGrab unavailable; recorder disabled.")
+            logger.warning("[screen_record] No capture backend (mss or Pillow); recorder disabled.")
             return False
         if self._thread is not None and self._thread.is_alive():
             return True
@@ -113,16 +116,71 @@ class ScreenRecorder:
     # Capture
     # ------------------------------------------------------------------
 
-    def _grab_once(self):
-        """Single capture attempt with a multi-screen → single-screen fallback.
+    @staticmethod
+    def _grab_mss():
+        """Capture all physical monitors using mss and stitch into one PIL Image.
 
-        ``ImageGrab.grab(all_screens=True)`` is the right call on most
-        multi-monitor setups but can raise X11 ``BadMatch`` when the
-        virtual root has an awkward geometry (e.g. one monitor is taller
-        than the other and Xinerama's bounding rect extends past either
-        real screen).  When that happens we permanently drop the kwarg
-        for the rest of the session and retry without it.
+        mss enumerates actual physical monitors (sct.monitors[1:]) and captures
+        each at its real geometry, so it works correctly on Linux X11 with
+        asymmetric multi-monitor setups (monitors at different heights or with
+        different origins) where Pillow ImageGrab.grab(all_screens=True) raises
+        BadMatch (X error 8).
+
+        Monitors are composited onto a canvas whose bounding box covers all of
+        them, preserving relative positions.  Black fill covers any gaps.
         """
+        import mss as _mss
+        from PIL import Image
+
+        with _mss.mss() as sct:
+            monitors = sct.monitors[1:]  # skip index 0 (virtual combined rect)
+            if not monitors:
+                monitors = sct.monitors  # ultra-fallback
+
+            if len(monitors) == 1:
+                raw = sct.grab(monitors[0])
+                return Image.frombytes("RGB", raw.size, raw.rgb)
+
+            # Multi-monitor: determine bounding box and stitch
+            left   = min(m["left"]              for m in monitors)
+            top    = min(m["top"]               for m in monitors)
+            right  = max(m["left"] + m["width"] for m in monitors)
+            bottom = max(m["top"] + m["height"] for m in monitors)
+            canvas = Image.new("RGB", (right - left, bottom - top), (0, 0, 0))
+
+            for monitor in monitors:
+                raw = sct.grab(monitor)
+                img = Image.frombytes("RGB", raw.size, raw.rgb)
+                canvas.paste(img, (monitor["left"] - left, monitor["top"] - top))
+
+            return canvas
+
+    def _grab_once(self):
+        """Single capture with multi-monitor support.
+
+        Preference order:
+        1. mss — captures each physical monitor individually and stitches them;
+           handles asymmetric multi-monitor X11 correctly.
+        2. Pillow ImageGrab(all_screens=True) — correct on Windows/macOS; may
+           raise BadMatch on X11 with uneven monitor geometry.
+        3. Pillow ImageGrab() — primary monitor only (last resort).
+        """
+        # --- mss path (preferred) ---
+        if self._use_mss is not False:
+            try:
+                img = self._grab_mss()
+                self._use_mss = True
+                return img
+            except ImportError:
+                self._use_mss = False  # mss not installed; skip permanently
+            except Exception as exc:
+                self._use_mss = False
+                logger.info(
+                    "[screen_record] mss capture failed (%s); trying Pillow fallback.",
+                    exc,
+                )
+
+        # --- Pillow path (fallback) ---
         from PIL import ImageGrab
         if self._all_screens_supported:
             try:
@@ -131,14 +189,10 @@ class ScreenRecorder:
                 # Old Pillow without the kwarg.  Permanent fallback.
                 self._all_screens_supported = False
             except Exception as exc:
-                # Could be an X11 BadMatch ("X get_image failed error 8 …")
-                # or any other backend-specific failure.  Try once more
-                # without ``all_screens`` and remember the failure for
-                # next time so we don't pay this cost every frame.
                 self._all_screens_supported = False
                 logger.info(
                     "[screen_record] ImageGrab.grab(all_screens=True) failed (%s); "
-                    "falling back to single-screen capture for the rest of the session.",
+                    "falling back to single-screen capture.",
                     exc,
                 )
         return ImageGrab.grab()

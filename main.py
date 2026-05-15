@@ -219,16 +219,16 @@ def _start_api_background():
         return
     try:
         import uvicorn
-        from api import app
-        host = os.environ.get("AUTOGUI_API_HOST", "0.0.0.0")
-        port = int(os.environ.get("AUTOGUI_API_PORT", "8002"))
+        from api import app, get_api_host, get_api_port
+        host = get_api_host()
+        port = get_api_port()
 
         def _run():
             uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
 
         t = threading.Thread(target=_run, name="autogui-api", daemon=True)
         t.start()
-        print(f"[autogui] REST API listening on http://{host}:{port}", file=sys.stderr)
+        print(f"[autogui] REST API starting on http://{host}:{port}", file=sys.stderr)
         if host == "0.0.0.0":
             print(
                 "[autogui] WARNING: REST API bound to 0.0.0.0 (all interfaces), no auth. "
@@ -466,7 +466,7 @@ async def validate_and_configure(cfg: dict, config_path: str) -> None:
     ow_cfg = cfg.setdefault("openwebui", {})
     original_key = ow_cfg.get("api_key", "").strip()
 
-    # ── 1. Prompt for a key if none is configured ──────────────────────────
+    # ── 1. Prompt for a key if none is configured ────────────────────────
     if original_key in _PLACEHOLDER_KEYS:
         print(_SEP)
         print("No API key configured — OpenWebUI requires one.")
@@ -563,7 +563,7 @@ async def validate_and_configure(cfg: dict, config_path: str) -> None:
             print("  Continuing — tool calls may fail.\n")
             break
 
-    # ── 3. Model selection ─────────────────────────────────────────────────
+    # ── 3. Model selection ─────────────────────────────────────────────
     if not models:
         return  # couldn't reach the server; nothing to validate against
 
@@ -619,7 +619,7 @@ async def run_health_check(client: OpenWebUIClient, registry: ToolRegistry) -> N
     status = "✓ reachable" if reachable else "✗ unreachable"
     print(f"OpenWebUI instance: {base}  [{status}]")
     print(f"Model configured:   {client.model}")
-    print(f"Registered tools ({len(registry.list_tools())}):")
+    print(f"Registered tools ({len(registry.list_tools()):}):")
     for name in registry.list_tools():
         print(f"  • {name}")
     sys.exit(0 if reachable else 1)
@@ -785,9 +785,6 @@ def main():
     args = parse_args()
     _suppress_windows_proactor_resource_warnings()
 
-    # -- Start background REST API server -----------------------------------
-    _start_api_background()
-
     # -- Load and patch configuration -----------------------------------
     try:
         cfg = load_config(args.config)
@@ -804,6 +801,10 @@ def main():
 
     apply_cli_overrides(cfg, args)
     setup_logging(cfg, verbose=args.verbose)
+
+    # -- Start background REST API server (after logging is configured) ---
+    _start_api_background()
+
     asyncio.run(validate_and_configure(cfg, args.config))
 
     # -- Build components -----------------------------------------------
