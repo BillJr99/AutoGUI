@@ -118,7 +118,10 @@ class OpenWebUIClient:
 
         if not self.model:
             try:
-                models = await self.fetch_models()
+                # Prefer models that OpenWebUI reports as tools-capable so that
+                # the tool-calling pipeline doesn't crash on a model whose
+                # function-calling template is unconfigured (null).
+                models = await self.fetch_models(prefer_tools_capable=bool(tools))
                 if models:
                     self.model = models[0]
                     logger.info(
@@ -161,8 +164,12 @@ class OpenWebUIClient:
         }
         if tools:
             payload["tools"] = tools
-            # "auto" lets the model decide when to call tools vs. reply directly.
-            payload["tool_choice"] = "auto"
+            # Intentionally omit tool_choice so OpenWebUI uses its default
+            # behaviour.  Explicitly sending tool_choice="auto" triggers a
+            # template-processing code path in some OpenWebUI versions that
+            # crashes with AttributeError when the model's function-calling
+            # template is not configured (null).  Omitting it is equivalent
+            # per the OpenAI spec (defaults to "auto" when tools are present).
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -188,6 +195,24 @@ class OpenWebUIClient:
                     raw = await resp.text()
                     if resp.status != 200:
                         import sys
+                        # Diagnose the specific OpenWebUI tool-calling bug so
+                        # the user knows what to fix in their OpenWebUI config.
+                        detail = ""
+                        try:
+                            detail = json.loads(raw).get("detail", "")
+                        except Exception:
+                            pass
+                        if "startswith" in detail or "NoneType" in detail:
+                            logger.error(
+                                "[client.py:chat] OpenWebUI returned HTTP %d with '%s'. "
+                                "This usually means the model %r does not have tool-calling "
+                                "configured in OpenWebUI (null function-calling template). "
+                                "Fix: in OpenWebUI Admin > Models > %r, enable 'Tools' "
+                                "under Capabilities, or set a non-empty function-calling "
+                                "template. Alternatively set 'openwebui.model' in "
+                                "AutoGUI's config.json to a model that supports tool calling.",
+                                resp.status, detail, self.model, self.model,
+                            )
                         msg = (
                             f"\n========== OpenWebUI HTTP {resp.status} ==========\n"
                             f"endpoint: {self._endpoint}\n"
@@ -206,9 +231,6 @@ class OpenWebUIClient:
                             self.model,
                             raw,
                         )
-                        # Tag auth failures so callers can detect them
-                        # programmatically (e.g. fast-client → primary
-                        # auto-demote without needing to grep error text).
                         err = RuntimeError(
                             f"[client.py:chat] API returned HTTP {resp.status}: {raw[:500]}"
                         )
@@ -278,14 +300,19 @@ class OpenWebUIClient:
         """
         return message.get("content") or ""
 
-    async def fetch_models(self) -> list[str]:
+    async def fetch_models(self, prefer_tools_capable: bool = False) -> list[str]:
         """
         Fetch the list of available model IDs from /api/models.
+
+        When ``prefer_tools_capable`` is True, models that OpenWebUI reports
+        as having tool-calling capability (``info.meta.capabilities.tools``)
+        are sorted to the front.  Models with no capability metadata are kept
+        in the list but deprioritised.
 
         Returns
         -------
         list[str]
-            Sorted list of model ID strings.
+            Sorted list of model ID strings (tools-capable first when requested).
 
         Raises
         ------
@@ -315,12 +342,21 @@ class OpenWebUIClient:
                             f"Unexpected HTTP {resp.status} from {url}"
                         )
                     data = await resp.json(content_type=None)
-                    models = [
-                        item["id"]
-                        for item in data.get("data", [])
-                        if item.get("id")
-                    ]
-                    return sorted(models)
+                    items = [item for item in data.get("data", []) if item.get("id")]
+                    if prefer_tools_capable:
+                        # Sort models that declare tools capability first.
+                        # Models without the capability field are kept (they may
+                        # still work) but placed after known-capable ones.
+                        def _tools_key(item: dict) -> int:
+                            caps = (
+                                (item.get("info") or {})
+                                .get("meta") or {}
+                            ).get("capabilities") or {}
+                            return 0 if caps.get("tools") else 1
+                        items = sorted(items, key=_tools_key)
+                    else:
+                        items = sorted(items, key=lambda x: x["id"])
+                    return [item["id"] for item in items]
         except (PermissionError, RuntimeError):
             raise
         except Exception as e:
