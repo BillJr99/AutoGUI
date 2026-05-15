@@ -26,8 +26,10 @@ AUTOGUI_CONFIG      Path to config.json (default: ``config.json``).
                     An empty string is treated as "no config file".
 AUTOGUI_DRY_RUN     ``true`` forces all tasks through DryRunAgent.
 AUTOGUI_API_PORT    Listening port (default: ``8002``).
-AUTOGUI_API_HOST    Bind address (default: ``127.0.0.1``).
-                    Set to ``0.0.0.0`` only in trusted network environments.
+AUTOGUI_API_HOST    Bind address (default: ``0.0.0.0``).
+                    The default binds on all interfaces for sandbox/
+                    container testing — set ``AUTOGUI_API_HOST=127.0.0.1``
+                    for local-only use.  The API has no authentication.
 OPENWEBUI_BASE_URL  OpenWebUI base URL when no config file is present.
 OPENWEBUI_API_KEY   API key when no config file is present.
 OPENWEBUI_MODEL     Model name when no config file is present.
@@ -79,6 +81,25 @@ CONFIG_PATH: Optional[Path] = Path(_config_env) if _config_env else None
 DRY_RUN: bool = os.environ.get("AUTOGUI_DRY_RUN", "false").lower() == "true"
 API_VERSION = "1.0.0"
 _START_TIME = time.monotonic()
+
+# ---------------------------------------------------------------------------
+# Default bind host/port — shared with main.py's background launcher.
+# Environment overrides take precedence; main.py imports these names so the
+# CLI launcher does not duplicate the defaults.
+# ---------------------------------------------------------------------------
+
+DEFAULT_API_HOST = "0.0.0.0"
+DEFAULT_API_PORT = 8002
+
+
+def get_api_host() -> str:
+    """Return the effective bind host, honouring ``AUTOGUI_API_HOST``."""
+    return os.environ.get("AUTOGUI_API_HOST", DEFAULT_API_HOST)
+
+
+def get_api_port() -> int:
+    """Return the effective listening port, honouring ``AUTOGUI_API_PORT``."""
+    return int(os.environ.get("AUTOGUI_API_PORT", str(DEFAULT_API_PORT)))
 
 
 def _load_config() -> dict:
@@ -572,9 +593,10 @@ async def approve_task(task_id: str):
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("AUTOGUI_API_PORT", "8002"))
-    # Default to localhost; set AUTOGUI_API_HOST=0.0.0.0 only in trusted network
-    # environments — the API has no authentication.
-    host = os.environ.get("AUTOGUI_API_HOST", "127.0.0.1")
+    port = get_api_port()
+    # Default binds on all interfaces (0.0.0.0) for sandbox/container testing.
+    # Set AUTOGUI_API_HOST=127.0.0.1 for local-only use — the API has no
+    # authentication and should not be exposed to untrusted networks.
+    host = get_api_host()
     logger.info("Starting AutoGUI REST API on %s:%d (dry_run=%s)", host, port, DRY_RUN)
     uvicorn.run(app, host=host, port=port)
