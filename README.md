@@ -18,6 +18,19 @@ works out of the box.
 The Pi extension is decoupled from OpenWebUI. It uses whatever model/provider Pi
 is configured to use and exposes desktop tools plus `/autogui`.
 
+> **⚠ Experimental Software — Use in a Sandbox**
+>
+> AutoGUI is a research prototype. It is **not** intended for, nor evaluated or deemed
+> suitable for, any particular production use or critical workload. No warranty is
+> provided, express or implied.
+>
+> The agent operates at OS level: it can run shell commands, click anything, type
+> anywhere, read and write files, and take screenshots. **Run AutoGUI only in a
+> sandbox, VM, or container that you are willing to reset.** Restrict the REST API
+> to loopback (`AUTOGUI_API_HOST=127.0.0.1`) and consider disabling shell access
+> (`"allowed_shell": false`) if you do not fully trust the task or the model driving
+> it. See the [Security Notes](#security-notes) section for further guidance.
+
 ---
 
 ## Features
@@ -564,7 +577,7 @@ with `skill_save`, listed with `skill_list`, replayed with `skill_run`
 allowed:
 
 | `skills_enabled` | `skill_list` | `skill_run` | `skill_save` | Candidate suggestion at task start |
-|------------------|--------------|-------------|--------------|---------------------------------|
+|------------------|--------------|-------------|--------------|-----------------------------|
 | `false` (default) | ✓ | ✓ | — (not registered) | ✓ |
 | `true`            | ✓ | ✓ | ✓ | ✓ |
 
