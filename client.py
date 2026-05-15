@@ -175,15 +175,16 @@ class OpenWebUIClient:
                 ) as resp:
                     raw = await resp.text()
                     if resp.status != 200:
-                        # Log the full body so the model name and response are
-                        # visible even when the error is caught and re-logged
-                        # with a short message upstream.
+                        print(
+                            f"[client.py:chat] HTTP {resp.status} | model={self.model!r}"
+                            f"\n--- response body ---\n{raw}\n--- end body ---"
+                        )
                         logger.warning(
                             "[client.py:chat] HTTP %d from %s | model=%r | body=%s",
                             resp.status,
                             self._endpoint,
                             self.model,
-                            raw[:1000],
+                            raw,
                         )
                         # Tag auth failures so callers can detect them
                         # programmatically (e.g. fast-client → primary
