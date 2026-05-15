@@ -138,9 +138,21 @@ class OpenWebUIClient:
                     "Set 'openwebui.model' in config.json or the OPENWEBUI_MODEL env var."
                 ) from exc
 
+        # OpenWebUI's pipeline code calls .startswith() on message["content"]
+        # without guarding against null.  When the LLM returns tool_calls,
+        # content is legitimately null per the OpenAI spec, but sending it
+        # as-is causes OpenWebUI to raise AttributeError and return HTTP 400.
+        # Coerce null content to "" on outbound messages so OpenWebUI sees a
+        # valid string — the empty string is semantically equivalent here.
+        sanitized: list[dict] = []
+        for m in messages:
+            if m.get("content") is None:
+                m = {**m, "content": ""}
+            sanitized.append(m)
+
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": sanitized,
             "temperature": (
                 self.temperature if temperature is None else float(temperature)
             ),
