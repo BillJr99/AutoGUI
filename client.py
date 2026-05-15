@@ -155,18 +155,22 @@ class OpenWebUIClient:
                         import sys
                         detail = ""
                         try:
-                            detail = json.loads(raw).get("detail", "")
+                            # .get("detail") may return None, dict, or list depending
+                            # on the error format; normalize to str to avoid TypeError.
+                            detail = str(json.loads(raw).get("detail") or "")
                         except Exception:
                             pass
-                        if "startswith" in detail or "NoneType" in detail:
+                        if resp.status == 400 and (
+                            "startswith" in detail or "NoneType" in detail
+                        ):
                             logger.error(
-                                "[client.py:chat] OpenWebUI returned HTTP %d: '%s'. "
+                                "[client.py:chat] OpenWebUI returned HTTP 400: '%s'. "
                                 "The model %r does not have tool-calling configured in "
                                 "OpenWebUI.  Workaround: set openwebui.api_path to "
                                 "'/v1/chat/completions' and openwebui.base_url to "
                                 "'http://localhost:11434' in config.json to bypass "
                                 "OpenWebUI and call Ollama directly.",
-                                resp.status, detail, self.model,
+                                detail, self.model,
                             )
                         msg = (
                             f"\n========== HTTP {resp.status} ==========\n"
@@ -271,12 +275,14 @@ class OpenWebUIClient:
                             items = [i for i in items_raw if i.get("id")]
 
                         if prefer_tools_capable and style == "openwebui":
-                            def _tools_key(item: dict) -> int:
+                            def _tools_key(item: dict) -> tuple:
                                 caps = (
                                     (item.get("info") or {})
                                     .get("meta") or {}
                                 ).get("capabilities") or {}
-                                return 0 if caps.get("tools") else 1
+                                # Compound key: tools-capable first, then alphabetical
+                                # by id for deterministic ordering within each group.
+                                return (0 if caps.get("tools") else 1, item.get("id", ""))
                             items = sorted(items, key=_tools_key)
                         else:
                             items = sorted(items, key=lambda x: x["id"])
