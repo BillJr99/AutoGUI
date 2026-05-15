@@ -1,5 +1,4 @@
-"""
-api.py — FastAPI REST API server for AutoGUI.
+"""api.py — FastAPI REST API server for AutoGUI.
 
 Exposes the AutoGUI Agent as a network-accessible API so that external
 processes, web UIs, and automation scripts can submit desktop tasks,
@@ -259,11 +258,11 @@ def _build_agent(cfg: dict, dry_run: bool):
         return agent
     except Exception as exc:  # noqa: BLE001
         logger.warning("build_components failed (%s); falling back to env defaults", exc)
-        ow = cfg.get("openwebui", {})
+        ow = cfg.get("openwebui") or {}
         client = OpenWebUIClient(
-            base_url=ow.get("base_url", "http://localhost:3000"),
-            api_key=ow.get("api_key", ""),
-            model=ow.get("model", ""),
+            base_url=ow.get("base_url") or "http://localhost:3000",
+            api_key=ow.get("api_key") or "",
+            model=ow.get("model") or "",
         )
         registry = ToolRegistry(cfg)
         return Agent(client=client, registry=registry, cfg=cfg)
