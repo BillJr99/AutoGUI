@@ -50,7 +50,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -185,6 +185,24 @@ _TASK_HANDLES: dict[str, asyncio.Task] = {}
 
 # Maximum number of tasks to keep in TASKS before evicting completed ones.
 MAX_TASKS = 500
+
+# ---------------------------------------------------------------------------
+# TUI notification bridge
+# ---------------------------------------------------------------------------
+_tui_event_callback: Optional[Callable[[str, dict], None]] = None
+
+
+def register_tui_callback(cb: Callable[[str, dict], None]) -> None:
+    """Called by the TUI on mount to receive REST API task events."""
+    global _tui_event_callback
+    _tui_event_callback = cb
+
+
+def unregister_tui_callback() -> None:
+    """Called by the TUI on unmount."""
+    global _tui_event_callback
+    _tui_event_callback = None
+
 
 # ---------------------------------------------------------------------------
 # FastAPI application
@@ -367,6 +385,12 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
             task["steps"].append(step)
             seq += 1
 
+            if _tui_event_callback is not None:
+                try:
+                    _tui_event_callback(task_id, step)
+                except Exception:
+                    pass
+
             if event.kind == "done":
                 break
 
@@ -385,6 +409,11 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
             "data": {"exception": type(exc).__name__},
         }
         task["steps"].append(err_step)
+        if _tui_event_callback is not None:
+            try:
+                _tui_event_callback(task_id, err_step)
+            except Exception:
+                pass
         task["status"] = "error"
 
     finally:
