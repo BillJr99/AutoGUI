@@ -173,10 +173,17 @@ class ScreenRecorder:
                 return img
             except ImportError:
                 self._use_mss = False  # mss not installed; skip permanently
+                logger.info(
+                    "[screen_record] mss not installed; falling back to Pillow. "
+                    "On X11 with uneven monitors, install mss (`pip install mss`) "
+                    "for reliable multi-monitor recording.",
+                )
             except Exception as exc:
                 self._use_mss = False
-                logger.info(
-                    "[screen_record] mss capture failed (%s); trying Pillow fallback.",
+                logger.warning(
+                    "[screen_record] mss capture failed (%s); trying Pillow fallback. "
+                    "If this is an X11 multi-monitor setup with monitors of different "
+                    "heights, install/reinstall mss (`pip install --upgrade mss`).",
                     exc,
                 )
 
@@ -190,9 +197,11 @@ class ScreenRecorder:
                 self._all_screens_supported = False
             except Exception as exc:
                 self._all_screens_supported = False
-                logger.info(
-                    "[screen_record] ImageGrab.grab(all_screens=True) failed (%s); "
-                    "falling back to single-screen capture.",
+                logger.warning(
+                    "[screen_record] ImageGrab.grab(all_screens=True) failed (%s). "
+                    "This is expected on X11 with monitors at different heights "
+                    "(XGetImage BadMatch). Screen recording will use primary monitor "
+                    "only. Install mss (`pip install mss`) to fix multi-monitor support.",
                     exc,
                 )
         return ImageGrab.grab()
