@@ -1,6 +1,8 @@
 {
   "openwebui": {
     "base_url": "http://localhost:3000",
+    "_api_path_comment": "api_path selects the completions endpoint. Default '/api/chat/completions' targets OpenWebUI. To bypass OpenWebUI and call Ollama directly, set api_path to '/v1/chat/completions' and base_url to 'http://localhost:11434' (no api_key needed).",
+    "api_path": "/api/chat/completions",
     "api_key": "sk-your-openwebui-api-key-here",
     "model": "llama3.1:70b",
     "temperature": 0.2,

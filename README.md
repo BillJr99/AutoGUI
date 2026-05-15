@@ -62,7 +62,7 @@ main.py             Entry point — argparse, validation, component wiring, TUI/
 ├── config.json     Runtime configuration (URL, model, safety, logging, TUI settings)
 │
 ├── client.py       Async OpenWebUI API client (aiohttp, OpenAI-compatible)
-│   ├─ chat()           POST /api/chat/completions
+│   ├─ chat()           POST /api/chat/completions (or custom api_path)
 │   ├─ fetch_models()   GET /api/models — used for validation and model picker
 │   └─ health_check()   Connectivity probe
 │
@@ -401,6 +401,30 @@ Your API key: OpenWebUI → **Settings → Account → API Keys**.
 
 The model string must match exactly what appears in your OpenWebUI model list.
 If you leave the model wrong, startup validation will offer a menu to pick the right one.
+
+#### Bypassing OpenWebUI — connecting directly to Ollama
+
+If you prefer to skip the OpenWebUI proxy (for example, if the model you want
+isn't configured for tool-calling in OpenWebUI, or you don't have admin access
+to change that setting), set `api_path` to `/v1/chat/completions` and point
+`base_url` at your Ollama instance:
+
+```json
+{
+  "openwebui": {
+    "base_url": "http://localhost:11434",
+    "api_path": "/v1/chat/completions",
+    "api_key": "",
+    "model": "qwen3:14b"
+  }
+}
+```
+
+Ollama exposes an OpenAI-compatible completions endpoint at
+`/v1/chat/completions` that AutoGUI targets directly — no OpenWebUI
+installation required, and no API key needed.  The `openwebui` config
+section name is kept for backwards compatibility; it works for any
+OpenAI-compatible endpoint regardless of whether OpenWebUI is involved.
 
 ### Verify connectivity
 
@@ -855,12 +879,13 @@ No configuration is needed.
 ```jsonc
 {
   "openwebui": {
-    "base_url": "http://localhost:3000",   // OpenWebUI server URL
-    "api_key": "sk-...",                   // API key (Settings → Account → API Keys)
-    "model": "llama3.1:70b",              // Model ID — must match /api/models list
-    "temperature": 0.2,                   // Sampling temperature (0–1)
-    "max_tokens": 4096,                   // Max completion tokens per call
-    "timeout_seconds": 120               // Per-request timeout
+    "base_url": "http://localhost:3000",          // OpenWebUI server URL (or Ollama: http://localhost:11434)
+    "api_key": "sk-...",                          // API key (Settings → Account → API Keys); "" for Ollama
+    "model": "llama3.1:70b",                     // Model ID — must match /api/models list
+    "api_path": "/api/chat/completions",          // Completions path. Use "/v1/chat/completions" to bypass OpenWebUI and call Ollama directly
+    "temperature": 0.2,                           // Sampling temperature (0–1)
+    "max_tokens": 4096,                           // Max completion tokens per call
+    "timeout_seconds": 120                        // Per-request timeout
   },
   "install_dependencies": false,          // True = run scripts/install-dependencies.* at startup
   "agent": {
