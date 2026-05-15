@@ -160,8 +160,8 @@ class OpenWebUIClient:
             "Accept-Encoding": "gzip, deflate",
         }
 
-        logger.debug(
-            "[client.py:chat] POST %s | model=%s | messages=%d | tools=%d",
+        logger.info(
+            "[client.py:chat] POST %s | model=%r | messages=%d | tools=%d",
             self._endpoint,
             self.model,
             len(messages),
@@ -175,6 +175,16 @@ class OpenWebUIClient:
                 ) as resp:
                     raw = await resp.text()
                     if resp.status != 200:
+                        # Log the full body so the model name and response are
+                        # visible even when the error is caught and re-logged
+                        # with a short message upstream.
+                        logger.warning(
+                            "[client.py:chat] HTTP %d from %s | model=%r | body=%s",
+                            resp.status,
+                            self._endpoint,
+                            self.model,
+                            raw[:1000],
+                        )
                         # Tag auth failures so callers can detect them
                         # programmatically (e.g. fast-client → primary
                         # auto-demote without needing to grep error text).
