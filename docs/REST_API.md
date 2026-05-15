@@ -40,7 +40,7 @@ cp config.json.example config.json
 
 # 3. Start the server
 python api.py
-# Listening on http://127.0.0.1:8002
+# Starting on http://0.0.0.0:8002
 
 # 4. Submit a task
 curl -s -X POST http://localhost:8002/api/task \
@@ -68,7 +68,7 @@ curl -s http://localhost:8002/api/task/3fa85f64-...
 | `AUTOGUI_CONFIG` | `config.json` | Path to the configuration file. If the file does not exist, the agent is configured from the `OPENWEBUI_*` variables below. An empty string means "no config file" and skips file loading entirely. |
 | `AUTOGUI_DRY_RUN` | `false` | Set to `true` to force all tasks through `DryRunAgent` — no desktop is touched, no OpenWebUI call is made. Useful for testing. |
 | `AUTOGUI_API_PORT` | `8002` | TCP port the API server listens on. |
-| `AUTOGUI_API_HOST` | `127.0.0.1` | Bind address for the API server. Set to `0.0.0.0` only behind a trusted network boundary — the API has no authentication. |
+| `AUTOGUI_API_HOST` | `0.0.0.0` | Bind address for the API server. Binds to all interfaces by default (intended for sandbox/container use). Set to `127.0.0.1` to restrict to loopback — the API has no authentication. |
 | `OPENWEBUI_BASE_URL` | `http://localhost:3000` | OpenWebUI base URL (used when `config.json` is absent). |
 | `OPENWEBUI_API_KEY` | _(empty)_ | API key for OpenWebUI (used when `config.json` is absent). |
 | `OPENWEBUI_MODEL` | _(empty)_ | Model ID to use (used when `config.json` is absent). |
@@ -433,7 +433,7 @@ curl -s -X POST http://127.0.0.1:8002/api/task \
 ## Security Notes
 
 - **No authentication** is enforced. The API is designed to run inside a trusted network boundary (localhost or private LAN). Do not expose it to the public internet without adding your own auth layer (e.g. a reverse proxy with bearer tokens).
-- The default bind address is `127.0.0.1`. Set `AUTOGUI_API_HOST=0.0.0.0` only when you need to accept connections from other hosts on a trusted network — the API has no authentication.
+- The default bind address is `0.0.0.0` (all interfaces), intended for sandbox/container use. Set `AUTOGUI_API_HOST=127.0.0.1` to restrict to loopback for local development — the API has no authentication.
 - The agent operates at OS level: it can click anywhere, run shell commands, and read/write files. Only run it on machines where you accept this capability.
 - Set `allowed_shell: false` in `config.json` (or `allow.shell: false` per request) if you want to restrict shell access.
 - Restrict `config.json` permissions: `chmod 600 config.json` — it contains your API key.
