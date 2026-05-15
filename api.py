@@ -458,6 +458,8 @@ async def list_tools():
 @app.post("/api/task", status_code=202)
 async def create_task(req: TaskRequest):
     """Submit a new task.  Returns immediately with a task_id."""
+    logger.info("POST /api/task inbound body: %s", json.dumps(req.model_dump()))
+
     if not req.task.strip():
         return _err("empty_task", "The 'task' field must not be empty.")
 
