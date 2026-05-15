@@ -44,6 +44,7 @@ expose it to untrusted networks without adding your own auth layer.
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import time
 import uuid
@@ -60,10 +61,38 @@ from pydantic import BaseModel
 # Logging
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+def _setup_api_logging() -> None:
+    """Configure file + stderr logging when not already set up by main.py.
+
+    When api.py is imported by main.py the root logger already has a
+    RotatingFileHandler from setup_logging().  In that case this is a
+    no-op so we don't add duplicate handlers.  When api.py is run
+    standalone (python api.py) we set up our own file handler writing
+    to logs/api.log beside the process working directory.
+    """
+    root = logging.getLogger()
+    if any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
+        return  # already configured by main.py
+
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    root.setLevel(logging.DEBUG)
+
+    fh = logging.handlers.RotatingFileHandler(
+        log_dir / "api.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    root.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.WARNING)
+    sh.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    root.addHandler(sh)
+
+
+_setup_api_logging()
 logger = logging.getLogger("autogui.api")
 
 # ---------------------------------------------------------------------------

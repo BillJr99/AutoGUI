@@ -178,10 +178,11 @@ def build_components(cfg: dict):
         except Exception as e:
             print(f"[main] install-dependencies invocation failed: {e}")
 
-    ow_cfg = cfg.get("openwebui", {})
+    # Use `or {}` so a JSON null value is treated the same as a missing key.
+    ow_cfg = cfg.get("openwebui") or {}
     client = OpenWebUIClient(
-        base_url=ow_cfg.get("base_url", "http://localhost:3000"),
-        api_key=ow_cfg.get("api_key", ""),
+        base_url=ow_cfg.get("base_url") or "http://localhost:3000",
+        api_key=ow_cfg.get("api_key") or "",
         model=ow_cfg.get("model") or "",
         temperature=ow_cfg.get("temperature", 0.2),
         max_tokens=ow_cfg.get("max_tokens", 4096),
