@@ -59,6 +59,9 @@ class DesktopBackend:
         # Looked up by the desktop_click_mark tool when the model picks an id.
         self._last_marks: list[dict] = []
 
+        # Optional OS Screen Observer client; set via set_screen_observer().
+        self._screen_observer = None
+
     # ------------------------------------------------------------------
     # Cache control
     # ------------------------------------------------------------------
@@ -69,6 +72,18 @@ class DesktopBackend:
     def invalidate_cache(self):
         self._screenshot_cache = None
         self._windows_cache = None
+
+    # ------------------------------------------------------------------
+    # OS Screen Observer integration
+    # ------------------------------------------------------------------
+
+    def set_screen_observer(self, client) -> None:
+        """Attach an optional ScreenObserverClient for enhanced perception."""
+        self._screen_observer = client
+        logger.info(
+            "[backend] OS Screen Observer attached: %s",
+            getattr(client, "_base", "?"),
+        )
 
     # ------------------------------------------------------------------
     # Capabilities
@@ -82,8 +97,12 @@ class DesktopBackend:
         ----
         find_element     : bool — platform supports accessibility element lookup
         get_window_tree  : bool — platform supports accessibility tree dump
+        screen_observer  : bool — OS Screen Observer client is attached
         """
-        return {"find_element": False, "get_window_tree": False}
+        caps = {"find_element": False, "get_window_tree": False}
+        if self._screen_observer is not None and getattr(self._screen_observer, "enabled", False):
+            caps["screen_observer"] = True
+        return caps
 
     # ------------------------------------------------------------------
     # Display operations (pyautogui baseline)
@@ -115,7 +134,7 @@ class DesktopBackend:
                     )
                     img = ImageGrab.grab(bbox=bbox)
                 else:
-                    # all_screens=True spans all monitors on Windows (Pillow ≥ 7).
+                    # all_screens=True spans all monitors on Windows (Pillow >= 7).
                     # On Linux/macOS the kwarg may not be supported — fall back.
                     try:
                         img = ImageGrab.grab(all_screens=True)
@@ -150,11 +169,6 @@ class DesktopBackend:
                 self._screenshot_cache = (time.monotonic(), cache_key, dict(result))
             return result
         except ImportError as e:
-            # WARNING (not DEBUG) so the failure surfaces in the user's
-            # log / TUI bridge — a missing Pillow on the machine the
-            # standalone agent runs on means screenshots never save and
-            # the screenshots/ directory never gets created.  Hiding it
-            # at DEBUG made that root cause invisible.
             logger.warning("[backend:screenshot] PIL/Pillow unavailable: %s", e)
             return {"error": f"pyautogui/Pillow not installed: {e}"}
         except Exception as e:
@@ -597,6 +611,11 @@ class DesktopBackend:
     # ------------------------------------------------------------------
 
     async def list_windows(self) -> dict:
+        """List open windows; uses OS Screen Observer as fallback when available."""
+        if self._screen_observer is not None:
+            result = await self._screen_observer.get_windows()
+            if result is not None:
+                return result
         return {"error": "list_windows not implemented for this platform"}
 
     async def launch(
@@ -617,6 +636,15 @@ class DesktopBackend:
         window_title: str | None = None,
         index: int = 0,
     ) -> dict:
+        """Find element via a11y API; uses OS Screen Observer tree walk as fallback."""
+        if self._screen_observer is not None and name:
+            result = await self._screen_observer.find_element_in_tree(
+                name=str(name),
+                control_type=control_type,
+                index=int(index or 0),
+            )
+            if result is not None:
+                return result
         return {"error": "find_element not supported on this platform"}
 
     async def get_window_tree(
@@ -624,7 +652,33 @@ class DesktopBackend:
         window_title: str | None = None,
         depth: int = 3,
     ) -> dict:
+        """Dump accessibility tree; uses OS Screen Observer /api/structure as fallback."""
+        if self._screen_observer is not None:
+            result = await self._screen_observer.get_structure()
+            if result is not None:
+                return result
         return {"error": "get_window_tree not supported on this platform"}
+
+    async def describe_screen(self, window_index: int | None = None) -> dict:
+        """
+        Return a combined text description of the screen using OS Screen Observer.
+
+        Combines accessibility tree prose, OCR text, and optional VLM
+        interpretation depending on how OSScreenObserver is configured.
+        Returns an error dict if the observer is not configured or not reachable.
+        """
+        if self._screen_observer is None:
+            return {"error": "screen_observer is not configured in config.json (set screen_observer.enabled=true)"}
+        result = await self._screen_observer.get_description(window_index=window_index)
+        if result is None:
+            return {
+                "error": (
+                    "OS Screen Observer is not reachable. "
+                    "Start it with: python main.py --mode inspect "
+                    "(in the OSScreenObserver directory)"
+                )
+            }
+        return result
 
     async def activate_window(
         self,
