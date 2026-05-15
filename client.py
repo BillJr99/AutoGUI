@@ -56,9 +56,9 @@ class OpenWebUIClient:
         max_tokens: int = 4096,
         timeout_seconds: int = 120,
     ):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.model = model
+        self.base_url = (base_url or "http://localhost:3000").rstrip("/")
+        self.api_key = api_key or ""
+        self.model = model or ""
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)

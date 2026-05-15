@@ -320,9 +320,15 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
     seq = 0
 
     try:
+        # Coerce to str defensively — Pydantic should guarantee this, but
+        # guard against null config values that could propagate as None.
+        safe_task_str = str(task_str) if task_str is not None else ""
+        if not safe_task_str.strip():
+            raise ValueError("task string is empty or None")
+
         agent = _build_agent(cfg, dry_run)
 
-        async for event in agent.run(task_str):
+        async for event in agent.run(safe_task_str):
             step = {
                 "seq": seq,
                 "kind": event.kind,

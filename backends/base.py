@@ -108,6 +108,62 @@ class DesktopBackend:
     # Display operations (pyautogui baseline)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _grab_full_screen():
+        """Capture all monitors into one PIL Image.
+
+        Preference order:
+        1. mss — grabs each physical monitor individually and stitches them.
+           This avoids the X11 XGetImage BadMatch error that Pillow's
+           ImageGrab.grab(all_screens=True) raises on uneven multi-monitor
+           setups (monitors at different heights or with gaps between them).
+        2. Pillow ImageGrab(all_screens=True) — works on Windows/macOS; may
+           fail on X11 with asymmetric monitor geometry.
+        3. Pillow ImageGrab() — primary monitor only (last resort).
+        """
+        try:
+            import mss as _mss
+            from PIL import Image
+            with _mss.mss() as sct:
+                monitors = sct.monitors[1:]  # skip index 0 (virtual combined rect)
+                if not monitors:
+                    monitors = sct.monitors
+                if len(monitors) == 1:
+                    raw = sct.grab(monitors[0])
+                    return Image.frombytes("RGB", raw.size, raw.rgb)
+                left   = min(m["left"]              for m in monitors)
+                top    = min(m["top"]               for m in monitors)
+                right  = max(m["left"] + m["width"] for m in monitors)
+                bottom = max(m["top"] + m["height"] for m in monitors)
+                canvas = Image.new("RGB", (right - left, bottom - top), (0, 0, 0))
+                for monitor in monitors:
+                    raw = sct.grab(monitor)
+                    img = Image.frombytes("RGB", raw.size, raw.rgb)
+                    canvas.paste(img, (monitor["left"] - left, monitor["top"] - top))
+                return canvas
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.info(
+                "[backend] mss capture failed (%s); falling back to Pillow. "
+                "On X11 with uneven monitors this may raise XGetImage errors — "
+                "install mss (`pip install mss`) to avoid them.",
+                exc,
+            )
+        from PIL import ImageGrab
+        try:
+            return ImageGrab.grab(all_screens=True)
+        except TypeError:
+            pass
+        except Exception as exc:
+            logger.warning(
+                "[backend] ImageGrab.grab(all_screens=True) failed (%s). "
+                "This is common on X11 with monitors of different heights. "
+                "Install mss (`pip install mss`) for reliable multi-monitor support.",
+                exc,
+            )
+        return ImageGrab.grab()
+
     async def screenshot(
         self,
         region: dict | None = None,
@@ -121,7 +177,7 @@ class DesktopBackend:
             if key == cache_key and (time.monotonic() - ts) < self._cache_ttl:
                 return dict(cached, cache_hit=True)
         try:
-            from PIL import Image, ImageGrab
+            from PIL import Image, ImageGrab  # noqa: F401 (ImageGrab used by region path)
 
             loop = asyncio.get_event_loop()
 
@@ -132,22 +188,15 @@ class DesktopBackend:
                         region["x"] + region["width"],
                         region["y"] + region["height"],
                     )
-                    img = ImageGrab.grab(bbox=bbox)
-                else:
-                    # all_screens=True spans all monitors on Windows (Pillow >= 7).
-                    # On Linux/macOS the kwarg may not be supported — fall back.
-                    try:
-                        img = ImageGrab.grab(all_screens=True)
-                    except TypeError:
-                        img = ImageGrab.grab()
-                if resize_width and img.width > resize_width:
-                    ratio = resize_width / img.width
-                    img = img.resize(
-                        (resize_width, int(img.height * ratio)), Image.LANCZOS
-                    )
-                return img
+                    return ImageGrab.grab(bbox=bbox)
+                return self._grab_full_screen()
 
             img = await loop.run_in_executor(None, _capture)
+            if resize_width and img.width > resize_width:
+                ratio = resize_width / img.width
+                img = img.resize(
+                    (resize_width, int(img.height * ratio)), Image.LANCZOS
+                )
 
             save_path = Path(save_dir)
             save_path.mkdir(parents=True, exist_ok=True)
@@ -191,19 +240,13 @@ class DesktopBackend:
         Returns the same shape as screenshot() plus a "marks" list.
         """
         try:
-            from PIL import Image, ImageGrab
+            from PIL import Image
 
             from som import annotate
 
             loop = asyncio.get_event_loop()
 
-            def _capture_full() -> Image.Image:
-                try:
-                    return ImageGrab.grab(all_screens=True)
-                except TypeError:
-                    return ImageGrab.grab()
-
-            img = await loop.run_in_executor(None, _capture_full)
+            img = await loop.run_in_executor(None, self._grab_full_screen)
             full_w, full_h = img.width, img.height
 
             marks = await self.get_marks()
@@ -354,12 +397,7 @@ class DesktopBackend:
 
         loop = asyncio.get_event_loop()
         try:
-            try:
-                img = await loop.run_in_executor(
-                    None, lambda: ImageGrab.grab(all_screens=True)
-                )
-            except TypeError:
-                img = await loop.run_in_executor(None, ImageGrab.grab)
+            img = await loop.run_in_executor(None, self._grab_full_screen)
 
             data = await loop.run_in_executor(
                 None,
