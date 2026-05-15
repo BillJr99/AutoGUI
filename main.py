@@ -182,7 +182,7 @@ def build_components(cfg: dict):
     client = OpenWebUIClient(
         base_url=ow_cfg.get("base_url", "http://localhost:3000"),
         api_key=ow_cfg.get("api_key", ""),
-        model=ow_cfg.get("model", "llama3.1:70b"),
+        model=ow_cfg.get("model") or "",
         temperature=ow_cfg.get("temperature", 0.2),
         max_tokens=ow_cfg.get("max_tokens", 4096),
         timeout_seconds=ow_cfg.get("timeout_seconds", 120),
