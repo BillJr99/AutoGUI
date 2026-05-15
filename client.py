@@ -116,6 +116,12 @@ class OpenWebUIClient:
         if stream:
             raise NotImplementedError("[client.py:chat] Streaming not yet implemented.")
 
+        if not self.model:
+            raise ValueError(
+                "[client.py:chat] No model configured. "
+                "Set 'openwebui.model' in config.json or the OPENWEBUI_MODEL env var."
+            )
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
