@@ -18,12 +18,14 @@ New LLM tools (platform-dependent)
   desktop_find_element   — find a UI element by accessibility properties.
                            Supported: Windows (uiautomation), Linux X11 +
                            Wayland (AT-SPI via pyatspi), WSL (PowerShell
-                           UIAutomation).
+                           UIAutomation), or via OS Screen Observer.
   desktop_get_window_tree — dump the accessibility tree for a window.
-                           Supported: Windows.
+                           Supported: Windows, or via OS Screen Observer.
+  desktop_describe_screen — combined a11y+OCR+VLM description via OS Screen Observer.
 
 These tools are registered only when the active backend reports support for
-them via capabilities()["find_element"] / capabilities()["get_window_tree"].
+them via capabilities()["find_element"] / capabilities()["get_window_tree"] /
+capabilities()["screen_observer"].
 """
 
 import asyncio
@@ -297,6 +299,19 @@ class ToolRegistry:
         if self._tools_cfg.get("allowed_desktop", True):
             try:
                 self._backend = get_backend(self._platform_info)
+                # Attach OS Screen Observer client before querying capabilities so
+                # capabilities() can reflect its availability.
+                _oso_cfg = cfg.get("screen_observer", {})
+                if _oso_cfg.get("enabled"):
+                    try:
+                        from screen_observer_client import ScreenObserverClient as _OSO
+                        self._backend.set_screen_observer(_OSO(_oso_cfg))
+                        logger.info(
+                            "[tools.py] OS Screen Observer enabled: %s",
+                            _oso_cfg.get("base_url", "http://127.0.0.1:5001"),
+                        )
+                    except Exception as _oso_err:
+                        logger.warning("[tools.py] OS Screen Observer init failed: %s", _oso_err)
                 self._backend_caps = self._backend.capabilities()
                 logger.info("[tools.py] Backend capabilities: %s", self._backend_caps)
                 cache_ttl = self._tools_cfg.get("perception_cache_ttl_seconds", 0.5)
@@ -353,7 +368,7 @@ class ToolRegistry:
         save_dir = self._tools_cfg.get("screenshot_dir", "screenshots")
         resize_w = self._tools_cfg.get("max_screenshot_width", 1280)
 
-        # ── Shell ──────────────────────────────────────────────────────
+        # ── Shell ──────────────────────────────────────────────────────────────
         if shell_ok:
             self._register(
                 {
@@ -382,7 +397,7 @@ class ToolRegistry:
                 ),
             )
 
-        # ── Filesystem ─────────────────────────────────────────────────
+        # ── Filesystem ─────────────────────────────────────────────────────────
         if fs_ok:
             self._register(
                 {"type": "function", "function": {
@@ -421,7 +436,7 @@ class ToolRegistry:
                 fs_list,
             )
 
-        # ── Desktop tools ──────────────────────────────────────────────
+        # ── Desktop tools ──────────────────────────────────────────────────────
         if desk_ok:
             b = self._backend
 
@@ -715,8 +730,8 @@ class ToolRegistry:
                 lambda dx=0, dy=0, click=False: b.mouse_move(int(dx), int(dy), bool(click)),
             )
 
-            # ── Extended: find_element ────────────────────────────────
-            if self._backend_caps.get("find_element"):
+            # ── Extended: find_element ────────────────────────────────────
+            if self._backend_caps.get("find_element") or self._backend_caps.get("screen_observer"):
                 self._register(
                     {"type": "function", "function": {
                         "name": "desktop_find_element",
@@ -724,7 +739,8 @@ class ToolRegistry:
                             "Find a UI element by its accessibility properties (name, type). "
                             "Returns the element's name, control type, and screen rect. "
                             "Use this to locate buttons/fields by name without knowing pixel positions. "
-                            "Supported on Windows (UIAutomation), Linux (AT-SPI), and WSL."
+                            "Supported on Windows (UIAutomation), Linux (AT-SPI), WSL, "
+                            "and via OS Screen Observer when configured."
                         ),
                         "parameters": {"type": "object", "properties": {
                             "name": {"type": "string", "description": "Element name or label (partial match)."},
@@ -774,8 +790,8 @@ class ToolRegistry:
                     ),
                 )
 
-            # ── Extended: get_window_tree ─────────────────────────────
-            if self._backend_caps.get("get_window_tree"):
+            # ── Extended: get_window_tree ─────────────────────────────────
+            if self._backend_caps.get("get_window_tree") or self._backend_caps.get("screen_observer"):
                 self._register(
                     {"type": "function", "function": {
                         "name": "desktop_get_window_tree",
@@ -783,7 +799,7 @@ class ToolRegistry:
                             "Dump the accessibility element tree for a window. "
                             "Shows all UI controls, their names, types, and positions. "
                             "Use before interacting with an unfamiliar window. "
-                            "Supported on Windows and macOS."
+                            "Supported on Windows, macOS, and via OS Screen Observer when configured."
                         ),
                         "parameters": {"type": "object", "properties": {
                             "window_title": {"type": "string", "description": "Window title fragment."},
@@ -793,7 +809,30 @@ class ToolRegistry:
                     lambda window_title=None, depth=3: b.get_window_tree(window_title=window_title, depth=depth),
                 )
 
-        # ── Browser tools (Phase 9) ───────────────────────────────────
+            # ── Extended: desktop_describe_screen (OS Screen Observer) ──────
+            if self._backend_caps.get("screen_observer"):
+                self._register(
+                    {"type": "function", "function": {
+                        "name": "desktop_describe_screen",
+                        "description": (
+                            "Return a combined text description of the focused window using "
+                            "OS Screen Observer: accessibility tree prose, OCR text, and "
+                            "optional VLM interpretation. Use when a plain screenshot does "
+                            "not give enough detail about UI controls or text content. "
+                            "Requires OSScreenObserver running locally "
+                            "(python main.py --mode inspect in the OSScreenObserver directory)."
+                        ),
+                        "parameters": {"type": "object", "properties": {
+                            "window_index": {
+                                "type": "integer",
+                                "description": "Window index from desktop_list_windows. Omit for focused window.",
+                            },
+                        }},
+                    }},
+                    lambda window_index=None: b.describe_screen(window_index=window_index),
+                )
+
+        # ── Browser tools (Phase 9) ───────────────────────────────────────
         # Independent of desk_ok: a config can enable browser tools while
         # disabling desktop tools, useful for headless CI-style usage.
         if browser_ok and self._browser_backend is not None:
@@ -934,7 +973,7 @@ class ToolRegistry:
                 lambda: bb_.close(),
             )
 
-        # ── desktop_wait_for ──────────────────────────────────────────
+        # ── desktop_wait_for ────────────────────────────────────────────────
         # Available whenever a desktop backend exists, regardless of
         # which other tools the agent gates.  The polling cost is low —
         # listing windows and consulting the a11y tree at 0.5 s cadence.
