@@ -287,7 +287,7 @@ class OpenWebUIClient:
                     models = [
                         item["id"]
                         for item in data.get("data", [])
-                        if "id" in item
+                        if item.get("id")
                     ]
                     return sorted(models)
         except (PermissionError, RuntimeError):
