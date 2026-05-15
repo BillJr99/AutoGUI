@@ -276,7 +276,7 @@ class Agent:
             try:
                 self._trace.write_meta(
                     event="session_start",
-                    model=cfg.get("openwebui", {}).get("model", "?"),
+                    model=(cfg.get("openwebui") or {}).get("model") or "?",
                     vision=self._vision_screenshots,
                 )
             except Exception:
@@ -1717,9 +1717,9 @@ class Agent:
             # if the same signature recurs ``stall_threshold`` times.
             if self._watchdog is not None and tool_calls:
                 first = tool_calls[0]
-                first_name = first.get("function", {}).get("name", "")
+                first_name = (first.get("function") or {}).get("name") or ""
                 try:
-                    first_args = json.loads(first.get("function", {}).get("arguments") or "{}")
+                    first_args = json.loads((first.get("function") or {}).get("arguments") or "{}")
                 except json.JSONDecodeError:
                     first_args = {}
                 wd_state = await self._snapshot_watchdog_state()
@@ -1747,10 +1747,10 @@ class Agent:
             # Dispatch each tool call.
             step_failure_seen = False
             for tc in tool_calls:
-                tool_name = tc.get("function", {}).get("name", "")
+                tool_name = (tc.get("function") or {}).get("name") or ""
                 call_id = tc.get("id", "")
                 try:
-                    args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+                    args = json.loads((tc.get("function") or {}).get("arguments") or "{}")
                 except json.JSONDecodeError:
                     args = {}
                 result_json = await self._registry.dispatch(tool_name, args)
@@ -1814,7 +1814,7 @@ class Agent:
             # already in local_history) and when none of the called
             # tools were state-changing (read-only steps don't need a
             # post-action screenshot).
-            called_names = {tc.get("function", {}).get("name", "") for tc in tool_calls}
+            called_names = {(tc.get("function") or {}).get("name") or "" for tc in tool_calls}
             state_changing = {
                 n for n in called_names
                 if n.startswith("desktop_")
@@ -2425,7 +2425,7 @@ class Agent:
             # desktop action.  Skipped otherwise to avoid wasting a wmctrl call.
             pre_windows = None
             tool_names_pending = {
-                tc.get("function", {}).get("name", "") for tc in tool_calls
+                (tc.get("function") or {}).get("name") or "" for tc in tool_calls
             }
             if (
                 any(n.startswith("desktop_") and n not in (
@@ -2444,9 +2444,9 @@ class Agent:
                     pre_windows = None
 
             for tc in tool_calls:
-                tool_name = tc.get("function", {}).get("name", "unknown")
+                tool_name = (tc.get("function") or {}).get("name") or "unknown"
                 call_id = tc.get("id", "")
-                raw_args = tc.get("function", {}).get("arguments", "{}")
+                raw_args = (tc.get("function") or {}).get("arguments") or "{}"
 
                 # Parse the arguments JSON string emitted by the model.
                 try:
@@ -2703,7 +2703,7 @@ class Agent:
             # skill_run replays desktop actions internally so it also triggers
             # the verify pass — otherwise the model never sees whether typing
             # actually appeared in the target window.
-            called_names = {tc.get("function", {}).get("name", "") for tc in tool_calls}
+            called_names = {(tc.get("function") or {}).get("name") or "" for tc in tool_calls}
             desktop_actions_taken = {
                 n for n in called_names
                 if n.startswith("desktop_")
