@@ -119,5 +119,11 @@
     "allowed_apps": [],
     "blocked_window_titles": [],
     "fs_write_snapshot_dir": ""
+  },
+  "screen_observer": {
+    "_comment": "Optional integration with OS Screen Observer (github.com/BillJr99/OSScreenObserver). When enabled=true AutoGUI probes the server and uses it as a fallback/enhancement for window listing, accessibility tree access (find_element, get_window_tree), and a new describe_screen capability — all with graceful degradation if the server is not reachable. Start OSScreenObserver with: python main.py --mode inspect",
+    "enabled": false,
+    "base_url": "http://127.0.0.1:5001",
+    "timeout_seconds": 2.0
   }
 }
