@@ -23,6 +23,11 @@ Design
 - `flush()` writes a GIF.  GIF was chosen over MP4 because no ffmpeg
   dependency is required; Pillow can write animated GIFs natively.
 - The recorder is a singleton attached to the agent at construction.
+- If the underlying ``ImageGrab`` call fails repeatedly (e.g. an X11
+  ``BadMatch`` when ``all_screens=True`` overflows the root window
+  geometry), the loop self-disables instead of spamming the log every
+  ``1/fps`` seconds.  A single warning is logged that points at the
+  config knob to suppress it permanently.
 """
 
 from __future__ import annotations
@@ -35,6 +40,13 @@ from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# After this many consecutive capture failures the loop gives up and exits.
+# Set high enough to ride out a transient glitch (e.g. the screen blanking
+# briefly) but low enough that a misconfigured X11 session does not spam the
+# debug log for the entire session.
+_MAX_CONSECUTIVE_FAILURES = 5
 
 
 class ScreenRecorder:
@@ -57,6 +69,11 @@ class ScreenRecorder:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._capture_available = self._check_capture()
+        # Sticky flag: once we drop ``all_screens=True`` because it raised a
+        # non-TypeError exception (e.g. X11 BadMatch on a multi-monitor setup
+        # where the virtual root extends past any real screen), don't try it
+        # again for the rest of the session.
+        self._all_screens_supported = True
 
     @staticmethod
     def _check_capture() -> bool:
@@ -96,16 +113,44 @@ class ScreenRecorder:
     # Capture
     # ------------------------------------------------------------------
 
+    def _grab_once(self):
+        """Single capture attempt with a multi-screen → single-screen fallback.
+
+        ``ImageGrab.grab(all_screens=True)`` is the right call on most
+        multi-monitor setups but can raise X11 ``BadMatch`` when the
+        virtual root has an awkward geometry (e.g. one monitor is taller
+        than the other and Xinerama's bounding rect extends past either
+        real screen).  When that happens we permanently drop the kwarg
+        for the rest of the session and retry without it.
+        """
+        from PIL import ImageGrab
+        if self._all_screens_supported:
+            try:
+                return ImageGrab.grab(all_screens=True)
+            except TypeError:
+                # Old Pillow without the kwarg.  Permanent fallback.
+                self._all_screens_supported = False
+            except Exception as exc:
+                # Could be an X11 BadMatch ("X get_image failed error 8 …")
+                # or any other backend-specific failure.  Try once more
+                # without ``all_screens`` and remember the failure for
+                # next time so we don't pay this cost every frame.
+                self._all_screens_supported = False
+                logger.info(
+                    "[screen_record] ImageGrab.grab(all_screens=True) failed (%s); "
+                    "falling back to single-screen capture for the rest of the session.",
+                    exc,
+                )
+        return ImageGrab.grab()
+
     def _capture_loop(self):
-        from PIL import ImageGrab, Image
+        from PIL import Image
         interval = 1.0 / self.fps
         next_tick = time.monotonic()
+        consecutive_failures = 0
         while not self._stop.is_set():
             try:
-                try:
-                    img = ImageGrab.grab(all_screens=True)
-                except TypeError:
-                    img = ImageGrab.grab()
+                img = self._grab_once()
                 if self.max_width and img.width > self.max_width:
                     ratio = self.max_width / img.width
                     img = img.resize(
@@ -114,8 +159,28 @@ class ScreenRecorder:
                     )
                 with self._frames_lock:
                     self._frames.append((time.monotonic(), img))
+                consecutive_failures = 0
             except Exception as e:
-                logger.debug("[screen_record] capture failed: %s", e)
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    logger.warning(
+                        "[screen_record] capture failed (%s); will retry %d more time(s) "
+                        "before disabling the recorder. Set "
+                        "agent.screen_record.enabled=false in config.json to suppress.",
+                        e,
+                        _MAX_CONSECUTIVE_FAILURES - 1,
+                    )
+                else:
+                    logger.debug("[screen_record] capture failed: %s", e)
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(
+                        "[screen_record] %d consecutive capture failures; "
+                        "stopping the screen recorder for this session. "
+                        "Set agent.screen_record.enabled=false in config.json "
+                        "to skip recorder startup entirely.",
+                        consecutive_failures,
+                    )
+                    return
 
             next_tick += interval
             sleep_for = next_tick - time.monotonic()
