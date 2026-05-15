@@ -10,6 +10,7 @@ bypass OpenWebUI entirely and hit Ollama's native OpenAI-compatible endpoint.
 import json
 import logging
 import traceback
+import uuid
 from typing import Any
 
 import aiohttp
@@ -62,6 +63,9 @@ class OpenWebUIClient:
         self.max_tokens = max_tokens
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._endpoint = f"{self.base_url}{self.api_path}"
+        # Stable session ID sent as chat_id — OpenWebUI v0.9.5+ requires this
+        # field in every /api/chat/completions request; absent = NoneType crash.
+        self._chat_id = str(uuid.uuid4())
 
     # ------------------------------------------------------------------
     # Primary interface
@@ -116,6 +120,9 @@ class OpenWebUIClient:
             ),
             "max_tokens": self.max_tokens,
             "stream": False,
+            # OpenWebUI v0.9.5+ crashes with NoneType.startswith when chat_id
+            # is absent from /api/chat/completions requests (issue #24550).
+            "chat_id": self._chat_id,
         }
         if tools:
             payload["tools"] = tools
