@@ -441,6 +441,14 @@ class AgentTUI(App):
         # subsequent library warning (urllib3 retry, pyautogui fail-safe,
         # etc.) should land in the conversation pane, not stderr.
         self._install_log_handler()
+
+        # Register TUI callback so REST API tasks display progress here.
+        try:
+            from api import register_tui_callback
+            register_tui_callback(self._on_api_task_event)
+        except ImportError:
+            pass
+
         log = self.query_one("#conversation", RichLog)
         model = self._cfg.get("openwebui", {}).get("model", "unknown")
         vision = self._agent._vision_screenshots
@@ -837,6 +845,11 @@ class AgentTUI(App):
         (Ctrl+C, action_quit, parent app exit, exception during teardown).
         Belt-and-suspenders cleanup so we never leave the process with
         a TUI log handler that points at a destroyed RichLog widget."""
+        try:
+            from api import unregister_tui_callback
+            unregister_tui_callback()
+        except ImportError:
+            pass
         self._uninstall_log_handler()
 
     # ------------------------------------------------------------------
@@ -860,3 +873,46 @@ class AgentTUI(App):
 
     def _update_status(self, text: str) -> None:
         self.status_text = text
+
+    # ------------------------------------------------------------------
+    # REST API task event display
+    # ------------------------------------------------------------------
+
+    def _on_api_task_event(self, task_id: str, step: dict) -> None:
+        """Called from the REST API thread when a background task emits an event."""
+        try:
+            self.call_from_thread(self._display_api_task_event, task_id, step)
+        except Exception:
+            pass
+
+    def _display_api_task_event(self, task_id: str, step: dict) -> None:
+        """Render a REST API task event in the conversation pane (runs on TUI thread)."""
+        try:
+            log = self.query_one("#conversation", RichLog)
+            kind = step.get("kind", "")
+            content = step.get("content", "")
+            seq = step.get("seq", -1)
+            short_id = task_id[:8]
+
+            if seq == 0:
+                log.write(f"\n[bold cyan]⟳ API task [{short_id}…]:[/bold cyan]")
+
+            if kind == "plan":
+                log.write(f"[cyan]  Plan: {content}[/cyan]")
+            elif kind == "text":
+                log.write(f"[white]  Agent: {content}[/white]")
+            elif kind == "tool_call" and self.show_tools:
+                log.write(f"[yellow]  ⚙ {content}[/yellow]")
+            elif kind == "tool_result" and self.show_tools:
+                log.write(f"[dim green]  ✓ {content}[/dim green]")
+            elif kind == "error":
+                log.write(f"[red]  ✗ ERROR: {content}[/red]")
+                self._update_status("API task error")
+            elif kind == "done":
+                data = step.get("data") or {}
+                iters = data.get("iterations", "?")
+                reason = data.get("finish_reason", "done")
+                log.write(f"[dim]  ─── API task done ({reason}, {iters} iterations) ───[/dim]")
+                self._update_status("Ready")
+        except Exception:
+            pass
