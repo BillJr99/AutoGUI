@@ -1,20 +1,10 @@
 """
-client.py — Async OpenWebUI API client.
+client.py — Async OpenWebUI / Ollama API client.
 
-OpenWebUI exposes an OpenAI-compatible REST API at:
-  POST {base_url}/api/chat/completions
-
-Authentication uses a Bearer token derived from the OpenWebUI API key
-(generated under Settings → Account → API Keys in the OpenWebUI UI).
-
-Tool calling follows the OpenAI function-calling schema:
-  - Request includes a `tools` list (JSON Schema descriptors).
-  - Response may contain `tool_calls` in the assistant message.
-  - The caller appends tool results as role="tool" messages and re-invokes.
-
-This module is intentionally framework-agnostic: it returns raw dicts so
-that agent.py can manage message history and dispatch without coupling to
-any particular HTTP library abstraction.
+Supports both OpenWebUI (POST {base_url}/api/chat/completions) and direct
+Ollama access (POST {base_url}/v1/chat/completions) via the ``api_path``
+config key.  Set ``api_path`` to ``/v1/chat/completions`` in config.json to
+bypass OpenWebUI entirely and hit Ollama's native OpenAI-compatible endpoint.
 """
 
 import json
@@ -26,25 +16,32 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_API_PATH = "/api/chat/completions"
+
 
 class OpenWebUIClient:
     """
-    Thin async wrapper around the OpenWebUI /api/chat/completions endpoint.
+    Thin async wrapper around an OpenAI-compatible chat completions endpoint.
 
     Parameters
     ----------
     base_url : str
-        Root URL of the OpenWebUI instance, e.g. "http://localhost:3000".
+        Root URL, e.g. "http://localhost:3000" (OpenWebUI) or
+        "http://localhost:11434" (Ollama).
     api_key : str
-        Bearer token for authentication.
+        Bearer token.  Pass "" for Ollama (no auth required).
     model : str
-        Model identifier as registered in OpenWebUI (e.g. "llama3.1:70b").
+        Model identifier, e.g. "qwen3:14b".
+    api_path : str
+        Path appended to base_url for completions.
+        Default "/api/chat/completions" (OpenWebUI).
+        Use "/v1/chat/completions" to talk directly to Ollama.
     temperature : float
         Sampling temperature passed to the model.
     max_tokens : int
         Maximum completion tokens per request.
     timeout_seconds : int
-        Per-request timeout; prevents indefinite hangs on slow inference.
+        Per-request timeout.
     """
 
     def __init__(
@@ -52,6 +49,7 @@ class OpenWebUIClient:
         base_url: str,
         api_key: str,
         model: str,
+        api_path: str = _DEFAULT_API_PATH,
         temperature: float = 0.2,
         max_tokens: int = 4096,
         timeout_seconds: int = 120,
@@ -59,10 +57,11 @@ class OpenWebUIClient:
         self.base_url = (base_url or "http://localhost:3000").rstrip("/")
         self.api_key = api_key or ""
         self.model = model or ""
+        self.api_path = api_path or _DEFAULT_API_PATH
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        self._endpoint = f"{self.base_url}/api/chat/completions"
+        self._endpoint = f"{self.base_url}{self.api_path}"
 
     # ------------------------------------------------------------------
     # Primary interface
@@ -75,78 +74,34 @@ class OpenWebUIClient:
         stream: bool = False,
         temperature: float | None = None,
     ) -> dict:
-        """
-        Send a chat completion request and return the parsed JSON response.
-
-        Parameters
-        ----------
-        messages : list[dict]
-            Full conversation history in OpenAI message format.
-            Each message is {"role": ..., "content": ...} with optional
-            "tool_calls" or "tool_call_id" fields as required by the protocol.
-        tools : list[dict] or None
-            Tool descriptors in OpenAI function-calling JSON Schema format.
-            Pass None to disable tool calling for this request.
-        stream : bool
-            Streaming is not yet implemented; must be False.
-
-        Returns
-        -------
-        dict
-            Raw parsed JSON response from the API, containing at minimum:
-            {
-              "choices": [
-                {
-                  "message": {
-                    "role": "assistant",
-                    "content": "...",          # may be None if tool_calls present
-                    "tool_calls": [...]        # present when model invokes tools
-                  },
-                  "finish_reason": "stop" | "tool_calls" | "length"
-                }
-              ],
-              "usage": {"prompt_tokens": N, "completion_tokens": M, "total_tokens": K}
-            }
-
-        Raises
-        ------
-        RuntimeError
-            If the HTTP response is not 2xx or JSON parsing fails.
-        """
+        """Send a chat completion request and return the parsed JSON response."""
         if stream:
             raise NotImplementedError("[client.py:chat] Streaming not yet implemented.")
 
         if not self.model:
             try:
-                # Prefer models that OpenWebUI reports as tools-capable so that
-                # the tool-calling pipeline doesn't crash on a model whose
-                # function-calling template is unconfigured (null).
                 models = await self.fetch_models(prefer_tools_capable=bool(tools))
                 if models:
                     self.model = models[0]
                     logger.info(
-                        "[client.py:chat] No model configured; auto-selected %r from OpenWebUI.",
+                        "[client.py:chat] No model configured; auto-selected %r.",
                         self.model,
                     )
                 else:
                     raise ValueError(
-                        "[client.py:chat] No model configured and OpenWebUI returned no models. "
-                        "Set 'openwebui.model' in config.json or the OPENWEBUI_MODEL env var."
+                        "[client.py:chat] No model configured and endpoint returned no models. "
+                        "Set 'openwebui.model' in config.json."
                     )
             except ValueError:
                 raise
             except Exception as exc:
                 raise ValueError(
-                    f"[client.py:chat] No model configured and could not auto-fetch from OpenWebUI: {exc}. "
-                    "Set 'openwebui.model' in config.json or the OPENWEBUI_MODEL env var."
+                    f"[client.py:chat] No model configured and could not auto-fetch: {exc}. "
+                    "Set 'openwebui.model' in config.json."
                 ) from exc
 
-        # OpenWebUI's pipeline code calls .startswith() on message["content"]
-        # without guarding against null.  When the LLM returns tool_calls,
-        # content is legitimately null per the OpenAI spec, but sending it
-        # as-is causes OpenWebUI to raise AttributeError and return HTTP 400.
-        # Coerce null content to "" on outbound messages so OpenWebUI sees a
-        # valid string — the empty string is semantically equivalent here.
+        # Coerce null content to "" — some pipeline code calls .startswith()
+        # on message["content"] without guarding against null.
         sanitized: list[dict] = []
         for m in messages:
             if m.get("content") is None:
@@ -164,20 +119,16 @@ class OpenWebUIClient:
         }
         if tools:
             payload["tools"] = tools
-            # Intentionally omit tool_choice so OpenWebUI uses its default
-            # behaviour.  Explicitly sending tool_choice="auto" triggers a
-            # template-processing code path in some OpenWebUI versions that
-            # crashes with AttributeError when the model's function-calling
-            # template is not configured (null).  Omitting it is equivalent
-            # per the OpenAI spec (defaults to "auto" when tools are present).
+            # Omit tool_choice — some OpenWebUI versions crash when tool_choice
+            # is set explicitly and the model's FC template is null.  Omitting
+            # it is spec-equivalent (defaults to "auto" when tools are present).
 
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            # Exclude brotli: aiohttp may advertise 'br' but can't decode it
-            # without the optional brotli/brotlipy package installed.
             "Accept-Encoding": "gzip, deflate",
         }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         logger.info(
             "[client.py:chat] POST %s | model=%r | messages=%d | tools=%d",
@@ -195,8 +146,6 @@ class OpenWebUIClient:
                     raw = await resp.text()
                     if resp.status != 200:
                         import sys
-                        # Diagnose the specific OpenWebUI tool-calling bug so
-                        # the user knows what to fix in their OpenWebUI config.
                         detail = ""
                         try:
                             detail = json.loads(raw).get("detail", "")
@@ -204,32 +153,26 @@ class OpenWebUIClient:
                             pass
                         if "startswith" in detail or "NoneType" in detail:
                             logger.error(
-                                "[client.py:chat] OpenWebUI returned HTTP %d with '%s'. "
-                                "This usually means the model %r does not have tool-calling "
-                                "configured in OpenWebUI (null function-calling template). "
-                                "Fix: in OpenWebUI Admin > Models > %r, enable 'Tools' "
-                                "under Capabilities, or set a non-empty function-calling "
-                                "template. Alternatively set 'openwebui.model' in "
-                                "AutoGUI's config.json to a model that supports tool calling.",
-                                resp.status, detail, self.model, self.model,
+                                "[client.py:chat] OpenWebUI returned HTTP %d: '%s'. "
+                                "The model %r does not have tool-calling configured in "
+                                "OpenWebUI.  Workaround: set openwebui.api_path to "
+                                "'/v1/chat/completions' and openwebui.base_url to "
+                                "'http://localhost:11434' in config.json to bypass "
+                                "OpenWebUI and call Ollama directly.",
+                                resp.status, detail, self.model,
                             )
                         msg = (
-                            f"\n========== OpenWebUI HTTP {resp.status} ==========\n"
+                            f"\n========== HTTP {resp.status} ==========\n"
                             f"endpoint: {self._endpoint}\n"
                             f"model:    {self.model!r}\n"
-                            f"--- response body ({len(raw)} bytes) ---\n"
-                            f"{raw}\n"
-                            f"--- end body ---\n"
-                            f"==================================================\n"
+                            f"--- response body ---\n{raw}\n"
+                            f"=====================================\n"
                         )
                         print(msg, flush=True)
                         print(msg, file=sys.stderr, flush=True)
                         logger.error(
                             "[client.py:chat] HTTP %d from %s | model=%r | body=%s",
-                            resp.status,
-                            self._endpoint,
-                            self.model,
-                            raw,
+                            resp.status, self._endpoint, self.model, raw,
                         )
                         err = RuntimeError(
                             f"[client.py:chat] API returned HTTP {resp.status}: {raw[:500]}"
@@ -262,12 +205,6 @@ class OpenWebUIClient:
 
     @staticmethod
     def extract_message(response: dict) -> dict:
-        """
-        Pull the assistant message dict from a chat completion response.
-
-        Returns the full message object, which may have both `content` (str | None)
-        and `tool_calls` (list | None) fields depending on finish_reason.
-        """
         try:
             return response["choices"][0]["message"]
         except (KeyError, IndexError) as e:
@@ -279,96 +216,76 @@ class OpenWebUIClient:
 
     @staticmethod
     def extract_tool_calls(message: dict) -> list[dict]:
-        """
-        Return the list of tool_call objects from an assistant message, or []
-        if the message contains a direct text reply instead.
-
-        Each tool_call has the shape:
-          {
-            "id": "call_abc123",
-            "type": "function",
-            "function": {"name": "tool_name", "arguments": "{...json string...}"}
-          }
-        """
         return message.get("tool_calls") or []
 
     @staticmethod
     def extract_text(message: dict) -> str:
-        """
-        Return the text content of an assistant message, or "" if the message
-        is a pure tool-call response (content is None or absent).
-        """
         return message.get("content") or ""
 
     async def fetch_models(self, prefer_tools_capable: bool = False) -> list[str]:
         """
-        Fetch the list of available model IDs from /api/models.
-
-        When ``prefer_tools_capable`` is True, models that OpenWebUI reports
-        as having tool-calling capability (``info.meta.capabilities.tools``)
-        are sorted to the front.  Models with no capability metadata are kept
-        in the list but deprioritised.
-
-        Returns
-        -------
-        list[str]
-            Sorted list of model ID strings (tools-capable first when requested).
-
-        Raises
-        ------
-        PermissionError
-            HTTP 401 — the API key is invalid or missing.
-        ConnectionError
-            Network-level failure (server unreachable, DNS, timeout, etc.).
-        RuntimeError
-            Any other non-200 HTTP status.
+        Fetch available model IDs.  Works with both OpenWebUI (/api/models)
+        and Ollama (/api/tags or /v1/models).
         """
-        url = f"{self.base_url}/api/models"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Accept-Encoding": "gzip, deflate",
-        }
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as session:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 401:
-                        raise PermissionError(
-                            "Authentication failed (HTTP 401) — API key is invalid or missing."
-                        )
-                    if resp.status != 200:
-                        raise RuntimeError(
-                            f"Unexpected HTTP {resp.status} from {url}"
-                        )
-                    data = await resp.json(content_type=None)
-                    items = [item for item in data.get("data", []) if item.get("id")]
-                    if prefer_tools_capable:
-                        # Sort models that declare tools capability first.
-                        # Models without the capability field are kept (they may
-                        # still work) but placed after known-capable ones.
-                        def _tools_key(item: dict) -> int:
-                            caps = (
-                                (item.get("info") or {})
-                                .get("meta") or {}
-                            ).get("capabilities") or {}
-                            return 0 if caps.get("tools") else 1
-                        items = sorted(items, key=_tools_key)
-                    else:
-                        items = sorted(items, key=lambda x: x["id"])
-                    return [item["id"] for item in items]
-        except (PermissionError, RuntimeError):
-            raise
-        except Exception as e:
-            raise ConnectionError(
-                f"Cannot reach OpenWebUI at {self.base_url}: {e}"
-            ) from e
+        # Try OpenWebUI-style endpoint first, then Ollama-style fallbacks.
+        candidates = [
+            (f"{self.base_url}/api/models", "openwebui"),
+            (f"{self.base_url}/v1/models", "openai"),
+            (f"{self.base_url}/api/tags", "ollama"),
+        ]
+        headers = {"Accept-Encoding": "gzip, deflate"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        last_exc: Exception | None = None
+        for url, style in candidates:
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as session:
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status == 401:
+                            raise PermissionError(
+                                "Authentication failed (HTTP 401) — API key is invalid or missing."
+                            )
+                        if resp.status != 200:
+                            last_exc = RuntimeError(f"HTTP {resp.status} from {url}")
+                            continue
+                        data = await resp.json(content_type=None)
+                        if style == "ollama":
+                            items_raw = data.get("models", [])
+                            items = [
+                                {"id": m.get("name") or m.get("model", "")}
+                                for m in items_raw
+                                if m.get("name") or m.get("model")
+                            ]
+                        else:
+                            items_raw = data.get("data", [])
+                            items = [i for i in items_raw if i.get("id")]
+
+                        if prefer_tools_capable and style == "openwebui":
+                            def _tools_key(item: dict) -> int:
+                                caps = (
+                                    (item.get("info") or {})
+                                    .get("meta") or {}
+                                ).get("capabilities") or {}
+                                return 0 if caps.get("tools") else 1
+                            items = sorted(items, key=_tools_key)
+                        else:
+                            items = sorted(items, key=lambda x: x["id"])
+
+                        return [item["id"] for item in items if item["id"]]
+            except PermissionError:
+                raise
+            except Exception as e:
+                last_exc = e
+                continue
+
+        raise ConnectionError(
+            f"Cannot reach endpoint at {self.base_url}: {last_exc}"
+        )
 
     async def health_check(self) -> bool:
-        """
-        Verify connectivity to the OpenWebUI instance by hitting /api/models.
-        Returns True if reachable, False otherwise.
-        """
         try:
             await self.fetch_models()
             return True
