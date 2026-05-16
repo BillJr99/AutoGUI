@@ -39,6 +39,9 @@ export const PREDICATE_KINDS = [
   "file_contains",
   "url_contains",
   "text_visible",
+  // Model-generated synonym — handled as text_visible.  Mirrors the
+  // mainline alias in predicates.py.
+  "text_in_window",
   "process_running",
   "shell_returns",
 ] as const;
@@ -83,7 +86,8 @@ export function renderPredicate(p: Predicate): string {
     case "file_absent":           return `file does NOT exist: ${JSON.stringify(p.path)}`;
     case "file_contains":         return `file ${JSON.stringify(p.path)} contains ${JSON.stringify(p.value)}`;
     case "url_contains":          return `browser URL contains ${JSON.stringify(p.value)}`;
-    case "text_visible":          return `text visible on screen: ${JSON.stringify(p.value)}`;
+    case "text_visible":
+    case "text_in_window":        return `text visible on screen: ${JSON.stringify(p.value)}`;
     case "process_running":       return `process matching ${JSON.stringify(p.value)} running`;
     case "shell_returns": {
       const m = p.stdout_contains ? ` and stdout contains ${JSON.stringify(p.stdout_contains)}` : "";
@@ -202,7 +206,8 @@ export async function checkPredicate(
         return { ok: false, kind: predicate.kind, detail: `browser_eval failed: ${(e as Error).message}` };
       }
     }
-    case "text_visible": {
+    case "text_visible":
+    case "text_in_window": {
       const needle = predicate.value ?? "";
       if (!needle) return { ok: false, kind: predicate.kind, detail: "empty value" };
       if (!helpers.findText) return { ok: false, kind: predicate.kind, detail: "OCR unavailable" };

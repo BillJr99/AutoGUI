@@ -14,6 +14,7 @@ import { createLogger } from "./logger.js";
 import { createBackend } from "./platform.js";
 import { commandExists, execFile, shellQuote } from "./process.js";
 import { ScreenRecorder } from "./screen_record.js";
+import { probeScreenObserver, type ScreenObserverClient } from "./screen_observer_client.js";
 import { SkillStore, type SkillStep } from "./skills.js";
 import { createDesktopTools } from "./tools.js";
 import { TraceWriter } from "./trace.js";
@@ -95,6 +96,7 @@ Rules:
 - After launching apps or making visible changes, verify with desktop_list_windows or desktop_screenshot.
 - Keep using Pi's built-in coding/filesystem tools for code and file work; use desktop_*${browserOn ? "/browser_*" : ""} tools only for desktop UI automation.
 - If a desktop tool reports a missing permission or dependency, tell the user exactly what is missing and stop that desktop action.
+- When a desktop tool fails, a predicate fails, or a step appears blocked, DO NOT give up or surface the failure yet. First reach for the perception tools: desktop_screenshot or desktop_screenshot_marked to see the screen, desktop_list_windows + desktop_active_window to confirm focus, desktop_get_window_text for text content, and desktop_click_text / desktop_click_element / desktop_click_mark to re-target with the fresh evidence. The failed tool's result usually includes a recovery_probe payload showing the current state — use it. Only escalate to the user after at least one perception-driven retry has failed.
 - When you finish a task that worked well, consider calling skill_save with descriptive keywords so the procedure can be replayed via skill_run later.
 - ALWAYS use desktop_launch({application: "name"}) to start an application — never \`shell_run\` with \`start <app>\`, \`cmd /c start <app>\`, or \`open -a <app>\`. Those commands can hang because the parent shell may wait for the spawned GUI process even after the window is visible, so the tool call never returns. desktop_launch resolves the executable + spawns it detached + returns immediately; reach for shell_run only when you genuinely need the command's exit status (e.g. \`where.exe\`, \`which\`, \`pgrep\`).
 - Argument schema discipline: every desktop_* / browser_* tool takes a flat JSON object — pass \`{"application": "notepad"}\`, not XML, not stringified parameter lists, not a free-form sentence describing the call. If you find yourself writing \`<arg name="...">\` you have the wrong call shape.
@@ -149,6 +151,7 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
   let progressStore: ProgressStore | undefined;
   let appMemory: AppMemory | undefined;
   let budget: BudgetTracker | undefined;
+  let screenObserver: ScreenObserverClient | undefined;
 
   const init = (async () => {
     cfg = await getConfig();
@@ -215,6 +218,34 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
     if (cfg.screenRecord.enabled) {
       recorder = new ScreenRecorder(cfg.screenRecord, getBackend, logger);
       void recorder.start();
+    }
+    // OS Screen Observer auto-probe: silent best-effort.  When reachable
+    // (MCP first if configured, then REST), desktop_* tools prefer OSO's
+    // a11y / observe paths; on any failure they fall through to native.
+    // No user prompt — discovery happens here at startup.
+    if (!cfg.screenObserver.disabled) {
+      try {
+        const probed = await probeScreenObserver(
+          {
+            base_url: cfg.screenObserver.baseUrl,
+            timeout_seconds: cfg.screenObserver.timeoutMs / 1000,
+            enabled: true,
+          },
+          logger,
+          // MCP probe is a TODO when the Pi runtime exposes a server
+          // registry to extensions; the REST probe alone covers the
+          // common single-host setup today.
+          undefined,
+        );
+        if (probed) {
+          screenObserver = probed;
+          await logger.log("oso.attached", { caps: probed.osoCapabilities });
+        } else {
+          await logger.log("oso.not_found", {});
+        }
+      } catch (e) {
+        await logger.log("oso.probe_threw", { error: (e as Error).message });
+      }
     }
   })();
 
@@ -316,6 +347,7 @@ ${autoGuiTask}`;
       progressRecord: progressSlot,
       appMemory,
       budget,
+      screenObserver,
     });
     for (const tool of tools) {
       pi.registerTool(tool);
@@ -419,7 +451,18 @@ ${autoGuiTask}`;
         const c = await getConfig();
         const backend = await getBackend();
         const status = await backend.status(ctx.signal);
-        ctx.ui.notify(JSON.stringify({ ...status, capabilities: backend.capabilities, config: { allowedBrowser: c.allowedBrowser, dryRun: c.dryRun, plannerEnabled: c.plannerEnabled, installDependencies: c.installDependencies } }, null, 2), "info");
+        ctx.ui.notify(JSON.stringify({
+          ...status,
+          capabilities: backend.capabilities,
+          screen_observer: screenObserver ? { attached: true, capabilities: screenObserver.osoCapabilities } : { attached: false },
+          config: {
+            allowedBrowser: c.allowedBrowser,
+            dryRun: c.dryRun,
+            plannerEnabled: c.plannerEnabled,
+            installDependencies: c.installDependencies,
+            recoveryProbeEnabled: c.recoveryProbeEnabled,
+          },
+        }, null, 2), "info");
       } catch (error) {
         ctx.ui.notify(`AutoGUI status failed: ${String(error)}`, "error");
       }

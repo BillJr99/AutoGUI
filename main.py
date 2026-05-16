@@ -437,6 +437,72 @@ def _save_config_fields(config_path: str, section: str, fields: dict) -> bool:
         return False
 
 
+async def _probe_screen_observer_and_offer_enable(cfg: dict, config_path: str) -> None:
+    """Probe OS Screen Observer at startup; offer to enable when running but unset.
+
+    Runs after the OpenWebUI handshake, before the TUI launches.  When OSO is
+    reachable at the configured base_url but ``screen_observer.enabled`` is
+    false (or the section is missing), the user is asked once whether to
+    enable it; on yes, ``cfg`` is mutated in-memory AND config.json is
+    persisted so subsequent runs auto-attach.  When OSO is already enabled,
+    or when ``disabled: true`` is explicitly set, the probe is skipped.
+
+    Silent on probe failure — this is purely opportunistic.  All paths are
+    best-effort; any exception is swallowed so a flaky OSO can't block the
+    main TUI startup.
+    """
+    try:
+        oso_cfg = cfg.get("screen_observer", {}) or {}
+        # Explicit opt-out: respect it.
+        if oso_cfg.get("disabled") is True:
+            return
+        # Already enabled — nothing to ask.
+        if oso_cfg.get("enabled") is True:
+            return
+        # Probe via a one-shot client with enabled=True so /healthz fires.
+        from screen_observer_client import ScreenObserverClient
+        probe_cfg = {
+            "enabled": True,
+            "base_url": oso_cfg.get("base_url", "http://127.0.0.1:5001"),
+            "timeout_seconds": float(oso_cfg.get("timeout_seconds", 1.5)),
+        }
+        client = ScreenObserverClient(probe_cfg)
+        reachable = await client.is_available()
+        if not reachable:
+            return
+        caps = client.oso_capabilities
+        print(_SEP)
+        print(f"OS Screen Observer detected at {probe_cfg['base_url']}.")
+        print("It can provide accessibility-tree perception, faster window")
+        print("activation, and post-action observation diffs to AutoGUI.")
+        cap_summary = ", ".join(k for k, v in caps.items() if v) or "basic"
+        print(f"Capabilities: {cap_summary}")
+        print(_SEP)
+        try:
+            answer = input("  Enable Screen Observer integration? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer in ("", "y", "yes"):
+            cfg.setdefault("screen_observer", {})
+            cfg["screen_observer"]["enabled"] = True
+            cfg["screen_observer"].setdefault("base_url", probe_cfg["base_url"])
+            cfg["screen_observer"].setdefault("timeout_seconds", probe_cfg["timeout_seconds"])
+            if _save_config_fields(config_path, "screen_observer", {
+                "enabled": True,
+                "base_url": probe_cfg["base_url"],
+                "timeout_seconds": probe_cfg["timeout_seconds"],
+            }):
+                print(f"  Saved screen_observer.enabled=true to {config_path}\n")
+            else:
+                print("  Enabled for this session (config.json not updated).\n")
+        else:
+            print("  Skipped — re-run AutoGUI to be asked again, or toggle from Ctrl+P.\n")
+    except Exception:
+        # Best-effort probe — never let it block startup.
+        return
+
+
 def _prompt_save(label: str, config_path: str, section: str, fields: dict) -> None:
     """Ask the user whether to persist *fields* to config.json."""
     try:
@@ -609,6 +675,11 @@ async def validate_and_configure(cfg: dict, config_path: str) -> None:
             print(f"  Enter a number between 1 and {len(models)}.")
         except ValueError:
             print("  Please enter a number.")
+
+    # Opportunistic OS Screen Observer probe — runs once after the model
+    # handshake.  Silent when OSO isn't running or is already enabled;
+    # prompts only when reachable but not yet configured.
+    await _probe_screen_observer_and_offer_enable(cfg, config_path)
 
 
 # ---------------------------------------------------------------------------

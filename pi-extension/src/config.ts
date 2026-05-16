@@ -104,6 +104,28 @@ export interface ExtensionConfig {
    *  /autogui-validate manual command — flip to false to suppress the
    *  follow-up validation entirely. */
   validateAfterAutogui: boolean;
+  /** OS Screen Observer overlay.  Probed at startup; when reachable
+   *  (MCP first, then REST) the desktop_* tools prefer OSO's a11y/observe
+   *  paths and fall through to native on any failure.  Set `disabled: true`
+   *  to skip the probe entirely. */
+  screenObserver: {
+    /** Skip auto-probe.  Default false (auto-discover). */
+    disabled: boolean;
+    /** REST base URL probed when no MCP server is found. */
+    baseUrl: string;
+    /** Per-request timeout in milliseconds.  Default 2000. */
+    timeoutMs: number;
+    /** MCP server name to look up via the Pi runtime (best-effort).
+     *  Empty string disables MCP probing. */
+    mcpServerName: string;
+  };
+  /** When true (default), predicate / step failure triggers a perception
+   *  bundle (marked screenshot + window list + OSO observe) before the
+   *  failure is surfaced, so the model can re-target unattended. */
+  recoveryProbeEnabled: boolean;
+  /** Maximum number of recovery probes attempted per step.  0 disables
+   *  per-step ceiling.  Default 2 — matches mainline. */
+  recoveryProbeMaxPerStep: number;
 }
 
 const DEFAULTS: ExtensionConfig = {
@@ -144,6 +166,14 @@ const DEFAULTS: ExtensionConfig = {
   },
   visionEnabled: true,
   validateAfterAutogui: true,
+  screenObserver: {
+    disabled: false,
+    baseUrl: "http://127.0.0.1:5001",
+    timeoutMs: 2000,
+    mcpServerName: "screen-observer",
+  },
+  recoveryProbeEnabled: true,
+  recoveryProbeMaxPerStep: 2,
 };
 
 function deepMerge<T>(base: T, patch: unknown): T {

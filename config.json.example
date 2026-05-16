@@ -42,7 +42,10 @@
       "preflight_enabled": true,
       "predicate_check_enabled": true,
       "visual_diff_enabled": true,
-      "watchdog_stall_threshold": 3
+      "watchdog_stall_threshold": 3,
+      "_recovery_probe_comment": "When a predicate or step fails, capture a perception bundle (screenshot + window list + OS Screen Observer observe diff when attached) and yield it as a recovery_probe event BEFORE the step_failure / step_blocked path. The model is expected to use that bundle to call desktop_screenshot_marked / desktop_click_text / desktop_click_element and re-target unattended on its next turn. recovery_probe_max_per_step caps probes per step (0 = unbounded) so a hopeless step still terminates. Symmetric with the pi-extension.",
+      "recovery_probe_enabled": true,
+      "recovery_probe_max_per_step": 2
     },
     "artifacts": {
       "_comment": "Stable-id store for large observations (file bodies, command stdout, OCR snippets). Each capture gets a fresh artifact://<id>; identical bodies are NOT deduped — the store is an append-only log of what the agent saw and when. The model fetches by id with get_artifact when it needs the body.",
