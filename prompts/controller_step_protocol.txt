@@ -67,9 +67,8 @@ ONE plan step at a time.  For each step:
 
 9a. FAILURE RECOVERY — When a desktop tool fails, a predicate fails, or a
     step appears blocked, the controller injects a `recovery_probe` event
-    carrying a fresh screenshot, the current window list, the active
-    window, and (when an OS Screen Observer is attached) an observe diff
-    token.  DO NOT immediately escalate.  Use the bundle: re-read the
+    carrying a fresh screenshot, the current window list, and the active
+    window.  DO NOT immediately escalate.  Use the bundle: re-read the
     screenshot, then call desktop_screenshot_marked + desktop_click_mark,
     desktop_click_text, or desktop_click_element to re-target with the
     fresh evidence and re-attempt the action.  Only after at least one

@@ -770,15 +770,51 @@ class DesktopBackend:
     async def get_window_tree(
         self,
         window_title: str | None = None,
+        window_index: int | None = None,
         depth: int = 3,
     ) -> dict:
-        """Dump accessibility tree; tries OS Screen Observer /api/structure when configured."""
+        """Dump accessibility tree; tries OS Screen Observer /api/structure when configured.
+
+        When window_index is provided OSO returns that specific window's tree;
+        otherwise (and when window_title is also unset) OSO returns a
+        whole-screen tree across all visible windows.
+        """
         if self._screen_observer is not None:
-            result = await self._screen_observer.get_structure()
+            result = await self._screen_observer.get_structure(window_index=window_index)
             if result is not None:
                 return result
             logger.warning("[backend:get_window_tree] OS Screen Observer unavailable; falling back to native method")
         return {"error": "get_window_tree not supported on this platform"}
+
+    async def describe_screen_text(
+        self,
+        window_index: int | None = None,
+        include_sketch: bool = True,
+        include_tree: bool = True,
+        tree_start_depth: int = 6,
+        tree_min_depth: int = 1,
+        tree_max_chars: int = 4000,
+        max_chars: int = 6000,
+    ) -> dict | None:
+        """Build a length-bounded text observation bundle from OSO.
+
+        Returns None when OSO is unreachable so callers can skip the
+        injection silently.  The tree is depth-trimmed to fit under
+        tree_max_chars; the combined bundle is capped at max_chars.
+        """
+        if self._screen_observer is None:
+            return None
+        from oso_text import build_text_bundle
+        return await build_text_bundle(
+            self._screen_observer,
+            window_index=window_index,
+            include_sketch=include_sketch,
+            include_tree=include_tree,
+            tree_start_depth=tree_start_depth,
+            tree_min_depth=tree_min_depth,
+            tree_max_chars=tree_max_chars,
+            max_chars=max_chars,
+        )
 
     async def describe_screen(self, window_index: int | None = None) -> dict:
         """

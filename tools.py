@@ -791,41 +791,71 @@ class ToolRegistry:
                 )
 
             # ── Extended: get_window_tree ─────────────────────────────────
-            if self._backend_caps.get("get_window_tree") or self._backend_caps.get("screen_observer"):
+            # When OSO is attached, the tool exposes a window_index parameter
+            # and a whole-screen mode.  Without OSO it falls back to the
+            # native platform implementation (Windows UIAutomation today).
+            # Descriptions are split so OSO terminology only enters the
+            # LLM-visible schema when OSO is actually attached.
+            _has_oso = bool(self._backend_caps.get("screen_observer"))
+            if self._backend_caps.get("get_window_tree") or _has_oso:
+                if _has_oso:
+                    tree_desc = (
+                        "Dump the accessibility element tree for a window or the whole screen. "
+                        "Shows every UI control with its name, role and bounds — far more accurate "
+                        "than guessing pixel coordinates from a screenshot. "
+                        "Omit window_index for a whole-screen tree (all visible windows); pass "
+                        "window_index from desktop_list_windows to scope to one window. "
+                        "Encouraged before interacting with an unfamiliar or dense window. "
+                        "Result is depth-limited; re-call with a specific window to drill in."
+                    )
+                    tree_params: dict = {
+                        "window_title": {"type": "string", "description": "Window title fragment (native fallback path)."},
+                        "window_index": {"type": "integer", "description": "Window index from desktop_list_windows. Omit for whole-screen tree."},
+                        "depth": {"type": "integer", "description": "Tree depth (1-5). Default: 3."},
+                    }
+                else:
+                    tree_desc = (
+                        "Dump the accessibility element tree for a window. "
+                        "Shows all UI controls, their names, types, and positions. "
+                        "Use before interacting with an unfamiliar window."
+                    )
+                    tree_params = {
+                        "window_title": {"type": "string", "description": "Window title fragment."},
+                        "depth": {"type": "integer", "description": "Tree depth (1-5). Default: 3."},
+                    }
                 self._register(
                     {"type": "function", "function": {
                         "name": "desktop_get_window_tree",
-                        "description": (
-                            "Dump the accessibility element tree for a window. "
-                            "Shows all UI controls, their names, types, and positions. "
-                            "Use before interacting with an unfamiliar window. "
-                            "Supported on Windows, macOS, and via OS Screen Observer when configured."
-                        ),
-                        "parameters": {"type": "object", "properties": {
-                            "window_title": {"type": "string", "description": "Window title fragment."},
-                            "depth": {"type": "integer", "description": "Tree depth (1-5). Default: 3."},
-                        }},
+                        "description": tree_desc,
+                        "parameters": {"type": "object", "properties": tree_params},
                     }},
-                    lambda window_title=None, depth=3: b.get_window_tree(window_title=window_title, depth=depth),
+                    lambda window_title=None, window_index=None, depth=3: b.get_window_tree(
+                        window_title=window_title, window_index=window_index, depth=depth,
+                    ),
                 )
 
-            # ── Extended: desktop_describe_screen (OS Screen Observer) ──────
-            if self._backend_caps.get("screen_observer"):
+            # ── Extended: desktop_describe_screen (OSO only) ────────────────
+            # This tool has no native fallback, so it is registered only when
+            # OSO is attached — keeping all OSO references out of the LLM
+            # context when OSO is disabled.
+            if _has_oso:
                 self._register(
                     {"type": "function", "function": {
                         "name": "desktop_describe_screen",
                         "description": (
-                            "Return a combined text description of the focused window using "
-                            "OS Screen Observer: accessibility tree prose, OCR text, and "
-                            "optional VLM interpretation. Use when a plain screenshot does "
-                            "not give enough detail about UI controls or text content. "
-                            "Requires OSScreenObserver running locally "
-                            "(python main.py --mode inspect in the OSScreenObserver directory)."
+                            "Return a combined text view of the screen — prose description, "
+                            "ASCII sketch, and accessibility-tree listing. Prefer this over "
+                            "a raw screenshot when the UI is dense, icon-only, has small fonts, "
+                            "or when you need element names/roles to click by accessibility. "
+                            "Omit window_index for a whole-screen description (all visible "
+                            "windows); pass window_index from desktop_list_windows to focus "
+                            "on a single window. Encouraged at the start of an unfamiliar "
+                            "task and whenever a screenshot left you uncertain."
                         ),
                         "parameters": {"type": "object", "properties": {
                             "window_index": {
                                 "type": "integer",
-                                "description": "Window index from desktop_list_windows. Omit for focused window.",
+                                "description": "Window index from desktop_list_windows. Omit for whole-screen view.",
                             },
                         }},
                     }},

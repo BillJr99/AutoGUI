@@ -28,6 +28,7 @@ import {
 } from "./preflight.js";
 import type { ProgressStore, TaskProgress } from "./progress.js";
 import { ScreenRecorder } from "./screen_record.js";
+import { buildOsoTextBundle, trimTree as trimTreeForResult } from "./oso_text.js";
 import type { ScreenObserverClient } from "./screen_observer_client.js";
 import { normalizeSkillSteps, type SkillStep, type SkillStore } from "./skills.js";
 import { annotateScreenshot } from "./som.js";
@@ -276,6 +277,54 @@ export function createDesktopTools(
             }
           } catch { /* best-effort */ }
         }
+
+        // Post-action text observation bundle (opt-in): description + sketch
+        // + depth-trimmed a11y tree paired with the screenshot.  Hard-gated
+        // on cfg.screenObserver.textObservation.enabled; when off, no
+        // "text_observation" field ever lands on the result.
+        if (cfg.screenObserver.textObservation.enabled) {
+          try {
+            const t = cfg.screenObserver.textObservation;
+            let windowIndex: number | undefined;
+            if (t.scope === "active_window" || t.scope === "auto") {
+              try {
+                const wins = await oso.getWindows();
+                const items = (wins?.windows as Array<Record<string, unknown>> | undefined) ?? [];
+                for (let i = 0; i < items.length; i++) {
+                  const w = items[i];
+                  if (w.focused || w.active || w.is_focused) {
+                    const idx = (w.window_index as number | undefined);
+                    windowIndex = typeof idx === "number" ? idx : i;
+                    break;
+                  }
+                }
+              } catch { /* fall through to whole-screen */ }
+            }
+            let bundle = await buildOsoTextBundle(oso, {
+              windowIndex,
+              includeSketch: t.includeSketch,
+              includeTree: t.includeTree,
+              treeStartDepth: t.treeStartDepth,
+              treeMinDepth: t.treeMinDepth,
+              treeMaxChars: t.treeMaxChars,
+              maxChars: t.maxChars,
+            });
+            if (t.scope === "auto" && bundle && !bundle.description && !bundle.sketch && !bundle.treeText) {
+              bundle = await buildOsoTextBundle(oso, {
+                windowIndex: undefined,
+                includeSketch: t.includeSketch,
+                includeTree: t.includeTree,
+                treeStartDepth: t.treeStartDepth,
+                treeMinDepth: t.treeMinDepth,
+                treeMaxChars: t.treeMaxChars,
+                maxChars: t.maxChars,
+              });
+            }
+            if (bundle) {
+              (result.details as Record<string, unknown>).text_observation = bundle;
+            }
+          } catch { /* best-effort */ }
+        }
       }
 
       // State diff (window-set).  Only meaningful for desktop_* state-changers.
@@ -350,7 +399,7 @@ export function createDesktopTools(
         const cap = cfg.recoveryProbeMaxPerStep;
         if (!counter || cap === 0 || counter.count < cap) {
           try {
-            const probe = await emitRecoveryProbe(getBackend, oso, signal);
+            const probe = await emitRecoveryProbe(getBackend, oso, signal, cfg.screenObserver.textObservation);
             if (probe) {
               void options.trace.writeEvent("recovery_probe", `perception bundle for failed ${toolName}`, probe);
               await logger?.log("tool.recovery_probe", { toolName, ...probe });
@@ -359,11 +408,15 @@ export function createDesktopTools(
               // model sees the perception payload on its next turn.
               if (error instanceof Error) {
                 const existing = (error as { details?: Record<string, unknown> }).details ?? {};
+                const osoHint = oso && oso.enabled
+                  ? "desktop_describe_screen / "
+                  : "";
                 (error as { details?: Record<string, unknown> }).details = {
                   ...existing,
                   recovery_probe: probe,
                   recovery_hint:
-                    "Predicate/step failed.  Before giving up, call describe_screen / " +
+                    "Predicate/step failed.  Before giving up, call " +
+                    osoHint +
                     "desktop_screenshot_marked / desktop_click_text / desktop_click_element " +
                     "to re-target.  The recovery_probe payload above shows the current screen.",
                 };
@@ -1303,7 +1356,7 @@ export function createDesktopTools(
           const cap = cfg.recoveryProbeMaxPerStep;
           if (!counter || cap === 0 || counter.count < cap) {
             try {
-              const probe = await emitRecoveryProbe(getBackend, oso, signal);
+              const probe = await emitRecoveryProbe(getBackend, oso, signal, cfg.screenObserver.textObservation);
               if (probe) {
                 recoveryProbe = probe;
                 if (counter) counter.count++;
@@ -1404,6 +1457,101 @@ export function createDesktopTools(
         }),
       );
     }
+  }
+
+  // ── OSO text-perception tools (conditional) ─────────────────────────
+  // These tools are registered ONLY when an OS Screen Observer is attached.
+  // When OSO is disabled the definitions never enter the agent's tool
+  // catalogue, so the model has no way to learn about them — matching
+  // mainline's gating in tools.py.
+  if (oso && oso.enabled) {
+    definitions.push(
+      defineTool({
+        name: "desktop_describe_screen",
+        label: "Describe Screen",
+        description:
+          "Return a combined text view of the screen — prose description, ASCII sketch, " +
+          "and accessibility-tree listing. Prefer this over a raw screenshot when the UI " +
+          "is dense, icon-only, has small fonts, or when you need element names/roles to " +
+          "click by accessibility. Omit window_index for a whole-screen description (all " +
+          "visible windows); pass window_index from desktop_list_windows to focus on a " +
+          "single window. Encouraged at the start of an unfamiliar task and whenever a " +
+          "screenshot left you uncertain.",
+        promptSnippet:
+          "desktop_describe_screen: text + sketch + a11y-tree view of the focused window " +
+          "(omit window_index for whole-screen).",
+        promptGuidelines: [
+          "Prefer desktop_describe_screen over a raw screenshot when the UI is dense, icon-only, or low-contrast.",
+          "After state-changing actions you also receive an automatic text observation bundle in the tool result.",
+          "Use window_index from desktop_list_windows to scope to one window; omit for whole-screen.",
+        ],
+        parameters: Type.Object({
+          window_index: Type.Optional(Type.Number()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("desktop_describe_screen", async (params) => {
+          const t = cfg.screenObserver.textObservation;
+          const bundle = await buildOsoTextBundle(oso, {
+            windowIndex: typeof params.window_index === "number" ? params.window_index : undefined,
+            includeSketch: t.includeSketch,
+            includeTree: t.includeTree,
+            treeStartDepth: t.treeStartDepth,
+            treeMinDepth: t.treeMinDepth,
+            treeMaxChars: t.treeMaxChars,
+            maxChars: t.maxChars,
+          });
+          if (!bundle) {
+            return textResult("Screen observer unavailable.", { error: "screen_observer_unreachable" });
+          }
+          const summary = `Text view: scope=${bundle.scope}, tree_depth=${bundle.depthUsed}${bundle.truncated ? " (truncated)" : ""}.`;
+          return textResult(summary, bundle as unknown as Record<string, unknown>);
+        }),
+      }),
+      defineTool({
+        name: "desktop_get_window_tree",
+        label: "Get Window Tree",
+        description:
+          "Dump the accessibility element tree for a window or the whole screen. Shows " +
+          "every UI control with its name, role and bounds — far more accurate than " +
+          "guessing pixel coordinates from a screenshot. Omit window_index for a whole-" +
+          "screen tree (all visible windows); pass window_index from desktop_list_windows " +
+          "to scope to one window. Result is depth-limited; re-call with a specific " +
+          "window to drill in.",
+        promptSnippet:
+          "desktop_get_window_tree: dump a depth-limited a11y tree (omit window_index for whole-screen).",
+        promptGuidelines: [
+          "Use before interacting with an unfamiliar or dense window.",
+          "Prefer accessibility names from the tree over guessed pixel coordinates.",
+        ],
+        parameters: Type.Object({
+          window_index: Type.Optional(Type.Number()),
+        }),
+        executionMode: "sequential",
+        execute: wrap("desktop_get_window_tree", async (params) => {
+          const t = cfg.screenObserver.textObservation;
+          const windowIndex = typeof params.window_index === "number" ? params.window_index : undefined;
+          const result = await oso.getStructure(windowIndex);
+          if (!result) {
+            return textResult("Screen observer unavailable.", { error: "screen_observer_unreachable" });
+          }
+          const trimmed = trimTreeForResult(result.tree, {
+            startDepth: t.treeStartDepth,
+            minDepth: t.treeMinDepth,
+            maxChars: t.treeMaxChars,
+          });
+          const payload = {
+            scope: windowIndex !== undefined ? "active_window" : "screen",
+            depth_used: trimmed.depthUsed,
+            truncated: trimmed.truncated,
+            tree_text: trimmed.text,
+          };
+          return textResult(
+            `Accessibility tree: scope=${payload.scope}, depth=${trimmed.depthUsed}${trimmed.truncated ? " (truncated)" : ""}.`,
+            payload,
+          );
+        }),
+      }),
+    );
   }
 
   // ── preflight ──────────────────────────────────────────────────────
@@ -1582,6 +1730,16 @@ export async function emitRecoveryProbe(
   getBackend: () => Promise<DesktopBackend>,
   oso: ScreenObserverClient | undefined,
   signal?: AbortSignal,
+  textObservation?: {
+    enabled: boolean;
+    includeSketch: boolean;
+    includeTree: boolean;
+    scope: string;
+    maxChars: number;
+    treeStartDepth: number;
+    treeMinDepth: number;
+    treeMaxChars: number;
+  },
 ): Promise<Record<string, unknown> | null> {
   const probe: Record<string, unknown> = { ts: Date.now() };
   try {
@@ -1598,6 +1756,20 @@ export async function emitRecoveryProbe(
         description: obs.description,
       };
     } catch { /* ignore */ }
+    if (textObservation?.enabled) {
+      try {
+        const bundle = await buildOsoTextBundle(oso, {
+          windowIndex: undefined,
+          includeSketch: textObservation.includeSketch,
+          includeTree: textObservation.includeTree,
+          treeStartDepth: textObservation.treeStartDepth,
+          treeMinDepth: textObservation.treeMinDepth,
+          treeMaxChars: textObservation.treeMaxChars,
+          maxChars: textObservation.maxChars,
+        });
+        if (bundle) probe.oso_text = bundle;
+      } catch { /* ignore */ }
+    }
   }
   return probe;
 }

@@ -129,6 +129,17 @@
     "_comment": "Optional integration with OS Screen Observer (github.com/BillJr99/OSScreenObserver). When enabled=true AutoGUI probes the server and uses it as a fallback/enhancement for window listing, accessibility tree access (find_element, get_window_tree), and a new describe_screen capability — all with graceful degradation if the server is not reachable. Start OSScreenObserver with: python main.py --mode inspect",
     "enabled": false,
     "base_url": "http://127.0.0.1:5001",
-    "timeout_seconds": 2.0
+    "timeout_seconds": 2.0,
+    "text_observation": {
+      "_comment": "Post-action text observation bundle (description + sketch + depth-limited a11y tree) paired with the auto-screenshot. Only takes effect when screen_observer.enabled=true. The tree depth is shrunk automatically until the serialised tree fits under tree_max_chars; the full bundle is capped at max_chars. scope: 'active_window' (focused window only), 'screen' (whole desktop), or 'auto' (active_window with whole-screen fallback if empty).",
+      "enabled": false,
+      "include_sketch": true,
+      "include_tree": true,
+      "scope": "active_window",
+      "max_chars": 6000,
+      "tree_start_depth": 6,
+      "tree_min_depth": 1,
+      "tree_max_chars": 4000
+    }
   }
 }

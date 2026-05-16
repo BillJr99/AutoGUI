@@ -613,8 +613,13 @@ class WindowsBackend(DesktopBackend):
     async def get_window_tree(
         self,
         window_title: str | None = None,
+        window_index: int | None = None,
         depth: int = 3,
     ) -> dict:
+        # window_index is OSO-specific; the native UIAutomation path uses
+        # window_title.  When the caller supplies window_index but no title
+        # we still fall through to the native code with title=None, which
+        # dumps the root control (whole-desktop tree).
         try:
             import uiautomation as auto
             loop = asyncio.get_event_loop()

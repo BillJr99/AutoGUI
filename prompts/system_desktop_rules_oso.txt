@@ -1,0 +1,6 @@
+TEXT OBSERVATION:
+- When a screenshot is ambiguous (small fonts, dense forms, icon-only buttons, low contrast), call desktop_describe_screen for a prose + ASCII-sketch + accessibility-tree view of the UI.
+- desktop_describe_screen and desktop_get_window_tree both accept window_index from desktop_list_windows for a single window; omit window_index for a whole-screen view across all visible windows. Prefer the per-window form when you already know which window matters — it returns much less noise.
+- Encouraged usage: call desktop_describe_screen at the start of an unfamiliar task, before any click on a complex window, and whenever the previous screenshot did not clearly show what you need.
+- After state-changing actions you also receive an automatic text observation bundle alongside the screenshot — use the accessibility names it surfaces to drive desktop_find_element / desktop_click_element rather than guessing pixel coordinates.
+- desktop_get_window_tree returns a depth-limited tree; if you need more detail, re-call with a specific window_title or window_index. The tree depth auto-shrinks if the result would be too large for context.
