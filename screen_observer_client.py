@@ -14,14 +14,21 @@ logger = logging.getLogger(__name__)
 
 _COOLDOWN = 30.0
 
-# Capability keys from /api/capabilities that AutoGUI uses.
+# Capability keys from /api/capabilities 'supports' dict that AutoGUI gates on.
 # Defaults apply when OSO is reachable but the key is absent (older OSO version).
+# Keys match what observer.get_capabilities() actually returns.
 _CAP_DEFAULTS: dict = {
-    "accessibility_tree": True,
-    "ocr": True,
-    "vlm": False,
-    "screenshot": True,
-    "monitors": True,
+    "accessibility_tree": True,   # AT-SPI / UIAutomation / AX tree available
+    "ocr":                False,  # requires pytesseract
+    "vlm":                False,  # requires config vlm.enabled + vlm.model
+    "uia_invoke":         False,  # Windows UIAutomation invoke (Windows-only)
+    "occlusion_detection": True,  # Z-order occlusion check available
+    "drag":               True,   # drag gesture support
+    "screenshot":         True,   # /api/screenshot available
+    "monitors":           True,   # /api/monitors available
+    "bring_to_foreground": True,  # /api/bring_to_foreground available
+    "element_targeting":  True,   # element click/focus/invoke/set_value via element_id
+    "observe_with_diff":  True,   # /api/observe returns diff token
 }
 
 
@@ -117,6 +124,26 @@ class ScreenObserverClient:
             self._back_off()
             return None
 
+    async def _post(self, path: str, body: dict | None = None) -> dict | None:
+        if not self._enabled or not self._cooled():
+            return None
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{self._base}{path}",
+                    json=body or {},
+                    timeout=aiohttp.ClientTimeout(total=self._timeout),
+                ) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    logger.warning("[OSO] POST %s -> HTTP %d; falling back to native method", path, r.status)
+                    return None
+        except Exception as e:
+            logger.warning("[OSO] POST %s failed: %s; falling back to native method", path, e)
+            self._back_off()
+            return None
+
     async def is_available(self) -> bool:
         """Probe /api/healthz; returns True if the server is reachable.
 
@@ -178,8 +205,6 @@ class ScreenObserverClient:
         or None on failure.  Useful for per-window captures that OSO performs
         natively via its accessibility adapter.
         """
-        if not self._caps.get("screenshot", True):
-            return None
         p: dict = {}
         if window_index is not None:
             p["window_index"] = window_index
@@ -191,8 +216,6 @@ class ScreenObserverClient:
         Returns {ok, monitors: [{bounds, scale_factor, ...}]} or None on failure.
         Useful for multi-monitor coordinate translation and DPI-aware positioning.
         """
-        if not self._caps.get("monitors", True):
-            return None
         return await self._get("/api/monitors")
 
     async def get_visible_areas(self, window_index: int) -> dict | None:
@@ -224,3 +247,111 @@ class ScreenObserverClient:
             return None
         idx = max(0, min(int(index or 0), len(matches) - 1))
         return matches[idx]
+
+    async def find_element(
+        self,
+        name: str | None = None,
+        control_type: str | None = None,
+        window_title: str | None = None,
+        window_index: int | None = None,
+        index: int = 0,
+    ) -> dict | None:
+        """Find an element via OSO's selector engine (/api/find_element).
+
+        Constructs an XPath-ish selector with substring matching so e.g.
+        name="Save" matches a button labelled "Save as…".  Returns a dict
+        with element_id (for follow-up element_click/invoke calls), rect,
+        name, and control_type, or None on any failure.
+        """
+        if not self._caps.get("accessibility_tree", True):
+            return None
+        if not name and not control_type:
+            return None
+        role = control_type or "*"
+        selector = f'//{role}[name*="{name}"]' if name else f"//{role}"
+        p: dict = {"selector": selector}
+        if window_index is not None:
+            p["window_index"] = window_index
+        elif window_title:
+            p["window_title"] = window_title
+        result = await self._get("/api/find_element", p)
+        if result is None or not result.get("ok"):
+            return None
+        # pick nth match from all_matches when caller wants a specific index
+        all_matches = result.get("all_matches") or []
+        if all_matches and index > 0:
+            idx = max(0, min(index, len(all_matches) - 1))
+            m = all_matches[idx]
+            return {
+                "element_id": m.get("element_id"),
+                "name": m.get("name", ""),
+                "control_type": m.get("role", ""),
+                "rect": m.get("bounds", {}),
+                "method": "screen_observer_find_element",
+            }
+        bounds = result.get("bounds") or {}
+        first = all_matches[0] if all_matches else {}
+        return {
+            "element_id": result.get("element_id"),
+            "name": first.get("name", ""),
+            "control_type": first.get("role", ""),
+            "rect": bounds,
+            "method": "screen_observer_find_element",
+        }
+
+    async def bring_to_foreground(
+        self,
+        window_title: str | None = None,
+        window_index: int | None = None,
+        window_uid: str | None = None,
+    ) -> dict | None:
+        """Ask OSO to bring a window to the foreground (/api/bring_to_foreground).
+
+        OSO resolves the window via substring title match, index, or uid —
+        so passing title="Notepad" correctly finds "Notepad.exe – Untitled".
+        Returns {success, window, window_uid} or None on failure.
+        """
+        p: dict = {}
+        if window_uid:
+            p["window_uid"] = window_uid
+        elif window_index is not None:
+            p["window_index"] = window_index
+        elif window_title:
+            p["window_title"] = window_title
+        else:
+            return None
+        return await self._get("/api/bring_to_foreground", p)
+
+    async def observe(
+        self,
+        window_index: int | None = None,
+        window_title: str | None = None,
+    ) -> dict | None:
+        """Observe the current window state (/api/observe).
+
+        Returns a snapshot with tree_hash, description, and a diff_token
+        that tracks what changed since the previous observe call.  Useful
+        for verifying that an action produced the expected UI change.
+        """
+        p: dict = {}
+        if window_index is not None:
+            p["window_index"] = window_index
+        elif window_title:
+            p["window_title"] = window_title
+        return await self._get("/api/observe", p)
+
+    async def element_click(self, element_id: str) -> dict | None:
+        """Click a previously located element by its element_id."""
+        return await self._post("/api/element/click", {"element_id": element_id})
+
+    async def element_focus(self, element_id: str) -> dict | None:
+        """Focus a previously located element by its element_id."""
+        return await self._post("/api/element/focus", {"element_id": element_id})
+
+    async def element_invoke(self, element_id: str) -> dict | None:
+        """Invoke the default action on an element (e.g. press a button)."""
+        return await self._post("/api/element/invoke", {"element_id": element_id})
+
+    async def element_set_value(self, element_id: str, value: str) -> dict | None:
+        """Set the value of an element (e.g. fill a text field)."""
+        return await self._post("/api/element/set_value", {"element_id": element_id, "value": value})

@@ -378,6 +378,11 @@ class WaylandBackend(DesktopBackend):
         """Focus a window by swaymsg criteria (Sway/wlroots only)."""
         if not any([title, pid, app, window_id]):
             return {"error": "Provide at least one of: title, pid, app, window_id"}
+        if self._screen_observer is not None and title:
+            result = await self._screen_observer.bring_to_foreground(window_title=title)
+            if result is not None and result.get("success"):
+                return {"success": True, "method": "screen_observer",
+                        "window": result.get("window", title)}
 
         criteria_parts = []
         if window_id:

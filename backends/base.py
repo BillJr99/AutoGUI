@@ -681,20 +681,30 @@ class DesktopBackend:
         window_title: str | None = None,
         index: int = 0,
     ) -> dict:
-        """Find element via a11y API; tries OS Screen Observer tree walk when configured."""
-        if self._screen_observer is not None and name:
+        """Find element via a11y API; tries OS Screen Observer when configured."""
+        if self._screen_observer is not None and (name or control_type):
             oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
             if oso_caps.get("accessibility_tree", True):
-                result = await self._screen_observer.find_element_in_tree(
-                    name=str(name),
+                # Direct selector lookup — faster, handles selector predicates.
+                direct = await self._screen_observer.find_element(
+                    name=name,
+                    control_type=control_type,
+                    window_title=window_title,
+                    index=int(index or 0),
+                )
+                if direct is not None:
+                    return direct
+                # Fall back to full tree download + Python-side walk.
+                tree_result = await self._screen_observer.find_element_in_tree(
+                    name=str(name or ""),
                     control_type=control_type,
                     index=int(index or 0),
                 )
-                if result is not None:
-                    return result
+                if tree_result is not None:
+                    return tree_result
                 logger.warning("[backend:find_element] OS Screen Observer unavailable; falling back to native method")
             else:
-                logger.debug("[backend:find_element] OSO has no accessibility tree; skipping tree walk")
+                logger.debug("[backend:find_element] OSO has no accessibility tree; skipping")
         return {"error": "find_element not supported on this platform"}
 
     async def get_window_tree(
@@ -712,16 +722,22 @@ class DesktopBackend:
 
     async def describe_screen(self, window_index: int | None = None) -> dict:
         """
-        Return a combined text description of the screen using OS Screen Observer.
+        Return a rich description of the screen using OS Screen Observer.
 
-        Combines accessibility tree prose, OCR text, and optional VLM
-        interpretation depending on how OSScreenObserver is configured.
-        Returns an error dict if the observer is not configured or not reachable.
+        Fetches description (prose + OCR/VLM), ASCII sketch, and accessibility
+        structure in parallel to give callers the fullest possible picture of
+        what is currently on screen.  Returns an error dict if the observer is
+        not configured or not reachable.
         """
         if self._screen_observer is None:
             return {"error": "screen_observer is not configured in config.json (set screen_observer.enabled=true)"}
-        result = await self._screen_observer.get_description(window_index=window_index)
-        if result is None:
+        import asyncio
+        description, sketch, structure = await asyncio.gather(
+            self._screen_observer.get_description(window_index=window_index),
+            self._screen_observer.get_sketch(window_index=window_index),
+            self._screen_observer.get_structure(window_index=window_index),
+        )
+        if description is None and sketch is None and structure is None:
             return {
                 "error": (
                     "OS Screen Observer is not reachable. "
@@ -729,6 +745,13 @@ class DesktopBackend:
                     "(in the OSScreenObserver directory)"
                 )
             }
+        result: dict = {}
+        if description:
+            result.update(description)
+        if sketch:
+            result["sketch"] = sketch.get("sketch") or sketch
+        if structure:
+            result["structure"] = structure.get("tree") or structure
         return result
 
     async def activate_window(
@@ -738,6 +761,18 @@ class DesktopBackend:
         app: str = "",
         window_id: str = "",
     ) -> dict:
+        """Bring a window to the foreground.  Tries OS Screen Observer first
+        (which resolves window titles via substring match, so "Notepad" finds
+        "Notepad.exe – Untitled"), then falls back to the native platform method.
+        """
+        if self._screen_observer is not None and title:
+            result = await self._screen_observer.bring_to_foreground(window_title=title)
+            if result is not None and result.get("success"):
+                return {"success": True, "method": "screen_observer",
+                        "window": result.get("window", title),
+                        "window_uid": result.get("window_uid")}
+            if result is not None:
+                logger.debug("[backend:activate_window] OSO bring_to_foreground returned: %s", result)
         return {"error": "activate_window not supported on this platform"}
 
     async def get_active_window(self) -> dict:
