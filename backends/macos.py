@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 class MacOSBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
+        caps = super().capabilities()
+        caps.update({"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True})
+        return caps
 
     async def screenshot(
         self,

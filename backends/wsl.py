@@ -143,7 +143,9 @@ def _to_sendkeys(keys: list[str]) -> str:
 class WSLBackend(DesktopBackend):
 
     def capabilities(self) -> dict:
-        return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
+        caps = super().capabilities()
+        caps.update({"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True})
+        return caps
 
     # ------------------------------------------------------------------
     # PowerShell helper
@@ -664,6 +666,11 @@ class WSLBackend(DesktopBackend):
 
     async def list_windows(self) -> dict:
         """List visible Windows windows with titles, pids, bounding boxes, and active status."""
+        if self._screen_observer is not None:
+            result = await self._screen_observer.get_windows()
+            if result is not None:
+                return result
+            logger.warning("[wsl:list_windows] OS Screen Observer unavailable; falling back to PowerShell")
         script = (
             self._WIN_FOCUS_TYPE +
             "$ErrorActionPreference = 'SilentlyContinue'\n"

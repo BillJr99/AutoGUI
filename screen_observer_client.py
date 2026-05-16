@@ -14,6 +14,16 @@ logger = logging.getLogger(__name__)
 
 _COOLDOWN = 30.0
 
+# Capability keys from /api/capabilities that AutoGUI uses.
+# Defaults apply when OSO is reachable but the key is absent (older OSO version).
+_CAP_DEFAULTS: dict = {
+    "accessibility_tree": True,
+    "ocr": True,
+    "vlm": False,
+    "screenshot": True,
+    "monitors": True,
+}
+
 
 def _oso_walk_for_element(
     node: dict,
@@ -64,10 +74,22 @@ class ScreenObserverClient:
         self._timeout = float(cfg.get("timeout_seconds", 2.0))
         self._enabled = bool(cfg.get("enabled", False))
         self._disabled_until: float = 0.0
+        # Cached result of /api/capabilities; populated on first is_available() call.
+        self._caps: dict = dict(_CAP_DEFAULTS)
+        self._caps_fetched: bool = False
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def oso_capabilities(self) -> dict:
+        """Return the last-fetched /api/capabilities 'supports' dict.
+
+        Available after the first successful is_available() or get_capabilities()
+        call.  Falls back to conservative defaults until then.
+        """
+        return dict(self._caps)
 
     def _cooled(self) -> bool:
         return time.monotonic() >= self._disabled_until
@@ -88,17 +110,45 @@ class ScreenObserverClient:
                 ) as r:
                     if r.status == 200:
                         return await r.json()
-                    logger.debug("[OSO] GET %s -> HTTP %d", path, r.status)
+                    logger.warning("[OSO] GET %s -> HTTP %d; falling back to native method", path, r.status)
                     return None
         except Exception as e:
-            logger.debug("[OSO] GET %s failed: %s", path, e)
+            logger.warning("[OSO] GET %s failed: %s; falling back to native method", path, e)
             self._back_off()
             return None
 
     async def is_available(self) -> bool:
-        """Probe /api/healthz; returns True if the server is reachable."""
+        """Probe /api/healthz; returns True if the server is reachable.
+
+        Also fetches /api/capabilities on the first successful probe so
+        subsequent calls to oso_capabilities reflect what this OSO instance
+        actually supports.
+        """
         result = await self._get("/api/healthz")
+        if result is not None and not self._caps_fetched:
+            await self.get_capabilities()
         return result is not None
+
+    async def get_capabilities(self) -> dict | None:
+        """Fetch /api/capabilities and cache the 'supports' dict.
+
+        Returns the full capabilities response, or None if unreachable.
+        The 'supports' sub-dict is always accessible via oso_capabilities
+        even after a failure (returns cached or default values).
+        """
+        result = await self._get("/api/capabilities")
+        if result is not None:
+            supports = result.get("supports") or {}
+            merged = dict(_CAP_DEFAULTS)
+            merged.update(supports)
+            self._caps = merged
+            self._caps_fetched = True
+            logger.info(
+                "[OSO] capabilities: version=%s supports=%s",
+                result.get("version", "?"),
+                self._caps,
+            )
+        return result
 
     async def get_windows(self) -> dict | None:
         return await self._get("/api/windows")
@@ -120,6 +170,39 @@ class ScreenObserverClient:
         if window_index is not None:
             p["window_index"] = window_index
         return await self._get("/api/structure", p)
+
+    async def get_screenshot(self, window_index: int | None = None) -> dict | None:
+        """Fetch a screenshot from OSO (/api/screenshot).
+
+        Returns {data: base64_png, format: 'png', encoding: 'base64', window: title}
+        or None on failure.  Useful for per-window captures that OSO performs
+        natively via its accessibility adapter.
+        """
+        if not self._caps.get("screenshot", True):
+            return None
+        p: dict = {}
+        if window_index is not None:
+            p["window_index"] = window_index
+        return await self._get("/api/screenshot", p)
+
+    async def get_monitors(self) -> dict | None:
+        """Fetch monitor geometry from OSO (/api/monitors).
+
+        Returns {ok, monitors: [{bounds, scale_factor, ...}]} or None on failure.
+        Useful for multi-monitor coordinate translation and DPI-aware positioning.
+        """
+        if not self._caps.get("monitors", True):
+            return None
+        return await self._get("/api/monitors")
+
+    async def get_visible_areas(self, window_index: int) -> dict | None:
+        """Fetch the unoccluded regions of a window (/api/visible_areas).
+
+        Returns {window, visible_regions: [{x, y, width, height}]} or None.
+        Useful for verifying a click target is reachable without hitting an
+        overlapping window.
+        """
+        return await self._get("/api/visible_areas", {"window_index": window_index})
 
     async def find_element_in_tree(
         self,

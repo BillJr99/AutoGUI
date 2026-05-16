@@ -22,19 +22,21 @@ logger = logging.getLogger(__name__)
 class X11Backend(DesktopBackend):
 
     def capabilities(self) -> dict:
+        caps = super().capabilities()
         find_element = False
         try:
             import pyatspi  # noqa: F401
             find_element = True
         except Exception:
             pass
-        return {
+        caps.update({
             "find_element": find_element,
             "get_window_tree": False,
             "activate_window": True,
             "get_active_window": True,
             "get_window_text": True,
-        }
+        })
+        return caps
 
     async def find_element(
         self,

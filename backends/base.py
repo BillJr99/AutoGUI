@@ -84,6 +84,8 @@ class DesktopBackend:
             "[backend] OS Screen Observer attached: %s",
             getattr(client, "_base", "?"),
         )
+        # Note: capabilities are fetched async on first is_available() / get_capabilities()
+        # call.  Access via client.oso_capabilities or backend.capabilities()["oso_supports"].
 
     # ------------------------------------------------------------------
     # Capabilities
@@ -98,10 +100,14 @@ class DesktopBackend:
         find_element     : bool — platform supports accessibility element lookup
         get_window_tree  : bool — platform supports accessibility tree dump
         screen_observer  : bool — OS Screen Observer client is attached
+        oso_supports     : dict — OSO /api/capabilities 'supports' dict (when populated)
         """
         caps = {"find_element": False, "get_window_tree": False}
         if self._screen_observer is not None and getattr(self._screen_observer, "enabled", False):
             caps["screen_observer"] = True
+            oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+            if oso_caps:
+                caps["oso_supports"] = oso_caps
         return caps
 
     # ------------------------------------------------------------------
@@ -649,11 +655,12 @@ class DesktopBackend:
     # ------------------------------------------------------------------
 
     async def list_windows(self) -> dict:
-        """List open windows; uses OS Screen Observer as fallback when available."""
+        """List open windows; tries OS Screen Observer first when configured."""
         if self._screen_observer is not None:
             result = await self._screen_observer.get_windows()
             if result is not None:
                 return result
+            logger.warning("[backend:list_windows] OS Screen Observer unavailable; falling back to native method")
         return {"error": "list_windows not implemented for this platform"}
 
     async def launch(
@@ -674,15 +681,20 @@ class DesktopBackend:
         window_title: str | None = None,
         index: int = 0,
     ) -> dict:
-        """Find element via a11y API; uses OS Screen Observer tree walk as fallback."""
+        """Find element via a11y API; tries OS Screen Observer tree walk when configured."""
         if self._screen_observer is not None and name:
-            result = await self._screen_observer.find_element_in_tree(
-                name=str(name),
-                control_type=control_type,
-                index=int(index or 0),
-            )
-            if result is not None:
-                return result
+            oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+            if oso_caps.get("accessibility_tree", True):
+                result = await self._screen_observer.find_element_in_tree(
+                    name=str(name),
+                    control_type=control_type,
+                    index=int(index or 0),
+                )
+                if result is not None:
+                    return result
+                logger.warning("[backend:find_element] OS Screen Observer unavailable; falling back to native method")
+            else:
+                logger.debug("[backend:find_element] OSO has no accessibility tree; skipping tree walk")
         return {"error": "find_element not supported on this platform"}
 
     async def get_window_tree(
@@ -690,11 +702,12 @@ class DesktopBackend:
         window_title: str | None = None,
         depth: int = 3,
     ) -> dict:
-        """Dump accessibility tree; uses OS Screen Observer /api/structure as fallback."""
+        """Dump accessibility tree; tries OS Screen Observer /api/structure when configured."""
         if self._screen_observer is not None:
             result = await self._screen_observer.get_structure()
             if result is not None:
                 return result
+            logger.warning("[backend:get_window_tree] OS Screen Observer unavailable; falling back to native method")
         return {"error": "get_window_tree not supported on this platform"}
 
     async def describe_screen(self, window_index: int | None = None) -> dict:
