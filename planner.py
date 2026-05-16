@@ -131,6 +131,7 @@ _TYPED_PLANNER_USER = (
     "Browser tools available: {browser_available}\n"
     "Accessibility (a11y) clicking available: {a11y_available}\n\n"
     "DESKTOP STATE\n-------------\n{windows}\n\n"
+    "{registered_tools}"
     "{exemplars}"
     "{memory_hints}"
     "Produce the typed plan JSON now."
@@ -221,6 +222,7 @@ class Planner:
         windows_summary: str = "",
         exemplars: list[dict] | None = None,
         memory_hints: list[str] | None = None,
+        registered_tools: list[str] | None = None,
     ) -> str:
         """
         Ask the planner for a JSON-typed plan; falls back to the legacy
@@ -245,6 +247,7 @@ class Planner:
             browser_available="yes" if browser_available else "no",
             a11y_available="yes" if a11y_available else "no",
             windows=(windows_summary or "(unavailable)")[:1500],
+            registered_tools=_format_registered_tools(registered_tools),
             exemplars=_format_exemplars(exemplars),
             memory_hints=_format_memory_hints(memory_hints),
         )
@@ -324,6 +327,18 @@ class Planner:
                 revised_json = None
         return {"approve": approve, "issues": issues,
                 "revised_plan_json": revised_json}
+
+
+def _format_registered_tools(tools: list[str] | None) -> str:
+    if not tools:
+        return ""
+    return (
+        "REGISTERED TOOLS\n"
+        "----------------\n"
+        "Only reference these exact names in preflight tool checks and tools_hint:\n"
+        + "\n".join(f"  {t}" for t in sorted(tools))
+        + "\n\n"
+    )
 
 
 def _format_exemplars(exemplars: list[dict] | None) -> str:
