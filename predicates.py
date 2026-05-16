@@ -43,6 +43,33 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _normalize_win_str(s: str) -> str:
+    """Lower-case and strip common decorations from window app names/titles."""
+    s = s.lower().strip()
+    s = re.sub(r'\.(exe|app|lnk)$', '', s)
+    return s
+
+
+def _titles_match(needle: str, haystack: str) -> bool:
+    """True when needle and haystack refer to the same window.
+
+    Handles 'notepad' vs 'untitled - notepad', 'Notepad.exe', etc.
+    Checks normalized substring in both directions, then splits compound
+    titles on ' - ', ' – ', '|', ':' and tests each segment.
+    """
+    n = _normalize_win_str(needle)
+    h = _normalize_win_str(haystack)
+    if not n:
+        return False
+    if n in h or h in n:
+        return True
+    for segment in re.split(r'\s*[-–|:]\s*', h):
+        seg = segment.strip()
+        if seg and (n in seg or seg in n):
+            return True
+    return False
+
+
 @dataclass
 class PredicateResult:
     ok: bool
@@ -191,7 +218,8 @@ async def _check_window_title(p: dict, registry) -> PredicateResult:
     wins = wins or []
     for w in wins:
         title = str(w.get("title", "") or "")
-        if needle.lower() in title.lower():
+        app = str(w.get("app", "") or "")
+        if _titles_match(needle, title) or _titles_match(needle, app):
             return PredicateResult(True, p["kind"], f"matched {title!r}", w)
     return PredicateResult(False, p["kind"],
                            f"no window title contains {needle!r}",
@@ -212,10 +240,11 @@ async def _check_active_app(p: dict, registry) -> PredicateResult:
     if not info or not info.get("found"):
         return PredicateResult(False, p["kind"], "no active window detected")
     win = info.get("window") or info
-    app = str(win.get("app", "") or "").lower()
-    title = str(win.get("title", "") or "").lower()
-    if target in app or target in title:
-        return PredicateResult(True, p["kind"], f"active app/title matched {target!r}", win)
+    app = str(win.get("app", "") or "")
+    title = str(win.get("title", "") or "")
+    target_raw = str(p.get("value") or "")
+    if _titles_match(target_raw, app) or _titles_match(target_raw, title):
+        return PredicateResult(True, p["kind"], f"active app/title matched {target_raw!r}", win)
     return PredicateResult(False, p["kind"],
                            f"active app={app!r} title={title!r}", win)
 
