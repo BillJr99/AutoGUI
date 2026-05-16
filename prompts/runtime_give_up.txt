@@ -2,7 +2,9 @@
 Your last response indicated confusion, inability to help, or that you forgot the task — but you have NOT finished it.
 DO NOT ask for clarification. DO NOT give up. Instead:
 1. Re-read the original task above and identify the next incomplete step.
-2. Use desktop_list_windows to see what is currently open.
-3. Use shell_run to search for missing programs or paths.
-4. Continue executing until the entire task is complete.
-Issue tool calls NOW to make progress on the task.
+2. Use desktop_screenshot or desktop_screenshot_marked to see the screen, not just the error string.
+3. Use desktop_list_windows + desktop_get_active_window to confirm focus.
+4. Use desktop_click_text / desktop_click_element / desktop_click_mark to re-target with the fresh perception evidence; the previous failure's payload may already include a recovery_probe with screenshot + window list — use it.
+5. Use shell_run to search for missing programs or paths.
+6. Continue executing until the entire task is complete.
+Issue tool calls NOW to make progress on the task. Only after at least one perception-driven retry has also failed should you escalate to the user.

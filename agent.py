@@ -33,6 +33,7 @@ import json
 import logging
 import platform as _platform
 import re
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
@@ -333,6 +334,19 @@ class Agent:
         self._predicate_retry_delay: float = max(
             0.0, float(controller_cfg.get("predicate_retry_delay_seconds", 0.5))
         )
+        # Recovery probe: when a predicate or step fails, capture a
+        # perception bundle (screenshot + window list + OSO observe) so
+        # the model can re-target unattended on the next turn.  Bounded
+        # by ``recovery_probe_max_per_step`` to keep a hopeless step from
+        # looping on screenshots.  Symmetric with the pi-extension.
+        self._recovery_probe_enabled: bool = bool(
+            controller_cfg.get("recovery_probe_enabled", True)
+        )
+        self._recovery_probe_max_per_step: int = max(
+            0, int(controller_cfg.get("recovery_probe_max_per_step", 2))
+        )
+        # Per-step counter; reset at the top of each step loop iteration.
+        self._recovery_probe_count: dict[str, int] = {}
         self._visual_diff_enabled: bool = bool(
             controller_cfg.get("visual_diff_enabled", True)
         )
@@ -1289,6 +1303,24 @@ class Agent:
                         f"predicate {predicates.render(step.predicate)} "
                         f"did not hold ({p_result.detail})"
                     )
+                    # Recovery probe: attach a perception bundle so the next
+                    # planner / executor turn can re-target unattended
+                    # instead of escalating.  Symmetric with the
+                    # pi-extension's check_predicate failure path.
+                    probe = await self._emit_recovery_probe(step.id, reason)
+                    if probe is not None:
+                        yield AgentEvent(
+                            kind="recovery_probe",
+                            content=(
+                                f"recovery probe attached for step {step.id}: "
+                                f"predicate {predicates.render(step.predicate)} failed — "
+                                "before reporting blocked, use the screenshot + window "
+                                "list + (when present) oso_observe in this event's data "
+                                "to call desktop_screenshot_marked / desktop_click_text / "
+                                "desktop_click_element and re-attempt."
+                            ),
+                            data=probe,
+                        )
 
             # Process the verdict.
             if verdict == StepVerdict.DONE:
@@ -1367,6 +1399,36 @@ class Agent:
                 retry_count=retry_count,
                 max_retries=self._step_max_retries,
             )
+
+            # Recovery probe before escalation: when the step is going to
+            # retry or replan, the perception bundle lets the next attempt
+            # / planner turn see the actual screen state, not just the
+            # error string.  Skip on terminal verdicts (the user will be
+            # taking over) and on RETRY+predicate paths where we already
+            # emitted a probe immediately after the predicate failed.
+            already_probed = (
+                verdict == StepVerdict.BLOCKED
+                and bool(step.predicate)
+                and predicate_failure_detail
+            )
+            if (
+                not already_probed
+                and action in (RecoveryAction.RETRY, RecoveryAction.WAIT_AND_RETRY,
+                               RecoveryAction.REPLAN)
+            ):
+                step_probe = await self._emit_recovery_probe(step.id, reason)
+                if step_probe is not None:
+                    yield AgentEvent(
+                        kind="recovery_probe",
+                        content=(
+                            f"recovery probe attached for step {step.id}: {verdict.value} — "
+                            "the screenshot + window list + (when present) oso_observe "
+                            "in this event's data show the current screen; use them with "
+                            "desktop_screenshot_marked / desktop_click_text / "
+                            "desktop_click_element to re-target on the next attempt."
+                        ),
+                        data=step_probe,
+                    )
 
             yield AgentEvent(
                 kind="step_failure",
@@ -2020,6 +2082,77 @@ class Agent:
             except Exception:
                 pass
         return anchor
+
+    async def _emit_recovery_probe(self, step_id: str, reason: str) -> dict | None:
+        """Assemble a perception bundle on predicate / step failure.
+
+        Captures a screenshot (marked variant when available), the current
+        active window, the visible window list, and (when an OSO client is
+        attached to the backend) an observe() diff token.  Returns a dict
+        suitable for embedding in an AgentEvent.data payload — or None when
+        the per-step ceiling has been hit or the feature is disabled.
+
+        Mirrors the pi-extension's `emitRecoveryProbe` in tools.ts so both
+        runtimes produce the same shape.  Never throws — all calls are
+        best-effort and missing pieces just produce absent fields.
+        """
+        if not self._recovery_probe_enabled:
+            return None
+        cap = self._recovery_probe_max_per_step
+        seen = self._recovery_probe_count.get(step_id, 0)
+        if cap > 0 and seen >= cap:
+            return None
+        self._recovery_probe_count[step_id] = seen + 1
+        probe: dict = {"step": step_id, "reason": reason, "ts": time.time()}
+        tools = self._registry.list_tools()
+        # Prefer the marked screenshot when SoM is available; the model can
+        # then call desktop_click_mark directly without another perception
+        # round-trip.
+        shot_tool = (
+            "desktop_screenshot_marked"
+            if "desktop_screenshot_marked" in tools
+            else "desktop_screenshot" if "desktop_screenshot" in tools
+            else None
+        )
+        if shot_tool:
+            try:
+                raw = await self._registry.dispatch(shot_tool, {})
+                shot = json.loads(raw) if raw else {}
+                # Strip the inline image bytes — keep the path + marks so
+                # the event payload doesn't bloat traces / TUI buffers.
+                shot.pop("data", None)
+                probe["screenshot"] = shot
+            except Exception as e:
+                probe["screenshot_error"] = str(e)
+        if "desktop_get_active_window" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_get_active_window", {})
+                probe["active_window"] = json.loads(raw)
+            except Exception:
+                pass
+        if "desktop_list_windows" in tools:
+            try:
+                raw = await self._registry.dispatch("desktop_list_windows", {})
+                wins = json.loads(raw)
+                if isinstance(wins, dict) and isinstance(wins.get("windows"), list):
+                    probe["window_list"] = wins["windows"][:25]
+            except Exception:
+                pass
+        # Direct OSO observe — only when the backend has an attached client.
+        backend = getattr(self._registry, "_backend", None)
+        oso = getattr(backend, "_screen_observer", None) if backend else None
+        if oso is not None and getattr(oso, "enabled", False):
+            try:
+                obs = await oso.observe()
+                if obs:
+                    probe["oso_observe"] = {
+                        "tree_hash": obs.get("tree_hash"),
+                        "diff_token": obs.get("diff_token"),
+                        "description": obs.get("description"),
+                    }
+            except Exception:
+                pass
+        return probe
 
     async def _best_effort_active_app(self) -> str:
         """Return a normalised app slug for the active window, or '' on miss."""

@@ -64,5 +64,17 @@
     "bufferSeconds": 5.0,
     "maxWidth": 960,
     "outDir": ""
-  }
+  },
+
+  "_screen_observer_section": "OS Screen Observer (OSO) overlay — when reachable, desktop_* tools prefer OSO's a11y/observe paths and fall through to native on any failure (silent fallback contract). Auto-probed at session_start; no user prompt. Set disabled=true to skip the probe entirely. baseUrl is the REST endpoint used when the MCP probe doesn't find a server.",
+  "screenObserver": {
+    "disabled": false,
+    "baseUrl": "http://127.0.0.1:5001",
+    "timeoutMs": 2000,
+    "mcpServerName": "screen-observer"
+  },
+
+  "_recovery_section": "When a predicate or desktop_* tool fails, the extension assembles a perception bundle (window list + active window + OSO observe diff) and attaches it to the error so the model can re-target on its next turn instead of escalating immediately. recoveryProbeMaxPerStep caps the number of probes per plan step (0 = unbounded) to keep a hopeless step from looping on screenshots.",
+  "recoveryProbeEnabled": true,
+  "recoveryProbeMaxPerStep": 2
 }

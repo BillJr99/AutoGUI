@@ -28,6 +28,7 @@ import {
 } from "./preflight.js";
 import type { ProgressStore, TaskProgress } from "./progress.js";
 import { ScreenRecorder } from "./screen_record.js";
+import type { ScreenObserverClient } from "./screen_observer_client.js";
 import { normalizeSkillSteps, type SkillStep, type SkillStore } from "./skills.js";
 import { annotateScreenshot } from "./som.js";
 import { findText } from "./tesseract.js";
@@ -75,6 +76,13 @@ export interface DesktopToolOptions {
   appMemory?: AppMemory;
   /** Optional cost-telemetry tracker; reset at /autogui task start. */
   budget?: BudgetTracker;
+  /** Optional OS Screen Observer client; when attached the desktop_* tools
+   *  prefer OSO's a11y / observe paths and fall through to native on any
+   *  failure (silent fallback contract). */
+  screenObserver?: ScreenObserverClient;
+  /** Per-step recovery-probe counter (mutated by the controller wrapper).
+   *  Bounded by `config.recoveryProbeMaxPerStep`. */
+  recoveryProbeCounter?: { count: number; stepId: string };
 }
 
 const Region = Type.Object({
@@ -178,6 +186,34 @@ export function createDesktopTools(
     return undefined;
   };
 
+  const oso = options.screenObserver;
+
+  /** OSO-first screenshot: when OSO is attached and supports /api/screenshot,
+   * fetch via the observer (per-window when window_index hinted) and save the
+   * PNG to the screenshot dir.  Returns null on any failure so callers fall
+   * through to the native backend. */
+  const osoScreenshot = async (): Promise<ScreenshotResult | null> => {
+    if (!oso || !oso.enabled) return null;
+    if (oso.osoCapabilities.screenshot === false) return null;
+    try {
+      const r = await oso.getScreenshot();
+      if (!r) return null;
+      const b64 = (r.data as string | undefined) ?? (r.base64_png as string | undefined);
+      if (!b64) return null;
+      const { savePng } = await import("./backends/common.js");
+      const path = await savePng(b64, saveDir, "oso_screenshot");
+      const buf = Buffer.from(b64, "base64");
+      let width = 0, height = 0;
+      if (buf.length >= 24 && buf.toString("ascii", 12, 16) === "IHDR") {
+        width = buf.readUInt32BE(16);
+        height = buf.readUInt32BE(20);
+      }
+      return { path, width, height, mimeType: "image/png", data: b64 };
+    } catch {
+      return null;
+    }
+  };
+
   /** Capture window-list state before a tool dispatch, used by Phase 4 diff. */
   const snapshotWindows = async (signal?: AbortSignal): Promise<WindowInfo[] | undefined> => {
     try {
@@ -222,6 +258,24 @@ export function createDesktopTools(
       // Skill recording.
       if (!META_TOOLS.has(toolName) && !toolName.startsWith("skill_")) {
         options.sessionSteps.push({ tool: toolName, args: { ...params } });
+      }
+
+      // Post-action OSO observe: when OSO is attached and this was a
+      // state-changing desktop action, ask the observer for a diff token so
+      // the model can verify the UI actually changed in the expected way.
+      if (oso && oso.enabled && STATE_CHANGING.has(toolName) && !toolName.startsWith("browser_") && !toolName.startsWith("skill_")) {
+        if (oso.osoCapabilities.observe_with_diff !== false) {
+          try {
+            const obs = await oso.observe();
+            if (obs) {
+              (result.details as Record<string, unknown>).oso_observe = {
+                tree_hash: obs.tree_hash,
+                diff_token: obs.diff_token,
+                changed: obs.changed,
+              };
+            }
+          } catch { /* best-effort */ }
+        }
       }
 
       // State diff (window-set).  Only meaningful for desktop_* state-changers.
@@ -287,6 +341,37 @@ export function createDesktopTools(
           }
         } catch { /* swallow */ }
       }
+      // Recovery probe: when a desktop_* tool fails, attach a perception
+      // bundle so the model can re-target on the next turn rather than
+      // surface the failure upstream.  Gated by config.recoveryProbeEnabled
+      // and a per-step ceiling; never thrown — best-effort.
+      if (cfg.recoveryProbeEnabled && toolName.startsWith("desktop_") && !META_TOOLS.has(toolName)) {
+        const counter = options.recoveryProbeCounter;
+        const cap = cfg.recoveryProbeMaxPerStep;
+        if (!counter || cap === 0 || counter.count < cap) {
+          try {
+            const probe = await emitRecoveryProbe(getBackend, oso, signal);
+            if (probe) {
+              void options.trace.writeEvent("recovery_probe", `perception bundle for failed ${toolName}`, probe);
+              await logger?.log("tool.recovery_probe", { toolName, ...probe });
+              if (counter) counter.count++;
+              // Attach the bundle to the thrown error's details so the
+              // model sees the perception payload on its next turn.
+              if (error instanceof Error) {
+                const existing = (error as { details?: Record<string, unknown> }).details ?? {};
+                (error as { details?: Record<string, unknown> }).details = {
+                  ...existing,
+                  recovery_probe: probe,
+                  recovery_hint:
+                    "Predicate/step failed.  Before giving up, call describe_screen / " +
+                    "desktop_screenshot_marked / desktop_click_text / desktop_click_element " +
+                    "to re-target.  The recovery_probe payload above shows the current screen.",
+                };
+              }
+            }
+          } catch { /* swallow */ }
+        }
+      }
       throw error;
     }
   };
@@ -311,7 +396,10 @@ export function createDesktopTools(
           const cached = options.cache.get<ScreenshotResult>(cacheKey);
           if (cached) return screenshotResult(cached, Boolean(options.omitScreenshotImages?.()));
         }
-        const r = await backend.screenshot({ region, saveDir }, signal);
+        // OSO-first when no region (region requires native crop).
+        let r: ScreenshotResult | null = null;
+        if (!region) r = await osoScreenshot();
+        if (!r) r = await backend.screenshot({ region, saveDir }, signal);
         if (cacheKey) options.cache.set(cacheKey, r);
         return screenshotResult(r, Boolean(options.omitScreenshotImages?.()));
       }),
@@ -467,6 +555,37 @@ export function createDesktopTools(
       executionMode: "sequential",
       execute: wrap("desktop_click_element", async (params, signal) => {
         const backend = await getBackend();
+        // OSO-first element targeting.  When OSO returns an element_id we
+        // can invoke it directly (proper UIA invoke / AT-SPI action),
+        // which is more reliable than a synthesized click on the bounds.
+        if (oso && oso.enabled && oso.osoCapabilities.accessibility_tree !== false) {
+          const el = await oso.findElement({
+            name: params.name,
+            controlType: params.control_type,
+            windowTitle: params.window_title,
+            index: params.index,
+          });
+          if (el) {
+            if (el.element_id && oso.osoCapabilities.element_targeting !== false) {
+              const inv = await oso.elementClick(el.element_id);
+              if (inv) {
+                return textResult(`Clicked OSO element ${JSON.stringify(el.name || params.name)}.`, {
+                  ...inv, method: "screen_observer",
+                  resolved_to: { name: el.name, controlType: el.control_type, rect: el.rect },
+                });
+              }
+            }
+            const r = el.rect;
+            const cx = Math.round(r.x + Math.max(1, r.width / 2));
+            const cy = Math.round(r.y + Math.max(1, r.height / 2));
+            const click = await backend.click(cx, cy, params.button ?? "left", Math.max(1, Math.round(params.clicks ?? 1)), signal);
+            return textResult(`Clicked OSO-located element ${JSON.stringify(el.name || params.name)}.`, {
+              ...click, method: "screen_observer_coords",
+              resolved_to: { x: cx, y: cy, name: el.name, controlType: el.control_type },
+            });
+          }
+          // OSO didn't find it — fall through to native a11y.
+        }
         if (!backend.findElement) {
           return textResult(
             `desktop_click_element is not supported on this backend (${backend.name}). ` +
@@ -568,6 +687,29 @@ export function createDesktopTools(
       execute: wrap("desktop_list_windows", async (_params, signal) => {
         const cached = options.cache.get<{ windows: WindowInfo[]; count: number }>("listWindows");
         if (cached) return textResult(`Found ${cached.count} visible windows. (cached)`, cached);
+        // OSO-first window listing — when reachable it returns richer window
+        // data (uid, app, bounds) than every native backend's minimum.
+        if (oso && oso.enabled) {
+          const r = await oso.getWindows();
+          const list = (r?.windows as Array<Record<string, unknown>> | undefined);
+          if (list) {
+            const windows: WindowInfo[] = list.map((w) => {
+              const b = (w.bounds as Record<string, number> | undefined) ?? {};
+              return {
+                id: (w.window_uid as string) ?? (w.id as string),
+                title: (w.title as string) ?? "",
+                app: (w.app as string) ?? (w.process_name as string),
+                pid: w.pid as number | undefined,
+                x: b.x ?? 0, y: b.y ?? 0,
+                width: b.width ?? 0, height: b.height ?? 0,
+                active: (w.active as boolean) ?? false,
+              };
+            });
+            const result = { windows, count: windows.length, source: "screen_observer" as const };
+            options.cache.set("listWindows", { windows, count: windows.length });
+            return textResult(`Found ${result.count} visible windows. (oso)`, result);
+          }
+        }
         const backend = await getBackend();
         const result = await backend.listWindows(signal);
         options.cache.set("listWindows", result);
@@ -609,6 +751,17 @@ export function createDesktopTools(
           title: typeof params.title === "string" ? params.title : undefined,
           app: typeof params.app === "string" ? params.app : undefined,
         };
+        // OSO bring_to_foreground does fuzzy substring matching natively;
+        // try it first when title or id is provided.
+        if (oso && oso.enabled && oso.osoCapabilities.bring_to_foreground !== false) {
+          const r = await oso.bringToForeground({
+            windowTitle: target.title,
+            windowUid: target.id,
+          });
+          if (r && r.success) {
+            return textResult("Focused window. (oso)", { ...r, requested: target, method: "screen_observer" });
+          }
+        }
         const result = await backend.focusWindow(target, signal);
         return textResult("Focused window.", result);
       }),
@@ -1141,13 +1294,37 @@ export function createDesktopTools(
           };
         }
         const result = await checkPredicate(pred, backend, helpers);
+        // On predicate failure, attach a perception bundle so the model can
+        // re-target unattended on the next turn.  Bounded by the per-step
+        // ceiling so a hopeless predicate can't loop on screenshots.
+        let recoveryProbe: Record<string, unknown> | undefined;
+        if (!result.ok && cfg.recoveryProbeEnabled) {
+          const counter = options.recoveryProbeCounter;
+          const cap = cfg.recoveryProbeMaxPerStep;
+          if (!counter || cap === 0 || counter.count < cap) {
+            try {
+              const probe = await emitRecoveryProbe(getBackend, oso, signal);
+              if (probe) {
+                recoveryProbe = probe;
+                if (counter) counter.count++;
+                void options.trace.writeEvent(
+                  "recovery_probe",
+                  `predicate failed: ${renderPredicate(pred)}`,
+                  probe,
+                );
+              }
+            } catch { /* best-effort */ }
+          }
+        }
         return textResult(
-          `${result.ok ? "ok" : "FAIL"}: ${renderPredicate(pred)} — ${result.detail}`,
+          `${result.ok ? "ok" : "FAIL"}: ${renderPredicate(pred)} — ${result.detail}` +
+          (recoveryProbe ? " (recovery_probe attached — call desktop_screenshot_marked / desktop_click_text / desktop_click_element to re-target before reporting blocked)" : ""),
           {
             ok: result.ok,
             kind: result.kind,
             detail: result.detail,
             observed: result.observed,
+            ...(recoveryProbe ? { recovery_probe: recoveryProbe } : {}),
           },
         );
       }),
@@ -1390,4 +1567,37 @@ function str(o: Record<string, unknown>, k: string, fallback?: string): string {
   if (typeof v === "string") return v;
   if (fallback !== undefined) return fallback;
   throw new Error(`Missing string arg ${k}`);
+}
+
+/**
+ * Assemble a perception bundle the model can use to re-target after a
+ * predicate or tool failure: current windows, active window, and (when
+ * OSO is attached) an observe() diff token.  Never throws — all calls
+ * are best-effort and missing pieces just produce undefined fields.
+ *
+ * Exported so both tools.ts (on tool failure) and the controller (on
+ * predicate failure) call the same assembler.
+ */
+export async function emitRecoveryProbe(
+  getBackend: () => Promise<DesktopBackend>,
+  oso: ScreenObserverClient | undefined,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown> | null> {
+  const probe: Record<string, unknown> = { ts: Date.now() };
+  try {
+    const backend = await getBackend();
+    try { probe.active_window = (await backend.activeWindow(signal)).window; } catch { /* ignore */ }
+    try { probe.window_list = (await backend.listWindows(signal)).windows.slice(0, 25); } catch { /* ignore */ }
+  } catch { /* backend unavailable */ }
+  if (oso && oso.enabled) {
+    try {
+      const obs = await oso.observe();
+      if (obs) probe.oso_observe = {
+        tree_hash: obs.tree_hash,
+        diff_token: obs.diff_token,
+        description: obs.description,
+      };
+    } catch { /* ignore */ }
+  }
+  return probe;
 }
