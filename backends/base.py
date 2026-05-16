@@ -176,6 +176,46 @@ class DesktopBackend:
         save_dir: str = "screenshots",
         resize_width: int = 1280,
     ) -> dict:
+        # Prefer OS Screen Observer for full-screen captures — it has direct
+        # access to the native framebuffer without the X11/Pillow stack.
+        if region is None and self._screen_observer is not None:
+            oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+            if oso_caps.get("screenshot", True):
+                try:
+                    oso_result = await self._screen_observer.get_screenshot()
+                    if oso_result is not None:
+                        b64 = oso_result.get("data") or oso_result.get("base64_png")
+                        if b64:
+                            from PIL import Image
+                            img_bytes = base64.b64decode(b64)
+                            img = Image.open(io.BytesIO(img_bytes))
+                            img.load()
+                            if resize_width and img.width > resize_width:
+                                ratio = resize_width / img.width
+                                img = img.resize(
+                                    (resize_width, int(img.height * ratio)), Image.LANCZOS
+                                )
+                            save_path = Path(save_dir)
+                            save_path.mkdir(parents=True, exist_ok=True)
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            filename = save_path / f"screenshot_{ts}.png"
+                            img.save(str(filename))
+                            buf = io.BytesIO()
+                            img.save(buf, format="PNG")
+                            out_b64 = base64.b64encode(buf.getvalue()).decode()
+                            result = {
+                                "path": str(filename),
+                                "width": img.width,
+                                "height": img.height,
+                                "base64_png": out_b64,
+                                "source": "screen_observer",
+                            }
+                            ck = f"full:{resize_width}"
+                            if self._cache_ttl > 0:
+                                self._screenshot_cache = (time.monotonic(), ck, dict(result))
+                            return result
+                except Exception as _oso_err:
+                    logger.debug("[backend:screenshot] OSO screenshot failed: %s; falling back to native", _oso_err)
         # Cache lookup — only for full-screen captures with matching resize_width.
         cache_key = f"full:{resize_width}" if region is None else None
         if cache_key and self._screenshot_cache and self._cache_ttl > 0:
@@ -862,7 +902,30 @@ class DesktopBackend:
             return {"error": "element_set_value failed or OSO unreachable"}
         return result
 
+    async def get_monitors(self) -> dict:
+        """Return monitor geometry via OS Screen Observer (/api/monitors)."""
+        if self._screen_observer is not None:
+            oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+            if oso_caps.get("monitors", True):
+                result = await self._screen_observer.get_monitors()
+                if result is not None:
+                    return result
+        return {"error": "get_monitors requires OS Screen Observer (set screen_observer.enabled=true in config.json)"}
+
     async def get_active_window(self) -> dict:
+        """Return the currently focused window; uses OS Screen Observer when configured."""
+        if self._screen_observer is not None:
+            try:
+                wins_result = await self._screen_observer.get_windows()
+                if wins_result is not None:
+                    for w in wins_result.get("windows", []):
+                        if w.get("active"):
+                            return {"found": True, "window": w}
+                obs = await self._screen_observer.observe()
+                if obs is not None and obs.get("window"):
+                    return {"found": True, "window": obs["window"]}
+            except Exception as _e:
+                logger.debug("[backend:get_active_window] OSO failed: %s", _e)
         return {"found": False, "error": "get_active_window not supported on this platform"}
 
     async def get_window_text(self, max_chars: int = 50000) -> dict:
