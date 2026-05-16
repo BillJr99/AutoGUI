@@ -200,11 +200,15 @@ class WindowsBackend(DesktopBackend):
             return (-2, "", f"PowerShell timed out after {timeout}s")
 
     def capabilities(self) -> dict:
+        caps = super().capabilities()
+        caps.update({"activate_window": True, "get_active_window": True, "get_window_text": True})
         try:
             import uiautomation  # noqa: F401
-            return {"find_element": True, "get_window_tree": True, "activate_window": True, "get_active_window": True, "get_window_text": True}
+            caps.update({"find_element": True, "get_window_tree": True})
         except ImportError:
-            return {"find_element": False, "get_window_tree": False, "activate_window": True, "get_active_window": True, "get_window_text": True}
+            caps.setdefault("find_element", False)
+            caps.setdefault("get_window_tree", False)
+        return caps
 
     # ------------------------------------------------------------------
     # Native input via SendInput (Phase 10)
@@ -358,7 +362,12 @@ class WindowsBackend(DesktopBackend):
             return await super().hotkey(keys)
 
     async def list_windows(self) -> dict:
-        """List visible windows with titles, pids, bounding boxes, and active status."""
+        """List visible windows; tries OS Screen Observer first, falls back to PowerShell."""
+        if self._screen_observer is not None:
+            result = await self._screen_observer.get_windows()
+            if result is not None:
+                return result
+            logger.warning("[windows:list_windows] OS Screen Observer unavailable; falling back to PowerShell")
         script = (
             self._WIN_FOCUS_TYPE +
             "$ErrorActionPreference = 'SilentlyContinue'\n"
@@ -589,10 +598,12 @@ class WindowsBackend(DesktopBackend):
 
             return await loop.run_in_executor(None, _find)
         except ImportError:
-            return {"error": "uiautomation not installed — pip install uiautomation"}
+            logger.warning("[windows:find_element] uiautomation not installed; falling back to OS Screen Observer")
+            return await super().find_element(name=name, control_type=control_type, window_title=window_title, index=index)
         except Exception as e:
+            logger.warning("[windows:find_element] UIAutomation failed (%s); falling back to OS Screen Observer", e)
             logger.debug("[windows:find_element] %s", traceback.format_exc())
-            return {"error": str(e)}
+            return await super().find_element(name=name, control_type=control_type, window_title=window_title, index=index)
 
     async def get_window_tree(
         self,
@@ -631,7 +642,9 @@ class WindowsBackend(DesktopBackend):
             tree = await loop.run_in_executor(None, _tree)
             return {"tree": tree}
         except ImportError:
-            return {"error": "uiautomation not installed — pip install uiautomation"}
+            logger.warning("[windows:get_window_tree] uiautomation not installed; falling back to OS Screen Observer")
+            return await super().get_window_tree(window_title=window_title, depth=depth)
         except Exception as e:
+            logger.warning("[windows:get_window_tree] UIAutomation failed (%s); falling back to OS Screen Observer", e)
             logger.debug("[windows:get_window_tree] %s", traceback.format_exc())
-            return {"error": str(e)}
+            return await super().get_window_tree(window_title=window_title, depth=depth)
