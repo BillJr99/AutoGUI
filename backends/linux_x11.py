@@ -240,6 +240,11 @@ class X11Backend(DesktopBackend):
         """
         if not any([title, pid, app, window_id]):
             return {"error": "Provide at least one of: title, pid, app, window_id (hex wid)"}
+        if self._screen_observer is not None and title:
+            result = await self._screen_observer.bring_to_foreground(window_title=title)
+            if result is not None and result.get("success"):
+                return {"success": True, "method": "screen_observer",
+                        "window": result.get("window", title)}
 
         # Find the target window
         windows_result = await self.list_windows()
