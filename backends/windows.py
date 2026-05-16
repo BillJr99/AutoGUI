@@ -443,6 +443,11 @@ class WindowsBackend(DesktopBackend):
         """Bring a window to the foreground — same logic as WSLBackend."""
         if not any([title, pid, app, window_id]):
             return {"error": "Provide at least one of: title, pid, app, window_id"}
+        if self._screen_observer is not None and title:
+            result = await self._screen_observer.bring_to_foreground(window_title=title)
+            if result is not None and result.get("success"):
+                return {"success": True, "method": "screen_observer",
+                        "window": result.get("window", title)}
 
         target = {"id": window_id, "pid": pid, "title": title, "app": app}
         target_b64 = base64.b64encode(json.dumps(target).encode("utf-8")).decode("ascii")
