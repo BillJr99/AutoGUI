@@ -172,12 +172,42 @@ class Agent:
         if (self._agent_cfg.get("controller", {}) or {}).get("enabled", True):
             controller_protocol = self._prompts.text("controller_step_protocol")
 
+        # OSO text observation: opt-in feature that pairs the auto-screenshot
+        # with a textual perception bundle (description + sketch + depth-
+        # trimmed a11y tree).  Hard-gated on screen_observer.enabled AND the
+        # backend actually reporting screen_observer capability — otherwise
+        # the model must see no trace of OSO in its context.
+        _oso_text_cfg = (
+            (cfg.get("screen_observer", {}) or {}).get("text_observation", {}) or {}
+        )
+        _backend_caps_for_oso = getattr(self._registry, "_backend_caps", {}) or {}
+        self._oso_text_enabled: bool = bool(
+            _oso_text_cfg.get("enabled", False)
+            and _backend_caps_for_oso.get("screen_observer", False)
+        )
+        self._oso_text_cfg = {
+            "include_sketch": bool(_oso_text_cfg.get("include_sketch", True)),
+            "include_tree": bool(_oso_text_cfg.get("include_tree", True)),
+            "scope": str(_oso_text_cfg.get("scope", "active_window")),
+            "max_chars": int(_oso_text_cfg.get("max_chars", 6000)),
+            "tree_start_depth": int(_oso_text_cfg.get("tree_start_depth", 6)),
+            "tree_min_depth": int(_oso_text_cfg.get("tree_min_depth", 1)),
+            "tree_max_chars": int(_oso_text_cfg.get("tree_max_chars", 4000)),
+        }
+        # OSO-specific prompt fragment is loaded ONLY when OSO is reachable.
+        # When OSO is disabled the file isn't read, so the strings inside
+        # never enter the system prompt or any other LLM-visible context.
+        oso_prompt_fragment = ""
+        if _backend_caps_for_oso.get("screen_observer", False):
+            oso_prompt_fragment = self._prompts.text("system_desktop_rules_oso")
+
         self._system_prompt: str = "\n\n".join(filter(None, [
             base,
             _build_os_instructions(self._prompts),
             self._prompts.text("system_desktop_rules"),
             self._prompts.text("system_browser_rules"),
             self._prompts.text("system_tool_analysis"),
+            oso_prompt_fragment,
             controller_protocol,
         ]))
 
@@ -1961,6 +1991,33 @@ class Agent:
                 except Exception as e:
                     logger.warning("[agent] controller auto-screenshot failed: %s", e)
 
+                # OSO text observation: paired with the screenshot when enabled
+                # and the backend has the screen_observer capability.  Hard-
+                # gated so when OSO is off no "[OSO ...]" string ever lands
+                # in local_history.
+                if self._oso_text_enabled:
+                    try:
+                        bundle = await self._build_oso_text_bundle()
+                        if bundle is not None:
+                            tools_str = ", ".join(sorted(state_changing))
+                            parts = [
+                                f"[Text observation AFTER {tools_str} "
+                                f"(scope={bundle['scope']}, tree_depth={bundle['depth_used']}"
+                                f"{', truncated' if bundle['truncated'] else ''})]"
+                            ]
+                            if bundle["description"]:
+                                parts.append(bundle["description"])
+                            if bundle["sketch"]:
+                                parts.append("SKETCH:\n" + bundle["sketch"])
+                            if bundle["tree_text"]:
+                                parts.append("TREE:\n" + bundle["tree_text"])
+                            local_history.append({
+                                "role": "user",
+                                "content": "\n\n".join(parts),
+                            })
+                    except Exception as e:
+                        logger.warning("[agent] OSO text observation failed: %s", e)
+
             if step_failure_seen:
                 local_history.append({
                     "role": "user",
@@ -2152,7 +2209,79 @@ class Agent:
                     }
             except Exception:
                 pass
+            # Full text bundle (description + sketch + depth-trimmed tree)
+            # when text_observation is enabled.  Gives the recovery flow the
+            # same perception payload as the success-path injection.
+            if self._oso_text_enabled:
+                try:
+                    bundle = await self._build_oso_text_bundle()
+                    if bundle is not None:
+                        probe["oso_text"] = bundle
+                except Exception:
+                    pass
         return probe
+
+    async def _build_oso_text_bundle(self) -> dict | None:
+        """Build a length-bounded text observation bundle via the backend.
+
+        Resolves the active-window index when scope is 'active_window' (or
+        'auto') so OSO can return a focused view.  Returns None when the
+        backend or OSO is unavailable.
+        """
+        backend = getattr(self._registry, "_backend", None)
+        if backend is None or getattr(backend, "_screen_observer", None) is None:
+            return None
+        cfg = self._oso_text_cfg
+        scope = cfg.get("scope", "active_window")
+        window_index: int | None = None
+        if scope in ("active_window", "auto"):
+            window_index = await self._best_effort_active_window_index()
+        bundle = await backend.describe_screen_text(
+            window_index=window_index,
+            include_sketch=cfg["include_sketch"],
+            include_tree=cfg["include_tree"],
+            tree_start_depth=cfg["tree_start_depth"],
+            tree_min_depth=cfg["tree_min_depth"],
+            tree_max_chars=cfg["tree_max_chars"],
+            max_chars=cfg["max_chars"],
+        )
+        if (
+            scope == "auto"
+            and bundle is not None
+            and not (bundle.get("description") or bundle.get("sketch") or bundle.get("tree_text"))
+        ):
+            # Active-window view returned nothing — retry whole-screen.
+            bundle = await backend.describe_screen_text(
+                window_index=None,
+                include_sketch=cfg["include_sketch"],
+                include_tree=cfg["include_tree"],
+                tree_start_depth=cfg["tree_start_depth"],
+                tree_min_depth=cfg["tree_min_depth"],
+                tree_max_chars=cfg["tree_max_chars"],
+                max_chars=cfg["max_chars"],
+            )
+        return bundle
+
+    async def _best_effort_active_window_index(self) -> int | None:
+        """Best-effort index of the focused window from OSO /api/windows."""
+        backend = getattr(self._registry, "_backend", None)
+        oso = getattr(backend, "_screen_observer", None) if backend else None
+        if oso is None:
+            return None
+        try:
+            wins = await oso.get_windows()
+        except Exception:
+            return None
+        if not wins:
+            return None
+        items = wins.get("windows") if isinstance(wins, dict) else None
+        if not items:
+            return None
+        for i, w in enumerate(items):
+            if w.get("focused") or w.get("active") or w.get("is_focused"):
+                idx = w.get("window_index")
+                return int(idx) if idx is not None else i
+        return None
 
     async def _best_effort_active_app(self) -> str:
         """Return a normalised app slug for the active window, or '' on miss."""

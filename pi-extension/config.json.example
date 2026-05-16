@@ -71,7 +71,18 @@
     "disabled": false,
     "baseUrl": "http://127.0.0.1:5001",
     "timeoutMs": 2000,
-    "mcpServerName": "screen-observer"
+    "mcpServerName": "screen-observer",
+    "_textObservation_comment": "Post-action text observation: pairs the auto-screenshot with a description + ASCII sketch + depth-limited a11y tree, and registers desktop_describe_screen + desktop_get_window_tree as model-callable tools. Only takes effect when an OSO server is reachable. scope: 'active_window' (focused window), 'screen' (whole desktop), or 'auto' (active_window then whole-screen if empty). The tree depth auto-shrinks until the serialised tree fits under treeMaxChars; the combined bundle is capped at maxChars.",
+    "textObservation": {
+      "enabled": false,
+      "includeSketch": true,
+      "includeTree": true,
+      "scope": "active_window",
+      "maxChars": 6000,
+      "treeStartDepth": 6,
+      "treeMinDepth": 1,
+      "treeMaxChars": 4000
+    }
   },
 
   "_recovery_section": "When a predicate or desktop_* tool fails, the extension assembles a perception bundle (window list + active window + OSO observe diff) and attaches it to the error so the model can re-target on its next turn instead of escalating immediately. recoveryProbeMaxPerStep caps the number of probes per plan step (0 = unbounded) to keep a hopeless step from looping on screenshots.",

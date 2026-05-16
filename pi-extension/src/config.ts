@@ -118,6 +118,21 @@ export interface ExtensionConfig {
     /** MCP server name to look up via the Pi runtime (best-effort).
      *  Empty string disables MCP probing. */
     mcpServerName: string;
+    /** Post-action text observation: pairs the auto-screenshot with a
+     *  description + ASCII sketch + depth-trimmed a11y tree.  Only takes
+     *  effect when an OSO server is reachable.  When disabled, no OSO
+     *  text features appear in the LLM context. */
+    textObservation: {
+      enabled: boolean;
+      includeSketch: boolean;
+      includeTree: boolean;
+      /** "active_window" | "screen" | "auto". */
+      scope: string;
+      maxChars: number;
+      treeStartDepth: number;
+      treeMinDepth: number;
+      treeMaxChars: number;
+    };
   };
   /** When true (default), predicate / step failure triggers a perception
    *  bundle (marked screenshot + window list + OSO observe) before the
@@ -171,6 +186,16 @@ const DEFAULTS: ExtensionConfig = {
     baseUrl: "http://127.0.0.1:5001",
     timeoutMs: 2000,
     mcpServerName: "screen-observer",
+    textObservation: {
+      enabled: false,
+      includeSketch: true,
+      includeTree: true,
+      scope: "active_window",
+      maxChars: 6000,
+      treeStartDepth: 6,
+      treeMinDepth: 1,
+      treeMaxChars: 4000,
+    },
   },
   recoveryProbeEnabled: true,
   recoveryProbeMaxPerStep: 2,

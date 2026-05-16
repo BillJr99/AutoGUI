@@ -99,6 +99,8 @@ export interface ScreenObserverClient {
   getScreenshot(windowIndex?: number): Promise<Record<string, unknown> | null>;
   getMonitors(): Promise<Record<string, unknown> | null>;
   getStructure(windowIndex?: number): Promise<{ tree?: TreeNode } | null>;
+  getSketch(windowIndex?: number): Promise<{ sketch?: string } | null>;
+  getDescription(windowIndex?: number): Promise<Record<string, unknown> | null>;
   findElement(query: { name?: string; controlType?: string; windowTitle?: string; windowIndex?: number; index?: number }): Promise<OsoElement | null>;
   findElementInTree(query: { name: string; controlType?: string; windowIndex?: number; index?: number }): Promise<OsoElement | null>;
   bringToForeground(query: { windowTitle?: string; windowIndex?: number; windowUid?: string }): Promise<Record<string, unknown> | null>;
@@ -199,6 +201,14 @@ export class RestScreenObserverClient implements ScreenObserverClient {
 
   getStructure(windowIndex?: number): Promise<{ tree?: TreeNode } | null> {
     return this.request("GET", "/api/structure", windowIndex !== undefined ? { window_index: windowIndex } : undefined) as Promise<{ tree?: TreeNode } | null>;
+  }
+
+  getSketch(windowIndex?: number): Promise<{ sketch?: string } | null> {
+    return this.request("GET", "/api/sketch", windowIndex !== undefined ? { window_index: windowIndex } : undefined) as Promise<{ sketch?: string } | null>;
+  }
+
+  getDescription(windowIndex?: number): Promise<Record<string, unknown> | null> {
+    return this.request("GET", "/api/description", windowIndex !== undefined ? { window_index: windowIndex } : undefined);
   }
 
   async findElementInTree(query: { name: string; controlType?: string; windowIndex?: number; index?: number }): Promise<OsoElement | null> {
