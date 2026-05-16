@@ -1,4 +1,4 @@
-"""
+""" 
 backends/base.py — Abstract base backend + shared pyautogui implementations.
 
 DesktopBackend is a concrete class whose default method implementations use
@@ -520,7 +520,12 @@ class DesktopBackend:
             await loop.run_in_executor(
                 None, lambda: pyautogui.click(x, y, button=button, clicks=clicks)
             )
-            return {"success": True, "x": x, "y": y, "button": button, "clicks": clicks}
+            result = {"success": True, "x": x, "y": y, "button": button, "clicks": clicks}
+            if self._screen_observer is not None:
+                obs = await self._screen_observer.observe()
+                if obs is not None:
+                    result["observe"] = obs
+            return result
         except Exception as e:
             logger.debug("[backend:click] %s", traceback.format_exc())
             return {"error": str(e)}
@@ -571,7 +576,12 @@ class DesktopBackend:
                         pyperclip.copy(saved)
                     except Exception:
                         pass
-                return {"success": True, "length": len(text), "method": "clipboard_paste"}
+                result = {"success": True, "length": len(text), "method": "clipboard_paste"}
+                if self._screen_observer is not None:
+                    obs = await self._screen_observer.observe()
+                    if obs is not None:
+                        result["observe"] = obs
+                return result
             except ImportError:
                 pass
             except Exception as e:
@@ -581,7 +591,12 @@ class DesktopBackend:
             await loop.run_in_executor(
                 None, lambda: pyautogui.write(text, interval=0.05)
             )
-            return {"success": True, "length": len(text), "method": "keystrokes"}
+            result = {"success": True, "length": len(text), "method": "keystrokes"}
+            if self._screen_observer is not None:
+                obs = await self._screen_observer.observe()
+                if obs is not None:
+                    result["observe"] = obs
+            return result
         except Exception as e:
             logger.debug("[backend:type_text] %s", traceback.format_exc())
             return {"error": str(e)}
@@ -591,7 +606,12 @@ class DesktopBackend:
             import pyautogui
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: pyautogui.hotkey(*keys))
-            return {"success": True, "keys": keys}
+            result = {"success": True, "keys": keys}
+            if self._screen_observer is not None:
+                obs = await self._screen_observer.observe()
+                if obs is not None:
+                    result["observe"] = obs
+            return result
         except Exception as e:
             logger.debug("[backend:hotkey] %s", traceback.format_exc())
             return {"error": str(e)}
@@ -774,6 +794,73 @@ class DesktopBackend:
             if result is not None:
                 logger.debug("[backend:activate_window] OSO bring_to_foreground returned: %s", result)
         return {"error": "activate_window not supported on this platform"}
+
+    async def observe(
+        self,
+        window_index: int | None = None,
+        window_title: str | None = None,
+    ) -> dict:
+        """Snapshot the current UI state via OSO (/api/observe).
+
+        Returns a diff-aware snapshot with tree_hash and diff_token so the
+        caller can detect what changed since the previous observe call.
+        """
+        if self._screen_observer is None:
+            return {"error": "screen_observer not configured"}
+        result = await self._screen_observer.observe(
+            window_index=window_index, window_title=window_title
+        )
+        if result is None:
+            return {"error": "OS Screen Observer is not reachable"}
+        return result
+
+    async def element_click(self, element_id: str) -> dict:
+        """Click a UI element located by OSO's find_element (uses element_id)."""
+        if self._screen_observer is None:
+            return {"error": "screen_observer not configured"}
+        oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+        if not oso_caps.get("element_targeting", False):
+            return {"error": "OSO does not support element_targeting on this platform"}
+        result = await self._screen_observer.element_click(element_id)
+        if result is None:
+            return {"error": "element_click failed or OSO unreachable"}
+        return result
+
+    async def element_focus(self, element_id: str) -> dict:
+        """Focus a UI element located by OSO's find_element (uses element_id)."""
+        if self._screen_observer is None:
+            return {"error": "screen_observer not configured"}
+        oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+        if not oso_caps.get("element_targeting", False):
+            return {"error": "OSO does not support element_targeting on this platform"}
+        result = await self._screen_observer.element_focus(element_id)
+        if result is None:
+            return {"error": "element_focus failed or OSO unreachable"}
+        return result
+
+    async def element_invoke(self, element_id: str) -> dict:
+        """Invoke the default action on a UI element (e.g. press a button)."""
+        if self._screen_observer is None:
+            return {"error": "screen_observer not configured"}
+        oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+        if not oso_caps.get("element_targeting", False):
+            return {"error": "OSO does not support element_targeting on this platform"}
+        result = await self._screen_observer.element_invoke(element_id)
+        if result is None:
+            return {"error": "element_invoke failed or OSO unreachable"}
+        return result
+
+    async def element_set_value(self, element_id: str, value: str) -> dict:
+        """Set the value of a UI element (e.g. fill a text field) via OSO."""
+        if self._screen_observer is None:
+            return {"error": "screen_observer not configured"}
+        oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
+        if not oso_caps.get("element_targeting", False):
+            return {"error": "OSO does not support element_targeting on this platform"}
+        result = await self._screen_observer.element_set_value(element_id, value)
+        if result is None:
+            return {"error": "element_set_value failed or OSO unreachable"}
+        return result
 
     async def get_active_window(self) -> dict:
         return {"found": False, "error": "get_active_window not supported on this platform"}
