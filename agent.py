@@ -1045,6 +1045,7 @@ class Agent:
                 windows_summary=windows_json,
                 exemplars=exemplars,
                 memory_hints=memory_hints,
+                registered_tools=available_tools,
             )
             # Plan_typed wraps an internal client.chat call we can't
             # otherwise observe; count it for the budget tracker.
@@ -1460,6 +1461,7 @@ class Agent:
                 task=user_input + "\n\n" + context,
                 os_label=_platform.system(),
                 vision=self._vision_screenshots,
+                registered_tools=self._registry.list_tools(),
             )
         except Exception as e:
             logger.warning("[agent] replan failed: %s", e)
