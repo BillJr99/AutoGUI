@@ -88,10 +88,10 @@ class ScreenObserverClient:
                 ) as r:
                     if r.status == 200:
                         return await r.json()
-                    logger.debug("[OSO] GET %s -> HTTP %d", path, r.status)
+                    logger.warning("[OSO] GET %s -> HTTP %d; falling back to native method", path, r.status)
                     return None
         except Exception as e:
-            logger.debug("[OSO] GET %s failed: %s", path, e)
+            logger.warning("[OSO] GET %s failed: %s; falling back to native method", path, e)
             self._back_off()
             return None
 

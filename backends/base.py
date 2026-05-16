@@ -649,11 +649,12 @@ class DesktopBackend:
     # ------------------------------------------------------------------
 
     async def list_windows(self) -> dict:
-        """List open windows; uses OS Screen Observer as fallback when available."""
+        """List open windows; tries OS Screen Observer first when configured."""
         if self._screen_observer is not None:
             result = await self._screen_observer.get_windows()
             if result is not None:
                 return result
+            logger.warning("[backend:list_windows] OS Screen Observer unavailable; falling back to native method")
         return {"error": "list_windows not implemented for this platform"}
 
     async def launch(
@@ -674,7 +675,7 @@ class DesktopBackend:
         window_title: str | None = None,
         index: int = 0,
     ) -> dict:
-        """Find element via a11y API; uses OS Screen Observer tree walk as fallback."""
+        """Find element via a11y API; tries OS Screen Observer tree walk when configured."""
         if self._screen_observer is not None and name:
             result = await self._screen_observer.find_element_in_tree(
                 name=str(name),
@@ -683,6 +684,7 @@ class DesktopBackend:
             )
             if result is not None:
                 return result
+            logger.warning("[backend:find_element] OS Screen Observer unavailable; falling back to native method")
         return {"error": "find_element not supported on this platform"}
 
     async def get_window_tree(
@@ -690,11 +692,12 @@ class DesktopBackend:
         window_title: str | None = None,
         depth: int = 3,
     ) -> dict:
-        """Dump accessibility tree; uses OS Screen Observer /api/structure as fallback."""
+        """Dump accessibility tree; tries OS Screen Observer /api/structure when configured."""
         if self._screen_observer is not None:
             result = await self._screen_observer.get_structure()
             if result is not None:
                 return result
+            logger.warning("[backend:get_window_tree] OS Screen Observer unavailable; falling back to native method")
         return {"error": "get_window_tree not supported on this platform"}
 
     async def describe_screen(self, window_index: int | None = None) -> dict:
