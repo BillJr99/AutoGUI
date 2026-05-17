@@ -14,6 +14,7 @@ rich>=13.7.0,<14.0.0
 # Does NOT work on Wayland or headless WSL — those paths use CLI tools instead.
 pyautogui>=0.9.54
 Pillow>=10.0.0
+mss>=9.0.0
 
 # REST API server
 fastapi>=0.100.0
