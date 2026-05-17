@@ -37,19 +37,37 @@ is configured to use and exposes desktop tools plus `/autogui`.
 
 [OSScreenObserver](https://github.com/BillJr99/OSScreenObserver) is an optional companion service that gives AutoGUI a richer perception layer: accessibility trees, on-screen description, OCR, and visual layout sketches served over a local REST API on port 5001.
 
-`start.sh` wires everything together:
+Three platform-specific launchers wire everything together:
+
+| Platform | Script |
+|----------|--------|
+| Linux / WSL | `bash start.sh` |
+| macOS | `bash start-mac.sh` |
+| Windows | `start.bat` |
 
 ```bash
-bash start.sh          # TUI mode
-bash start.sh "Open a terminal and list files"   # single-command mode
+# Linux / WSL
+bash start.sh                                # TUI
+bash start.sh "Open a terminal and list files"  # single-command
+
+# macOS
+bash start-mac.sh
+bash start-mac.sh "Open a terminal and list files"
+
+# Windows (Command Prompt)
+start.bat
+start.bat "Open a terminal and list files"
 ```
 
-The script:
-1. Runs `git submodule update --init --recursive` to populate `OSScreenObserver/`.
-2. Checks whether something is already listening on `http://127.0.0.1:5001/api/healthz`.
-3. If not, launches `OSScreenObserver/main.py` in the background and waits up to 10 s for it to become reachable.
-4. Starts AutoGUI (`python main.py`), forwarding any extra arguments.
-5. On exit (normal, Ctrl+C, or SIGTERM) kills OSScreenObserver **only if this script started it** — a pre-existing instance is left alone.
+Each script:
+1. Runs `git submodule update --init --recursive` to populate `OSScreenObserver/` (and any future submodules).
+2. Checks whether key Python packages (`textual`, `flask`) are importable. If not, **prompts once** — answering Y runs the appropriate install script (`scripts/install-dependencies.sh` or `scripts/install-dependencies.cmd`) and then installs OSScreenObserver's Python deps from `OSScreenObserver/requirements.txt`.
+3. Checks whether something is already listening on `http://127.0.0.1:5001/api/healthz`.
+4. If not, launches `OSScreenObserver/main.py --mode inspect` in the background and waits up to 10 s for it to become reachable.
+5. Starts AutoGUI (`python main.py`), forwarding any extra arguments.
+6. On exit (normal, Ctrl+C, or SIGTERM) kills OSScreenObserver **only if this script started it** — a pre-existing instance is left alone.
+
+> **macOS:** Your terminal app needs Accessibility permission before AutoGUI can control the desktop — System Settings → Privacy & Security → Accessibility → add your terminal.
 
 Enable the perception overlay in `config.json` once OSScreenObserver is running:
 
