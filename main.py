@@ -225,22 +225,32 @@ def _start_api_background():
         host = get_api_host()
         port = get_api_port()
 
+        _api_log = logging.getLogger("autogui.main")
+
         def _run():
-            uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
+            # log_config=None prevents uvicorn from installing its own
+            # StreamHandlers on the uvicorn/uvicorn.access/uvicorn.error
+            # loggers; those loggers then propagate to the root logger and
+            # are captured by the TUI log handler (or the file handler)
+            # instead of painting raw lines over the terminal layout.
+            uvicorn.run(app, host=host, port=port, log_config=None, access_log=False)
 
         t = threading.Thread(target=_run, name="autogui-api", daemon=True)
         t.start()
-        print(f"[autogui] REST API starting on http://{host}:{port}", file=sys.stderr)
+        _api_log.info("[autogui] REST API starting on http://%s:%d", host, port)
         if host == "0.0.0.0":
-            print(
-                "[autogui] WARNING: REST API bound to 0.0.0.0 (all interfaces), no auth. "
+            _api_log.warning(
+                "[autogui] REST API bound to 0.0.0.0 (all interfaces), no auth. "
                 "Set AUTOGUI_API_HOST=127.0.0.1 for loopback-only or AUTOGUI_DISABLE_API=1 to disable.",
-                file=sys.stderr,
             )
     except ImportError:
-        print("[autogui] REST API disabled: fastapi/uvicorn not installed.", file=sys.stderr)
+        logging.getLogger("autogui.main").warning(
+            "[autogui] REST API disabled: fastapi/uvicorn not installed."
+        )
     except Exception as e:
-        print(f"[autogui] REST API failed to start: {e}", file=sys.stderr)
+        logging.getLogger("autogui.main").error(
+            "[autogui] REST API failed to start: %s", e
+        )
 
 
 # ---------------------------------------------------------------------------
