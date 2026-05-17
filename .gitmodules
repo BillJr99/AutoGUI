@@ -1,0 +1,3 @@
+[submodule "OSScreenObserver"]
+	path = OSScreenObserver
+	url = https://github.com/BillJr99/OSScreenObserver.git
