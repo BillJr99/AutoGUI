@@ -28,6 +28,7 @@ Key bindings
 """
 
 import asyncio
+import io
 import json
 import logging
 import sys
@@ -474,6 +475,35 @@ class _AgentCommands(Provider):
 # Logging bridge
 # ---------------------------------------------------------------------------
 
+class _StderrProxy(io.StringIO):
+    """Replaces sys.stderr while the TUI is active.
+
+    Any code that writes directly to sys.stderr (bypassing the logging
+    framework) would otherwise paint raw characters over the Textual
+    layout.  This proxy buffers by line and forwards each line as a
+    WARNING-level log record so it lands in the TUI conversation pane
+    instead.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._log = logging.getLogger("autogui.stderr")
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._log.warning("%s", line)
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buf.strip():
+            self._log.warning("%s", self._buf)
+            self._buf = ""
+
+
 class _TUILogHandler(logging.Handler):
     """Logging handler that writes records into the TUI's conversation
     pane via Textual's thread-safe ``call_from_thread``.
@@ -615,6 +645,7 @@ class AgentTUI(App):
         # don't paint over the TUI layout.  Installed on mount, removed
         # on unmount.  See _install_log_handler for details.
         self._log_handler: logging.Handler | None = None
+        self._old_stderr: object | None = None  # restored on uninstall
         # stderr/stdout StreamHandlers that were attached to the root
         # logger before mount; we detach them on install (so they don't
         # paint the terminal) and re-attach them on uninstall so the
@@ -1099,17 +1130,22 @@ class AgentTUI(App):
     def _install_log_handler(self) -> None:
         if self._log_handler is not None:
             return
-        # Drop stderr/stdout StreamHandlers from the root logger AND from
-        # uvicorn's own named loggers — those write raw lines straight to
-        # the terminal and paint over the Textual layout.  File handlers
-        # stay so logs are persisted to disk.  Each removed handler is
-        # remembered so _uninstall_log_handler can restore them on exit.
+        # Replace sys.stderr with a proxy that forwards lines as WARNING
+        # log records.  This catches everything — logging StreamHandlers,
+        # bare print(..., file=sys.stderr) calls, uvicorn startup lines,
+        # or any library that writes directly to sys.stderr — so nothing
+        # can paint raw characters over the Textual layout.
+        self._old_stderr = sys.stderr
+        sys.stderr = _StderrProxy()
+        # Also displace any StreamHandlers on the root logger (and common
+        # named loggers) that still hold a reference to the old stderr fd
+        # so they don't double-emit once sys.stderr is the proxy.
         _named = ["uvicorn", "uvicorn.access", "uvicorn.error"]
         for lgr in [logging.getLogger()] + [logging.getLogger(n) for n in _named]:
             for h in list(lgr.handlers):
                 if isinstance(h, logging.StreamHandler) and not isinstance(
                     h, logging.FileHandler,
-                ) and h.stream in (sys.stderr, sys.stdout):
+                ):
                     lgr.removeHandler(h)
                     self._displaced_handlers.append((lgr, h))
         handler = _TUILogHandler(self)
@@ -1135,6 +1171,9 @@ class AgentTUI(App):
             except Exception:
                 pass
         self._displaced_handlers.clear()
+        if self._old_stderr is not None:
+            sys.stderr = self._old_stderr  # type: ignore[assignment]
+            self._old_stderr = None
 
     def on_unmount(self) -> None:
         """Textual lifecycle hook — fires for every shutdown path
