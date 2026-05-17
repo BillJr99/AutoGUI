@@ -487,7 +487,7 @@ class _TUILogHandler(logging.Handler):
     """
 
     def __init__(self, app: "AgentTUI") -> None:
-        super().__init__(level=logging.WARNING)
+        super().__init__(level=logging.INFO)
         self._app = app
         self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
 
@@ -619,7 +619,7 @@ class AgentTUI(App):
         # logger before mount; we detach them on install (so they don't
         # paint the terminal) and re-attach them on uninstall so the
         # process's logging state is restored when the TUI exits.
-        self._displaced_handlers: list[logging.Handler] = []
+        self._displaced_handlers: list[tuple[logging.Logger, logging.Handler]] = []
 
     # ------------------------------------------------------------------
     # Composition
@@ -1099,20 +1099,21 @@ class AgentTUI(App):
     def _install_log_handler(self) -> None:
         if self._log_handler is not None:
             return
-        root = logging.getLogger()
-        # Drop any stderr/stdout StreamHandler main.py installed — those
-        # write ``[WARNING] …`` lines straight to the terminal which
-        # paints over the Textual layout.  The file handler stays so
-        # logs are still persisted to disk.  Each removed handler is
-        # remembered so _uninstall_log_handler can restore them.
-        for h in list(root.handlers):
-            if isinstance(h, logging.StreamHandler) and not isinstance(
-                h, logging.FileHandler,
-            ) and h.stream in (sys.stderr, sys.stdout):
-                root.removeHandler(h)
-                self._displaced_handlers.append(h)
+        # Drop stderr/stdout StreamHandlers from the root logger AND from
+        # uvicorn's own named loggers — those write raw lines straight to
+        # the terminal and paint over the Textual layout.  File handlers
+        # stay so logs are persisted to disk.  Each removed handler is
+        # remembered so _uninstall_log_handler can restore them on exit.
+        _named = ["uvicorn", "uvicorn.access", "uvicorn.error"]
+        for lgr in [logging.getLogger()] + [logging.getLogger(n) for n in _named]:
+            for h in list(lgr.handlers):
+                if isinstance(h, logging.StreamHandler) and not isinstance(
+                    h, logging.FileHandler,
+                ) and h.stream in (sys.stderr, sys.stdout):
+                    lgr.removeHandler(h)
+                    self._displaced_handlers.append((lgr, h))
         handler = _TUILogHandler(self)
-        root.addHandler(handler)
+        logging.getLogger().addHandler(handler)
         self._log_handler = handler
 
     def _uninstall_log_handler(self) -> None:
@@ -1127,12 +1128,10 @@ class AgentTUI(App):
             except Exception:
                 pass
             self._log_handler = None
-        for h in self._displaced_handlers:
+        for lgr, h in self._displaced_handlers:
             try:
-                # Don't re-attach a handler that's somehow already on
-                # the root (e.g. a third party also added it back).
-                if h not in root.handlers:
-                    root.addHandler(h)
+                if h not in lgr.handlers:
+                    lgr.addHandler(h)
             except Exception:
                 pass
         self._displaced_handlers.clear()
