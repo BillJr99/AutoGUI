@@ -8,3 +8,4 @@ skills/
 .agents/
 .codex/
 config.json
+dist-tests/

@@ -41,3 +41,10 @@ pi-extension/.codex/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Test harness outputs
+test-results/
+.pytest_cache/
+
+# Local LLM picker state — written by scripts/test-in-docker.sh
+tests/user/llm-config.json

@@ -269,6 +269,76 @@ On WSL, the extension intentionally controls the Windows desktop through Windows
 
 Missing dependencies or permissions are reported as tool errors for Pi to surface.
 
+## OSScreenObserver integration
+
+The pi-extension probes [OSScreenObserver (OSO)](https://github.com/BillJr99/OSScreenObserver) at `session_start`. When a reachable
+server is found, the extension switches on a richer perception path:
+
+- **Auto-probe** — at `session_start` the extension hits OSO's MCP server (if `mcpServerName` resolves), then its REST endpoint at `screenObserver.baseUrl`. Whichever responds first wins. If neither responds, the extension proceeds without OSO and re-tries on the next session. Set `screenObserver.disabled: true` in `pi-extension/config.json` to skip the probe entirely.
+- **Capability negotiation** — the probe caches OSO's `/api/capabilities` `supports` dict so subsequent tool calls can branch on what's available (accessibility_tree, ocr, vlm, occlusion_detection, drag, observe_with_diff, etc.).
+- **Tool fallbacks** — when AutoGUI's native a11y backend can't resolve an element, `desktop_find_element` falls through to OSO's selector engine. The fallback is silent — callers always get a populated result envelope or a clean error.
+- **Post-action text bundle** — when `textObservation.enabled=true`, each state-changing desktop tool's result is paired with a description + ASCII sketch + depth-limited a11y tree from OSO. The tree depth auto-shrinks until the serialised text fits under `textObservation.treeMaxChars`; the combined bundle is capped at `textObservation.maxChars`.
+- **Recovery probe** — on tool failure or predicate miss, the controller asks OSO for an `observe` diff token + current sketch so the next model turn can re-target with fresh evidence instead of replaying the same mistake.
+- **System prompt branch** — `buildAutoGuiPrompt(cfg, backend, osoAttached=true)` injects an extra paragraph telling the model to prefer `desktop_describe_screen` / `desktop_get_window_tree` and to read the auto-attached OSO bundle before issuing the next call. When OSO is offline the prompt is byte-identical to the no-OSO build.
+
+### Running OSO alongside pi
+
+```bash
+# From the AutoGUI repo root (OSO is wired in as a submodule):
+python OSScreenObserver/main.py --mode inspect
+# In another shell:
+cd pi-extension && pi -e ./src/index.ts
+# Run a task; the extension will auto-probe OSO on first session_start.
+```
+
+Or run them together via the AutoGUI launcher:
+
+```bash
+bash start.sh "open notepad and type hello"
+```
+
+### Troubleshooting
+
+| Symptom | Diagnosis |
+|---|---|
+| Tools take an extra ~30 s on the first call | OSO is unreachable; the cooldown engaged. Subsequent calls short-circuit. |
+| `/api/capabilities` returns `accessibility_tree: false` | Mock adapter (start without `--mock`). |
+| Prompt doesn't mention `desktop_describe_screen` | OSO probe failed; see `runtime/traces/<session>.jsonl` for the `oso.probe_threw` event. |
+| `find_element` always uses the native path | `screenObserver.disabled` is true, or capabilities show `element_targeting: false`. |
+
+## Testing
+
+The pi-extension test lane lives at `pi-extension/tests/user/`. Tests use
+Node's built-in `node:test` runner against compiled TypeScript output.
+
+```bash
+cd pi-extension
+npm install
+npm run test:user
+```
+
+Coverage:
+
+- **`test_system_prompt.test.ts`** — snapshots the rendered prompt with
+  every permutation of `{plannerEnabled, controllerEnabled, allowedBrowser,
+  a11yFindElement, screenObserverAttached}`. Verifies the OSO branch
+  appears exactly once when attached and is absent when offline.
+- **`test_oso_probe.test.ts`** — with no OSO server reachable, the probe
+  returns null and the prompt has no OSO hint. With a Python OSO
+  subprocess running on a free port, the probe returns a populated
+  client with capabilities.
+- **`test_kickoff_env.test.ts`** — verifies the env-var contract between
+  `scripts/test-in-docker.sh` and the pi extension (LLM system, base URL,
+  API key, chat model, VLM model). When `AUTOGUI_LLM_SYSTEM=stub`, the
+  slow_llm tier is skipped; when `=ollama_bundled`, the model name uses
+  Ollama's `name:tag` convention.
+
+The Docker-based runner (see `AutoGUI/scripts/test-in-docker.sh`)
+includes this lane and runs it as **phase 6**, after the AutoGUI +
+OSScreenObserver Python tiers. It re-uses the same picker values for
+the real-LLM verification so Pi is exercised against the same endpoint
+as the rest of the suite.
+
 ## Development Checks
 
 ```bash
