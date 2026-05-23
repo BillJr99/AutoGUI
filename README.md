@@ -864,22 +864,132 @@ implicitly.
 
 ## Test harness
 
-A pytest suite under `tests/` exercises the controller / artifacts /
-predicates / failures / app memory / budget / preflight / watchdog /
-visual diff modules with no live model and no desktop backend
-required:
+AutoGUI ships with three test tiers, plus a Docker-based runner that
+executes all of them end-to-end against a real Xvfb display, a real
+Playwright Chromium, real Tesseract OCR, and (optionally) a bundled
+Ollama for the real-LLM lane.
+
+### Tier 1 — regression suite (`tests/`)
+
+The default suite — no display, no LLM, no network. Drives
+`Agent._run_with_controller` through scripted `StubClient` responses and
+asserts the controller / planner / artifact / predicate / failure /
+memory / budget / preflight / watchdog / visual-diff modules behave
+correctly. Stays green on every push; runs in <5 s.
 
 ```bash
-pip install pytest pytest-asyncio
-python -m pytest
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest tests/ -m "not user"
 ```
 
-The tests use mocked `OpenWebUIClient` and `ToolRegistry` stubs (see
-`tests/conftest.py`) to drive `Agent._run_with_controller` end-to-end,
-including a budget-exhaustion case that proves the ceiling stops the
-loop before the next step runs.  Run this on every controller change
-to catch regressions in the orchestration logic without burning real
-model calls.
+### Tier 2 — user tests (`tests/user/`)
+
+End-to-end tests that boot real subprocesses (`python api.py`,
+`python OSScreenObserver/main.py`), exercise the FastAPI REST surface,
+the desktop tool registry on Xvfb, browser tools through Playwright,
+shell / fs tools with the real shell, and every controller feature flag
+(critique, preflight, predicate check, visual diff, watchdog,
+recovery_probe, BoN, drift anchor, skills, app memory, subagent,
+budgets). Predicate coverage exercises all 9 kinds (file_exists,
+file_contains, file_absent, window_title_contains, window_active_app,
+url_contains, text_visible, process_running, shell_returns). The
+fixtures use a `StubClient` over the wire so the LLM stays deterministic.
+
+```bash
+python -m pytest tests/user/ -m "user and not integration"
+```
+
+Tests marked `needs_display` skip when `$DISPLAY` is unset; the Docker
+harness brings up Xvfb so they always run there.
+
+### Tier 3 — integration (`tests/user/integration_oso/`)
+
+Spawns OSScreenObserver as a submodule subprocess and drives the
+AutoGUI↔OSO contract: capability probe, cooldown after the server
+dies, `find_element` over OSO, `desktop_describe_screen` (which only
+registers when OSO is reachable), the MCP stdio path, and the full
+login.yaml scenario flowing through the same wire AutoGUI uses.
+
+```bash
+git submodule update --init --recursive
+python -m pytest tests/user/integration_oso/ -m "integration"
+```
+
+### Tier 4 — pi-extension (`pi-extension/tests/user/`)
+
+Node/TypeScript tests that snapshot the system prompt, verify the OSO
+auto-probe at `session_start`, and confirm the kickoff env-var contract
+between `scripts/test-in-docker.sh` and Pi.
+
+```bash
+cd pi-extension && npm run test:user
+```
+
+### Docker harness — `scripts/test-in-docker.sh`
+
+The one-command path. Walks the user through an interactive **LLM
+picker** (system / base URL / API key / chat model / VLM model), builds
+the test image, runs every tier inside it, surfaces JUnit XML to
+`test-results/`, and **always** tears down the container on exit (clean,
+failed, or Ctrl-C):
+
+```bash
+bash scripts/test-in-docker.sh
+```
+
+Picker options:
+
+| Option | Default | Notes |
+|---|---|---|
+| LLM system | Bundled Ollama | Also: OpenWebUI, OpenAI-compatible, Anthropic, Stub-only |
+| Base URL | per-system default | e.g. `http://127.0.0.1:11434` for Ollama |
+| API key | (silent) | Skipped for bundled Ollama / Stub |
+| Chat model | `qwen2.5:0.5b` (Ollama) | Whichever the picked endpoint supports |
+| VLM model | `qwen2.5vl:3b` (Ollama) | Enter to skip the vision tier |
+
+Choices are written to `test-results/llm-config.json` and re-used on
+subsequent runs unless `--reconfigure` is passed.
+
+Flags:
+
+| Flag | Effect |
+|---|---|
+| `--phase {regression,user,integration,all}` | Run only one tier |
+| `--no-llm` | Force `AUTOGUI_LLM_SYSTEM=stub`; skip slow_llm tests |
+| `--reconfigure` | Re-prompt the LLM picker |
+| `--non-interactive` | Don't prompt; require env vars |
+| `--list-models` | After picking the system, list real available models |
+| `--keep-container` | Don't auto-remove the container on exit |
+| `--remove-image` | Also delete the `autogui-tests` image on exit |
+| `--build-only` | Build the image, then exit before running tests |
+
+### What's tested — coverage matrix
+
+| Area | Tier | File |
+|---|---|---|
+| FastAPI REST surface (health, capabilities, tools, task lifecycle, SSE) | 2 | `tests/user/test_api_user.py` |
+| Planner — dependency ordering + plan event | 2 | `tests/user/test_planner.py` |
+| Controller flags (predicate, preflight, critique, visual_diff, watchdog, recovery_probe, BoN, drift_anchor, screen_record, subagent, skills, memory) | 2 | `tests/user/test_controller_feature_flags.py` |
+| All predicate kinds | 2 | `tests/user/test_predicates_full.py` |
+| Budget enforcement (chat_calls, tool_calls, no-ceiling) | 2 | `tests/user/test_budget_enforcement.py` |
+| Failure classifier + recovery_probe event | 2 | `tests/user/test_failures_user.py` |
+| Shell + filesystem tools | 2 | `tests/user/test_shell_fs_tools.py` |
+| Desktop tools on Xvfb | 2 | `tests/user/test_desktop_tools.py` |
+| Browser tools (Playwright Chromium) | 2 | `tests/user/test_browser_tools.py` |
+| Replay CLI + skills round-trip + app memory | 2 | `tests/user/test_replay_user.py`, `test_skills_user.py`, `test_memory_user.py` |
+| Artifacts + progress + checkpoint | 2 | `tests/user/test_artifacts_progress.py` |
+| Subagent dispatch + max_tool_calls | 2 | `tests/user/test_subagent_user.py` |
+| TUI smoke + `--check` | 2 | `tests/user/test_tui_smoke.py` |
+| OSO capability probe + cooldown | 3 | `integration_oso/test_oso_capability_probe.py`, `test_oso_cooldown.py` |
+| OSO find/describe/screen + oso_text bundle | 3 | `integration_oso/test_oso_find_and_describe.py`, `test_oso_describe_screen_tool.py` |
+| OSO MCP stdio path | 3 | `integration_oso/test_oso_mcp_path.py` |
+| OSO login.yaml scenario end-to-end | 3 | `integration_oso/test_oso_scenario_e2e.py` |
+| pi-extension system prompt + OSO branch | 4 | `pi-extension/tests/user/test_system_prompt.test.ts` |
+| pi-extension OSO probe | 4 | `pi-extension/tests/user/test_oso_probe.test.ts` |
+| pi-extension kickoff env contract | 4 | `pi-extension/tests/user/test_kickoff_env.test.ts` |
+
+OSScreenObserver-side coverage (run by the same Docker harness) is
+documented in `OSScreenObserver/README.md`.
 
 ## Safety Guardrails
 

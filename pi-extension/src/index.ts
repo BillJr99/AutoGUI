@@ -28,11 +28,20 @@ const SCREENSHOT_DEGRADE_AFTER_PROVIDER_ERRORS = 3;
 
 /**
  * Build the AutoGUI system prompt the `/autogui` command injects into Pi.
- * The prompt is dynamic now: it advertises whichever extra tools are
- * available (browser, click_element, click_text), and includes the
- * planner instructions when the planner is enabled in config.
+ * The prompt is dynamic: it advertises whichever extra tools are
+ * available (browser, click_element, click_text, OS Screen Observer),
+ * and includes the planner instructions when the planner is enabled in
+ * config.
+ *
+ * When `osoAttached` is true, the prompt instructs Pi to prefer OSO's
+ * richer perception tools (desktop_describe_screen, desktop_get_window_tree)
+ * for recovery and observation, and notes that post-action text bundles
+ * may be attached automatically.  When OSO is offline the prompt stays
+ * identical to the no-OSO build so prompt caching isn't perturbed.
  */
-function buildAutoGuiPrompt(cfg: ExtensionConfig, backend: DesktopBackend | undefined): string {
+export function buildAutoGuiPrompt(cfg: ExtensionConfig,
+                                    backend: DesktopBackend | undefined,
+                                    osoAttached: boolean = false): string {
   const browserOn = cfg.allowedBrowser;
   const a11yOn = backend?.capabilities?.findElement === true;
   const planner = cfg.plannerEnabled;
@@ -96,7 +105,11 @@ Rules:
 - After launching apps or making visible changes, verify with desktop_list_windows or desktop_screenshot.
 - Keep using Pi's built-in coding/filesystem tools for code and file work; use desktop_*${browserOn ? "/browser_*" : ""} tools only for desktop UI automation.
 - If a desktop tool reports a missing permission or dependency, tell the user exactly what is missing and stop that desktop action.
-- When a desktop tool fails, a predicate fails, or a step appears blocked, DO NOT give up or surface the failure yet. First reach for the perception tools: desktop_screenshot or desktop_screenshot_marked to see the screen, desktop_list_windows + desktop_active_window to confirm focus, desktop_get_window_text for text content, and desktop_click_text / desktop_click_element / desktop_click_mark to re-target with the fresh evidence. The failed tool's result usually includes a recovery_probe payload showing the current state — use it. Only escalate to the user after at least one perception-driven retry has failed.
+- When a desktop tool fails, a predicate fails, or a step appears blocked, DO NOT give up or surface the failure yet. First reach for the perception tools: desktop_screenshot or desktop_screenshot_marked to see the screen, desktop_list_windows + desktop_active_window to confirm focus, desktop_get_window_text for text content, and desktop_click_text / desktop_click_element / desktop_click_mark to re-target with the fresh evidence. The failed tool's result usually includes a recovery_probe payload showing the current state — use it. Only escalate to the user after at least one perception-driven retry has failed.${osoAttached ? `
+- OS Screen Observer (OSO) is attached.  Prefer its richer perception when raw screenshots aren't enough:
+    desktop_describe_screen — semantic description of the active window (scene + controls + actions).
+    desktop_get_window_tree — full accessibility tree (role, name, bounds, value) for the focused or named window.
+  These survive DPI scaling, async repaints, and partially-rendered widgets.  When a state-changing tool returns, a short OSO text bundle (description + ASCII sketch + depth-limited tree) is automatically attached to its result if textObservation.enabled is on — read it before issuing the next call.  For recovery probes the bundle already includes an observe diff token so you can ask OSO for "what changed since I last looked".` : ""}
 - When you finish a task that worked well, consider calling skill_save with descriptive keywords so the procedure can be replayed via skill_run later.
 - ALWAYS use desktop_launch({application: "name"}) to start an application — never \`shell_run\` with \`start <app>\`, \`cmd /c start <app>\`, or \`open -a <app>\`. Those commands can hang because the parent shell may wait for the spawned GUI process even after the window is visible, so the tool call never returns. desktop_launch resolves the executable + spawns it detached + returns immediately; reach for shell_run only when you genuinely need the command's exit status (e.g. \`where.exe\`, \`which\`, \`pgrep\`).
 - Argument schema discipline: every desktop_* / browser_* tool takes a flat JSON object — pass \`{"application": "notepad"}\`, not XML, not stringified parameter lists, not a free-form sentence describing the call. If you find yourself writing \`<arg name="...">\` you have the wrong call shape.
@@ -303,7 +316,7 @@ export default function autoGuiExtension(pi: ExtensionAPI) {
       }
       const backend = await getBackend().catch(() => undefined);
       const c = await getConfig();
-      const retryMessage = `${buildAutoGuiPrompt(c, backend)}
+      const retryMessage = `${buildAutoGuiPrompt(c, backend, screenObserver !== undefined)}
 
 AutoGUI provider retry:
 - The previous provider request failed with temporary status ${providerError.status}.
@@ -391,7 +404,7 @@ ${autoGuiTask}`;
       const c = await getConfig();
       let backend: DesktopBackend | undefined;
       try { backend = await getBackend(); } catch { /* prompt builds without backend caps */ }
-      let prompt = buildAutoGuiPrompt(c, backend);
+      let prompt = buildAutoGuiPrompt(c, backend, screenObserver !== undefined);
 
       // Skill suggestion: top-3 candidate skills whose keywords match the task.
       // Always runs (read-only) so an existing skill library is surfaced
@@ -493,7 +506,7 @@ ${autoGuiTask}`;
     const c = await getConfig();
     let backend: DesktopBackend | undefined;
     try { backend = await getBackend(); } catch { /* fall through */ }
-    const validatorPrompt = `${buildAutoGuiPrompt(c, backend)}
+    const validatorPrompt = `${buildAutoGuiPrompt(c, backend, screenObserver !== undefined)}
 
 Validator mode:
 - You are a read-only validator running in a separate Pi process.

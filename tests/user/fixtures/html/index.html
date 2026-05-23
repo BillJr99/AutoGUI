@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AutoGUI Browser User-Test Page</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 2em auto; }
+    h1 { color: #234; }
+    .hidden { display: none; }
+    button { padding: 8px 16px; margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <h1 id="title">Hello AutoGUI</h1>
+  <p id="lede">This page is a fixture used by tests/user/test_browser_tools.py.</p>
+
+  <form id="login" onsubmit="onSubmit(event)">
+    <label>Username <input id="user" name="user" type="text" /></label><br/>
+    <label>Password <input id="pass" name="pass" type="password" /></label><br/>
+    <button type="submit" id="submit">Sign in</button>
+    <button type="button" id="reset" onclick="document.getElementById('login').reset()">Reset</button>
+  </form>
+
+  <p id="status" class="hidden">Welcome, <span id="who"></span>!</p>
+
+  <a id="next" href="page2.html">Continue to page 2</a>
+
+  <script>
+    function onSubmit(e) {
+      e.preventDefault();
+      const u = document.getElementById('user').value;
+      document.getElementById('who').textContent = u;
+      document.getElementById('status').classList.remove('hidden');
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,122 @@
+# AutoGUI test harness — extends the production AutoGUI image with the
+# pieces needed for the user-test tiers:
+#   - Xvfb + fluxbox + xauth so wmctrl, xdotool, scrot, OCR, etc. all
+#     find a working X server (Xvfb on its own has no window manager,
+#     so wmctrl returns 0 windows).
+#   - python3-tk + python3-dev so pyautogui can import (mouseinfo
+#     sys.exit()s on missing tkinter).
+#   - Node 20.x + npm packages for the pi-extension test lane (already
+#     present in the base image).
+#   - Ollama (optional, controlled by INCLUDE_OLLAMA build arg) plus
+#     pre-pulled chat + VLM models.
+#
+# Build:
+#   docker build -f tests/user/Dockerfile.tests \
+#       --build-arg INCLUDE_OLLAMA=true \
+#       --build-arg OLLAMA_CHAT_MODEL=qwen2.5:0.5b \
+#       --build-arg OLLAMA_VLM_MODEL=qwen2.5vl:3b \
+#       -t autogui-tests .
+#
+# Run (executes tests/run_all.sh by default):
+#   docker run --rm \
+#       -v "$PWD/test-results:/tmp/test-results" \
+#       -e AUTOGUI_LLM_SYSTEM=ollama_bundled \
+#       -e AUTOGUI_LLM_MODEL=qwen2.5:0.5b \
+#       -e AUTOGUI_VLM_MODEL=qwen2.5vl:3b \
+#       autogui-tests
+
+FROM python:3.12-slim AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DISPLAY=:99
+
+# System packages: same set as the production Dockerfile PLUS what the
+# user-test tier needs on top.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash curl ca-certificates git gnupg sudo procps \
+    # pyautogui + Pillow
+    python3-tk python3-dev libx11-dev \
+    # X11 desktop automation + a window manager so wmctrl works
+    xdotool wmctrl scrot x11-utils xclip xauth dbus-x11 \
+    xvfb xterm x11-apps fluxbox xfonts-base \
+    # OCR
+    tesseract-ocr \
+    # ImageMagick — Set-of-Mark overlay + failure GIFs
+    imagemagick \
+    # AT-SPI — desktop_click_element on Linux
+    python3-pyatspi gir1.2-atspi-2.0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node 20.x for the pi-extension test lane.
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && chmod 644 /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Optional: Ollama for the real-LLM lane. Controlled by build args.
+ARG INCLUDE_OLLAMA=true
+ARG OLLAMA_CHAT_MODEL=qwen2.5:0.5b
+ARG OLLAMA_VLM_MODEL=qwen2.5vl:3b
+ENV OLLAMA_CHAT_MODEL=${OLLAMA_CHAT_MODEL} \
+    OLLAMA_VLM_MODEL=${OLLAMA_VLM_MODEL}
+
+RUN if [ "$INCLUDE_OLLAMA" = "true" ]; then \
+        curl -fsSL https://ollama.com/install.sh | sh; \
+    fi
+
+WORKDIR /app
+COPY . .
+
+# Initialise the OSScreenObserver submodule if it isn't already on disk.
+RUN if [ ! -f OSScreenObserver/main.py ]; then \
+        git submodule update --init --recursive 2>/dev/null \
+        || (echo "[Dockerfile.tests] WARN: submodule init failed; tests/integration_oso will skip"); \
+    fi
+
+# Install Python dependencies for both repos.
+RUN python -m pip install --upgrade pip \
+    && pip install -r requirements.txt -r requirements-dev.txt \
+    && if [ -f OSScreenObserver/requirements.txt ]; then \
+           pip install -r OSScreenObserver/requirements.txt; \
+       fi \
+    && if [ -f OSScreenObserver/requirements-dev.txt ]; then \
+           pip install -r OSScreenObserver/requirements-dev.txt; \
+       fi
+
+# Playwright Chromium for the browser test lane.
+RUN python -m playwright install --with-deps chromium \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Pre-build the pi-extension test deps + compile so the in-container
+# test phase is faster.
+RUN cd pi-extension && npm install --silent || true
+
+# Bundled Ollama models — pre-pulled at build time so test runs are
+# offline-safe. The 0.5b chat model + 3b vision model are tiny enough
+# to bake in (≈4 GB combined). Skip when INCLUDE_OLLAMA=false.
+RUN if [ "$INCLUDE_OLLAMA" = "true" ]; then \
+        (ollama serve >/tmp/ollama-pull.log 2>&1 &) \
+        && sleep 4 \
+        && (ollama pull "$OLLAMA_CHAT_MODEL" || true) \
+        && (ollama pull "$OLLAMA_VLM_MODEL" || true) \
+        && pkill -f "ollama serve" || true; \
+    fi
+
+# sudo passthrough so install-dependencies.sh "just works" as root.
+RUN printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/sudo \
+    && chmod +x /usr/local/bin/sudo
+
+# Test entrypoint.
+COPY tests/user/entrypoint.sh /usr/local/bin/test-entrypoint.sh
+RUN chmod +x /usr/local/bin/test-entrypoint.sh
+
+VOLUME ["/tmp/test-results"]
+
+CMD ["/usr/local/bin/test-entrypoint.sh"]

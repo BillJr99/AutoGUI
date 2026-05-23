@@ -30,8 +30,8 @@ jobs:
           pip install -r requirements.txt
           pip install pytest httpx pytest-asyncio
 
-      - name: Run tests
-        run: pytest tests/ -v
+      - name: Run regression tests
+        run: pytest tests/ -v -m "not user" --ignore=tests/user
         env:
           AUTOGUI_DRY_RUN: "true"
           # Use a clearly-nonexistent filename so api.py takes the
@@ -39,3 +39,23 @@ jobs:
           AUTOGUI_CONFIG: "__no_config__.json"
           # Suppress display-related errors on headless CI
           DISPLAY: ""
+
+  user-tests:
+    # Heavy lane: Docker + Xvfb + Playwright + Ollama. Doesn't gate
+    # merges; lets you trigger it explicitly when changing test plumbing.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[user-tests]')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build + run test image
+        run: bash scripts/test-in-docker.sh --non-interactive --no-llm
+
+      - name: Upload JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-results
+          path: test-results/*.xml

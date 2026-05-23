@@ -10,7 +10,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test:user": "bash tests/user/run.sh"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.74.0",
