@@ -14,8 +14,8 @@
     "test:user": "bash tests/user/run.sh"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.74.0",
-    "@earendil-works/pi-coding-agent": "^0.79.0",
+    "@earendil-works/pi-ai": "^0.74.2",
+    "@earendil-works/pi-coding-agent": "^0.79.10",
     "typebox": "^1.0.55"
   },
   "devDependencies": {
