@@ -26,8 +26,9 @@ is configured to use and exposes desktop tools plus `/autogui`.
 >
 > The agent operates at OS level: it can run shell commands, click anything, type
 > anywhere, read and write files, and take screenshots. **Run AutoGUI only in a
-> sandbox, VM, or container that you are willing to reset.** Restrict the REST API
-> to loopback (`AUTOGUI_API_HOST=127.0.0.1`) and consider disabling shell access
+> sandbox, VM, or container that you are willing to reset.** The REST API binds
+> to loopback (`127.0.0.1`) by default — only set `AUTOGUI_API_HOST=0.0.0.0` when
+> the runtime boundary provides isolation — and consider disabling shell access
 > (`"allowed_shell": false`) if you do not fully trust the task or the model driving
 > it. See the [Security Notes](#security-notes) section for further guidance.
 
@@ -338,14 +339,38 @@ window moves, and async UI redraws.
 | Platform     | Backend used                        | Install                                                |
 |--------------|-------------------------------------|--------------------------------------------------------|
 | Windows      | UIAutomation (`uiautomation` pkg)   | `pip install uiautomation pywin32`                     |
-| macOS        | Not available (Pi extension only)   | Use Pi extension for macOS AX element clicking                                         |
+| macOS        | System Events AX walk + AXPress     | `pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz` (optional; see below) |
 | Linux X11    | AT-SPI 2 (`pyatspi`)                | `sudo apt install python3-pyatspi gir1.2-atspi-2.0`    |
 | Linux Wayland| AT-SPI 2 (`pyatspi`)                | same as X11                                             |
+
+On macOS, `find_element` walks the frontmost process's accessibility tree
+via System Events (needs Accessibility permission for your terminal), and
+`desktop_click_element` performs the element's native `AXPress` action
+through `AXUIElementPerformAction` when the pyobjc ApplicationServices
+bindings are installed and the process is accessibility-trusted (reported
+as the `ax_actions` capability).  Without pyobjc it degrades to locating
+the element and clicking its rect centre.
 
 When the a11y backend isn't available the fallback ladder is:
 `desktop_click_text` (OCR/a11y text match) → `desktop_click_mark`
 (Set-of-Mark) → `desktop_click(x, y)`. The agent's system prompt
 encourages the model to walk this ladder.
+
+### Backend parity: launch and window listing
+
+Every backend now shares one `launch` / `list_windows` contract.  `launch`
+has a real generic default (detached subprocess spawn returning
+`{success, application, args, pid, method}`) with native overrides —
+`open -a` on macOS, `os.startfile`/detached spawn on Windows, PowerShell
+`Start-Process` on WSL.  `list_windows` gains native fallbacks so each
+platform returns the same window schema: `win32gui.EnumWindows` on Windows
+(when pywin32 is installed), `Quartz.CGWindowListCopyWindowInfo` on macOS
+(when AppleScript fails), and `xdotool` on X11 (when `wmctrl` is absent) —
+each degrading gracefully with an install hint when the tooling is missing.
+
+> **Note:** the macOS and Windows native paths are exercised in CI with
+> injected fake platform modules (mock-verified only); manual verification
+> on real hardware is still required.
 
 ### Browser automation (Playwright)
 
@@ -490,6 +515,16 @@ installation required, and no API key needed.  The `openwebui` config
 section name is kept for backwards compatibility; it works for any
 OpenAI-compatible endpoint regardless of whether OpenWebUI is involved.
 
+#### Streaming responses
+
+Set `"stream": true` in the `openwebui` section to have the agent consume the
+endpoint's SSE streaming interface.  Assistant text then arrives as
+incremental `text_delta` events — rendered live in the TUI output pane — with
+the complete message still following as the usual `text` event, so consumers
+that ignore deltas see no behavioural change.  If a stream fails mid-call the
+agent falls back to a non-streaming request (once per step) automatically.
+Default: `false`.
+
 ### Verify connectivity
 
 ```bash
@@ -521,7 +556,7 @@ startup. You can also start it standalone:
 ```bash
 # With config.json present:
 python api.py
-# Listening on http://0.0.0.0:8002
+# Listening on http://127.0.0.1:8002
 
 # Without a config file — use environment variables:
 OPENWEBUI_BASE_URL=http://localhost:3000 \
@@ -535,16 +570,18 @@ AUTOGUI_DRY_RUN=true python api.py
 
 ### Security and network bind address
 
-> **Warning: the REST API has no authentication and binds to `0.0.0.0`
-> (all interfaces) by default.**  This default suits sandbox / container
-> environments where network isolation is provided by the runtime.
-> **Do not expose the API port to an untrusted network without additional
-> access controls.**  For local development, restrict the server to
-> loopback (`127.0.0.1`) using the mechanisms below.
+> **The REST API has no authentication and binds to loopback
+> (`127.0.0.1`) by default.**  Exposing it on other interfaces is an
+> explicit opt-in: set `AUTOGUI_API_HOST=0.0.0.0` only when the runtime
+> boundary (Docker container, VM, firewall) provides the network
+> isolation — the shipped `Dockerfile` does this so published ports keep
+> working.  A prominent warning is logged whenever the effective bind
+> address is not loopback.  **Do not expose the API port to an untrusted
+> network without additional access controls.**
 
 | Mechanism | Effect |
 |---|---|
-| `AUTOGUI_API_HOST=127.0.0.1` | Restrict the API to loopback (recommended for local dev) |
+| `AUTOGUI_API_HOST=0.0.0.0` | Opt in to exposing the API on all interfaces (Docker/testing) |
 | `AUTOGUI_API_PORT=<port>` | Change the listen port (default `8002`) |
 | `AUTOGUI_DISABLE_API=1` | Disable the background API for all `main.py` invocations |
 
@@ -577,6 +614,11 @@ TASK_ID=$(curl -s -X POST http://localhost:8002/api/task \
 
 # Stream live events
 curl -N http://localhost:8002/api/task/$TASK_ID/stream
+
+# Or submit and stream in one call (SSE; first frame carries the task_id)
+curl -N -X POST 'http://localhost:8002/api/task?stream=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"task": "Take a screenshot of the desktop"}'
 
 # Or poll for the finished result
 curl -s http://localhost:8002/api/task/$TASK_ID | python3 -m json.tool
@@ -875,7 +917,15 @@ The default suite — no display, no LLM, no network. Drives
 `Agent._run_with_controller` through scripted `StubClient` responses and
 asserts the controller / planner / artifact / predicate / failure /
 memory / budget / preflight / watchdog / visual-diff modules behave
-correctly. Stays green on every push; runs in <5 s.
+correctly. `tests/test_agent_loop.py` drives the full agent loop (both
+the legacy ReAct executor and the controller path) with a scripted fake
+client: tool dispatch + history feedback, failed-tool retry directives,
+the hallucination guards, budget stops, progress persistence/resume,
+and the streaming (`text_delta`) paths. `tests/test_client_stream.py`
+exercises the SSE streaming client against a local scripted server, and
+`tests/test_backends.py` mock-verifies the platform backends' launch /
+list_windows / macOS AX-click parity. Stays green on every push; runs
+in <10 s.
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
@@ -1196,10 +1246,12 @@ self._register(
   excluded from git via `.gitignore`.
 - **Desktop control** — the agent operates at OS level: it can click anything and type
   anywhere.  Only run on machines and accounts where you accept this capability.
-- **REST API** — no authentication is enforced; the server binds to `0.0.0.0` by default
-  (all interfaces).  Set `AUTOGUI_API_HOST=127.0.0.1` for loopback-only use, or
-  `AUTOGUI_DISABLE_API=1` to disable the background API entirely.  See
-  [docs/REST_API.md](docs/REST_API.md) for details.
+- **REST API** — no authentication is enforced; the server binds to loopback
+  (`127.0.0.1`) by default.  Setting `AUTOGUI_API_HOST=0.0.0.0` is the explicit
+  opt-in for exposing the API on all interfaces (e.g. Docker, where the shipped
+  `Dockerfile` sets it so published ports work) — a warning is logged whenever the
+  bind address is not loopback.  Set `AUTOGUI_DISABLE_API=1` to disable the
+  background API entirely.  See [docs/REST_API.md](docs/REST_API.md) for details.
 
 ---
 

@@ -27,8 +27,9 @@ async def test_full_login_scenario_via_oso_client(oso_server_factory):
     if not LOGIN_YAML.exists():
         pytest.skip("login.yaml not present (submodule not initialised)")
 
-    import aiohttp
     from urllib.parse import urlencode
+
+    import aiohttp
 
     srv = oso_server_factory()
     base = srv["base_url"]

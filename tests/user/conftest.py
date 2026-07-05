@@ -24,9 +24,10 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -42,7 +43,6 @@ from conftest import (  # noqa: E402,F401
     make_assistant_text,
     make_tool_call,
 )
-
 
 # ---------------------------------------------------------------------------
 # Process helpers
@@ -496,6 +496,7 @@ def text_image_bytes():
     def _render(text: str, size: tuple[int, int] = (480, 120)) -> bytes:
         img = Image.new("RGB", size, "white")
         draw = ImageDraw.Draw(img)
+        font: Any
         try:
             font = ImageFont.truetype("DejaVuSans-Bold.ttf", 36)
         except OSError:

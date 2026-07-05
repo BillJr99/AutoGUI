@@ -8,7 +8,6 @@ OpenWebUI instance, or real desktop is required.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 
@@ -23,8 +22,8 @@ os.environ["AUTOGUI_DRY_RUN"] = "true"
 os.environ["AUTOGUI_CONFIG"] = "__no_config__.json"
 
 from fastapi.testclient import TestClient  # noqa: E402 — must come after env setup
-from api import app, TASKS, _TASK_HANDLES  # noqa: E402
 
+from api import _TASK_HANDLES, TASKS, app  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -447,6 +446,54 @@ class TestStreamTask:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/task?stream=true — direct SSE run endpoint
+# ---------------------------------------------------------------------------
+
+class TestCreateTaskStreaming:
+    def test_stream_true_returns_event_stream(self):
+        TASKS.clear()
+        _TASK_HANDLES.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            r = client.post("/api/task?stream=true", json={"task": "run streamed"})
+            assert r.status_code == 200
+            assert "text/event-stream" in r.headers.get("content-type", "")
+
+    def test_stream_true_emits_task_created_then_events_then_done(self):
+        import json as _json
+        TASKS.clear()
+        _TASK_HANDLES.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            r = client.post("/api/task?stream=true", json={"task": "run streamed events"})
+            payloads = []
+            for line in r.text.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        payloads.append(_json.loads(line[len("data:"):].strip()))
+                    except _json.JSONDecodeError:
+                        pass
+            assert payloads, "no SSE data frames in response"
+            # First frame announces the task id so the caller can poll/cancel.
+            assert payloads[0].get("kind") == "task_created"
+            task_id = payloads[0].get("task_id")
+            assert task_id in TASKS
+            # The stream carries AgentEvents and closes with the done sentinel.
+            kinds = [p.get("kind") for p in payloads[1:]]
+            assert "done" in kinds
+            assert any(k not in ("task_created", "done") for k in kinds)
+
+    def test_stream_false_path_unchanged(self):
+        """Without ?stream=true, the endpoint still returns 202 + task_id JSON."""
+        TASKS.clear()
+        _TASK_HANDLES.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            r = client.post("/api/task", json={"task": "plain submit"})
+            assert r.status_code == 202
+            data = r.json()
+            assert data["ok"] is True
+            assert data["task_id"] in TASKS
+
+
+# ---------------------------------------------------------------------------
 # Error shape consistency
 # ---------------------------------------------------------------------------
 
@@ -476,3 +523,57 @@ class TestErrorShapes:
         data = client.post("/api/task/bogus/approve").json()
         assert data["ok"] is False
         assert "error" in data
+
+
+# ---------------------------------------------------------------------------
+# Bind-host security defaults
+# ---------------------------------------------------------------------------
+
+class TestBindHostDefaults:
+    """The API must default to loopback; 0.0.0.0 is an explicit opt-in."""
+
+    def test_default_host_is_loopback(self, monkeypatch):
+        import api
+
+        monkeypatch.delenv("AUTOGUI_API_HOST", raising=False)
+        assert api.DEFAULT_API_HOST == "127.0.0.1"
+        assert api.get_api_host() == "127.0.0.1"
+
+    def test_env_var_opts_in_to_all_interfaces(self, monkeypatch):
+        import api
+
+        monkeypatch.setenv("AUTOGUI_API_HOST", "0.0.0.0")
+        assert api.get_api_host() == "0.0.0.0"
+
+    def test_is_loopback_host(self):
+        import api
+
+        assert api.is_loopback_host("127.0.0.1")
+        assert api.is_loopback_host("127.0.0.53")
+        assert api.is_loopback_host("localhost")
+        assert api.is_loopback_host("::1")
+        assert not api.is_loopback_host("0.0.0.0")
+        assert not api.is_loopback_host("192.168.1.10")
+
+    def test_warning_logged_for_nonloopback_host(self, caplog):
+        import api
+
+        with caplog.at_level("WARNING", logger="autogui.api"):
+            warned = api.warn_if_nonloopback_host("0.0.0.0")
+        assert warned is True
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "unauthenticated desktop-control API exposed to the network" in m
+            for m in messages
+        )
+
+    def test_no_warning_for_loopback_host(self, caplog):
+        import api
+
+        with caplog.at_level("WARNING", logger="autogui.api"):
+            warned = api.warn_if_nonloopback_host("127.0.0.1")
+        assert warned is False
+        assert not [
+            r for r in caplog.records
+            if "exposed to the network" in r.getMessage()
+        ]

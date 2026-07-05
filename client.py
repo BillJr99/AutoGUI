@@ -5,19 +5,112 @@ Supports both OpenWebUI (POST {base_url}/api/chat/completions) and direct
 Ollama access (POST {base_url}/v1/chat/completions) via the ``api_path``
 config key.  Set ``api_path`` to ``/v1/chat/completions`` in config.json to
 bypass OpenWebUI entirely and hit Ollama's native OpenAI-compatible endpoint.
+
+Streaming: ``chat_stream()`` yields structured delta events parsed from the
+server's SSE stream, and ``StreamAggregator`` reassembles those deltas into
+a response dict shape-identical to the non-streaming ``chat()`` return, so
+callers can stream for display and still hand the aggregate to code that
+expects the blocking shape.
 """
 
 import json
 import logging
 import traceback
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_API_PATH = "/api/chat/completions"
+
+
+class StreamAggregator:
+    """
+    Assemble ``chat_stream`` delta events into a final response dict.
+
+    Feed every event yielded by ``OpenWebUIClient.chat_stream`` to ``add()``,
+    then call ``response()`` to get a dict shape-identical to what the
+    non-streaming ``chat()`` call would have returned for the same
+    completion: ``{"id", "object", "created", "model", "choices": [{"index",
+    "finish_reason", "message": {...}}], "usage"?}``.
+
+    Tool-call fragments are keyed by their ``index`` field and their
+    ``arguments`` fragments are concatenated in arrival order, matching the
+    OpenAI streaming tool-call protocol.
+    """
+
+    def __init__(self) -> None:
+        self._meta: dict = {}
+        self._text_parts: list[str] = []
+        self._tool_calls: dict[int, dict] = {}
+        self._finish_reason: str | None = None
+        self._usage: dict | None = None
+
+    def add(self, event: dict) -> None:
+        etype = event.get("type")
+        if etype == "meta":
+            for key in ("id", "model", "created"):
+                if event.get(key) is not None:
+                    self._meta[key] = event[key]
+        elif etype == "text_delta":
+            self._text_parts.append(event.get("text") or "")
+        elif etype == "tool_call_delta":
+            try:
+                idx = int(event.get("index") or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            slot = self._tool_calls.setdefault(idx, {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if event.get("id"):
+                slot["id"] = event["id"]
+            if event.get("name"):
+                # The function name is sent whole (per the OpenAI protocol);
+                # some providers repeat it across deltas. Overwrite rather
+                # than concatenate so a repeated name doesn't become
+                # "shell_runshell_run" and break dispatch. Only ``arguments``
+                # fragments are streamed and accumulated.
+                slot["function"]["name"] = event["name"]
+            if event.get("arguments"):
+                slot["function"]["arguments"] += event["arguments"]
+        elif etype == "finish":
+            if event.get("finish_reason"):
+                self._finish_reason = event["finish_reason"]
+        elif etype == "usage":
+            if isinstance(event.get("usage"), dict):
+                self._usage = event["usage"]
+
+    def response(self) -> dict:
+        """Return the aggregated non-streaming-shaped response dict."""
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(self._text_parts),
+        }
+        if self._tool_calls:
+            message["tool_calls"] = [
+                self._tool_calls[i] for i in sorted(self._tool_calls)
+            ]
+        finish_reason = self._finish_reason or (
+            "tool_calls" if self._tool_calls else "stop"
+        )
+        response: dict[str, Any] = {
+            "id": self._meta.get("id", ""),
+            "object": "chat.completion",
+            "created": self._meta.get("created", 0),
+            "model": self._meta.get("model", ""),
+            "choices": [{
+                "index": 0,
+                "finish_reason": finish_reason,
+                "message": message,
+            }],
+        }
+        if self._usage is not None:
+            response["usage"] = self._usage
+        return response
 
 
 class OpenWebUIClient:
@@ -71,39 +164,40 @@ class OpenWebUIClient:
     # Primary interface
     # ------------------------------------------------------------------
 
-    async def chat(
+    async def _ensure_model(self, tools: list[dict] | None, caller: str) -> None:
+        """Auto-select a model from the endpoint when none is configured."""
+        if self.model:
+            return
+        try:
+            models = await self.fetch_models(prefer_tools_capable=bool(tools))
+            if models:
+                self.model = models[0]
+                logger.info(
+                    "[client.py:%s] No model configured; auto-selected %r.",
+                    caller,
+                    self.model,
+                )
+            else:
+                raise ValueError(
+                    f"[client.py:{caller}] No model configured and endpoint returned no models. "
+                    "Set 'openwebui.model' in config.json."
+                )
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                f"[client.py:{caller}] No model configured and could not auto-fetch: {exc}. "
+                "Set 'openwebui.model' in config.json."
+            ) from exc
+
+    def _build_payload(
         self,
         messages: list[dict],
-        tools: list[dict] | None = None,
-        stream: bool = False,
-        temperature: float | None = None,
+        tools: list[dict] | None,
+        temperature: float | None,
+        stream: bool,
     ) -> dict:
-        """Send a chat completion request and return the parsed JSON response."""
-        if stream:
-            raise NotImplementedError("[client.py:chat] Streaming not yet implemented.")
-
-        if not self.model:
-            try:
-                models = await self.fetch_models(prefer_tools_capable=bool(tools))
-                if models:
-                    self.model = models[0]
-                    logger.info(
-                        "[client.py:chat] No model configured; auto-selected %r.",
-                        self.model,
-                    )
-                else:
-                    raise ValueError(
-                        "[client.py:chat] No model configured and endpoint returned no models. "
-                        "Set 'openwebui.model' in config.json."
-                    )
-            except ValueError:
-                raise
-            except Exception as exc:
-                raise ValueError(
-                    f"[client.py:chat] No model configured and could not auto-fetch: {exc}. "
-                    "Set 'openwebui.model' in config.json."
-                ) from exc
-
+        """Build the chat completions request body shared by chat/chat_stream."""
         # Coerce null content to "" — some pipeline code calls .startswith()
         # on message["content"] without guarding against null.
         sanitized: list[dict] = []
@@ -119,23 +213,56 @@ class OpenWebUIClient:
                 self.temperature if temperature is None else float(temperature)
             ),
             "max_tokens": self.max_tokens,
-            "stream": False,
+            "stream": stream,
             # OpenWebUI v0.9.5+ crashes with NoneType.startswith when chat_id
             # is absent from /api/chat/completions requests (issue #24550).
             "chat_id": self._chat_id,
         }
+        if stream:
+            # Ask OpenAI-compatible servers to append a final usage chunk so
+            # the aggregate can carry the same usage dict as blocking chat().
+            payload["stream_options"] = {"include_usage": True}
         if tools:
             payload["tools"] = tools
             # Omit tool_choice — some OpenWebUI versions crash when tool_choice
             # is set explicitly and the model's FC template is null.  Omitting
             # it is spec-equivalent (defaults to "auto" when tools are present).
+        return payload
 
+    def _build_headers(self) -> dict:
         headers = {
             "Content-Type": "application/json",
             "Accept-Encoding": "gzip, deflate",
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        stream: bool = False,
+        temperature: float | None = None,
+    ) -> dict:
+        """Send a chat completion request and return the parsed JSON response.
+
+        With ``stream=True`` the request is served via ``chat_stream`` and the
+        deltas are aggregated into the same response shape as the blocking
+        path, so callers get identical dicts either way.
+        """
+        if stream:
+            aggregator = StreamAggregator()
+            async for event in self.chat_stream(
+                messages, tools=tools, temperature=temperature
+            ):
+                aggregator.add(event)
+            return aggregator.response()
+
+        await self._ensure_model(tools, caller="chat")
+
+        payload = self._build_payload(messages, tools, temperature, stream=False)
+        headers = self._build_headers()
 
         logger.info(
             "[client.py:chat] POST %s | model=%r | messages=%d | tools=%d",
@@ -158,8 +285,11 @@ class OpenWebUIClient:
                             # .get("detail") may return None, dict, or list depending
                             # on the error format; normalize to str to avoid TypeError.
                             detail = str(json.loads(raw).get("detail") or "")
-                        except Exception:
-                            pass
+                        except Exception as parse_exc:
+                            logger.debug(
+                                "[client.py:chat] could not parse error detail from "
+                                "HTTP %s body: %s", resp.status, parse_exc,
+                            )
                         if resp.status == 400 and (
                             "startswith" in detail or "NoneType" in detail
                         ):
@@ -209,6 +339,158 @@ class OpenWebUIClient:
             data.get("choices", [{}])[0].get("finish_reason", "unknown"),
         )
         return data
+
+    # ------------------------------------------------------------------
+    # Streaming interface
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _delta_events_from_chunk(chunk: dict) -> list[dict]:
+        """Translate one parsed SSE chunk into structured delta events."""
+        events: list[dict] = []
+        choices = chunk.get("choices") or []
+        choice = choices[0] if choices else {}
+        delta = choice.get("delta") or {}
+
+        content = delta.get("content")
+        if content:
+            events.append({"type": "text_delta", "text": content})
+
+        for tc in delta.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            events.append({
+                "type": "tool_call_delta",
+                "index": tc.get("index", 0),
+                "id": tc.get("id"),
+                "name": fn.get("name"),
+                "arguments": fn.get("arguments") or "",
+            })
+
+        if choice.get("finish_reason"):
+            events.append({
+                "type": "finish",
+                "finish_reason": choice["finish_reason"],
+            })
+
+        if isinstance(chunk.get("usage"), dict):
+            events.append({"type": "usage", "usage": chunk["usage"]})
+        return events
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+    ) -> AsyncIterator[dict]:
+        """
+        Send a streaming chat completion request and yield delta events.
+
+        Parses the server's SSE response (``data:`` lines terminated by a
+        ``data: [DONE]`` sentinel) and yields structured events:
+
+          {"type": "meta", "id": ..., "model": ..., "created": ...}
+              — once, from the first parseable chunk.
+          {"type": "text_delta", "text": str}
+              — one per assistant-content fragment.
+          {"type": "tool_call_delta", "index": int, "id": str|None,
+           "name": str|None, "arguments": str}
+              — one per tool-call fragment; concatenate ``arguments``
+              fragments per ``index`` to rebuild each call.
+          {"type": "finish", "finish_reason": str}
+          {"type": "usage", "usage": dict}
+
+        Feed every event to a ``StreamAggregator`` to rebuild the blocking
+        ``chat()`` response shape.  Malformed chunks are logged and skipped;
+        SSE comment lines (keepalives) are ignored.  If the connection drops
+        before ``[DONE]`` arrives a RuntimeError is raised so the caller can
+        fall back to a non-streaming retry.
+        """
+        await self._ensure_model(tools, caller="chat_stream")
+
+        payload = self._build_payload(messages, tools, temperature, stream=True)
+        headers = self._build_headers()
+
+        logger.info(
+            "[client.py:chat_stream] POST %s | model=%r | messages=%d | tools=%d",
+            self._endpoint,
+            self.model,
+            len(messages),
+            len(tools) if tools else 0,
+        )
+
+        meta_sent = False
+        done = False
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.post(
+                    self._endpoint, json=payload, headers=headers
+                ) as resp:
+                    if resp.status != 200:
+                        raw = await resp.text()
+                        logger.error(
+                            "[client.py:chat_stream] HTTP %d from %s | model=%r | body=%s",
+                            resp.status, self._endpoint, self.model, raw,
+                        )
+                        err = RuntimeError(
+                            f"[client.py:chat_stream] API returned HTTP {resp.status}: {raw[:500]}"
+                        )
+                        err.http_status = resp.status  # type: ignore[attr-defined]
+                        raise err
+
+                    # SSE framing: events are separated by blank lines; each
+                    # event's payload is the concatenation of its data: lines.
+                    data_lines: list[str] = []
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if line == "":
+                            if not data_lines:
+                                continue
+                            data = "\n".join(data_lines)
+                            data_lines = []
+                            if data.strip() == "[DONE]":
+                                done = True
+                                break
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    "[client.py:chat_stream] Skipping malformed SSE chunk: %.200s",
+                                    data,
+                                )
+                                continue
+                            if not meta_sent:
+                                meta_sent = True
+                                yield {
+                                    "type": "meta",
+                                    "id": chunk.get("id", ""),
+                                    "model": chunk.get("model", self.model),
+                                    "created": chunk.get("created", 0),
+                                }
+                            for event in self._delta_events_from_chunk(chunk):
+                                yield event
+                            continue
+                        if line.startswith(":"):
+                            continue  # SSE comment — keepalive; ignore.
+                        if line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                        # Other SSE fields (event:, id:, retry:) are ignored.
+
+                    # A trailing [DONE] without a final blank line still counts.
+                    if not done and data_lines and "\n".join(data_lines).strip() == "[DONE]":
+                        done = True
+
+        except aiohttp.ClientError as e:
+            logger.exception("[client.py:chat_stream] HTTP client error")
+            raise RuntimeError(f"[client.py:chat_stream] Connection error: {e}") from e
+
+        if not done:
+            # The server closed the connection before sending [DONE] — the
+            # completion is (potentially) truncated.  Raise so the caller can
+            # discard the partial aggregate and retry non-streaming.
+            raise RuntimeError(
+                "[client.py:chat_stream] Stream disconnected before [DONE]; "
+                "partial response discarded."
+            )
 
     # ------------------------------------------------------------------
     # Convenience extractors
@@ -291,6 +573,9 @@ class OpenWebUIClient:
             except PermissionError:
                 raise
             except Exception as e:
+                logger.debug(
+                    "[client.py:fetch_models] endpoint probe failed, trying next: %s", e
+                )
                 last_exc = e
                 continue
 

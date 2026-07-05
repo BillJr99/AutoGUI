@@ -40,7 +40,7 @@ cp config.json.example config.json
 
 # 3. Start the server
 python api.py
-# Starting on http://0.0.0.0:8002
+# Starting on http://127.0.0.1:8002
 
 # 4. Submit a task
 curl -s -X POST http://localhost:8002/api/task \
@@ -68,7 +68,7 @@ curl -s http://localhost:8002/api/task/3fa85f64-...
 | `AUTOGUI_CONFIG` | `config.json` | Path to the configuration file. If the file does not exist, the agent is configured from the `OPENWEBUI_*` variables below. An empty string means "no config file" and skips file loading entirely. |
 | `AUTOGUI_DRY_RUN` | `false` | Set to `true` to force all tasks through `DryRunAgent` — no desktop is touched, no OpenWebUI call is made. Useful for testing. |
 | `AUTOGUI_API_PORT` | `8002` | TCP port the API server listens on. |
-| `AUTOGUI_API_HOST` | `0.0.0.0` | Bind address for the API server. Binds to all interfaces by default (intended for sandbox/container use). Set to `127.0.0.1` to restrict to loopback — the API has no authentication. |
+| `AUTOGUI_API_HOST` | `127.0.0.1` | Bind address for the API server. Binds to loopback by default. Set to `0.0.0.0` to explicitly opt in to exposing the API on all interfaces (e.g. Docker, where the container boundary provides isolation) — the API has no authentication, and a warning is logged whenever the bind address is not loopback. |
 | `OPENWEBUI_BASE_URL` | `http://localhost:3000` | OpenWebUI base URL (used when `config.json` is absent). |
 | `OPENWEBUI_API_KEY` | _(empty)_ | API key for OpenWebUI (used when `config.json` is absent). |
 | `OPENWEBUI_MODEL` | _(empty)_ | Model ID to use (used when `config.json` is absent). |
@@ -232,6 +232,12 @@ Submit a new automation task. Returns immediately with a `task_id`; the agent ru
 ```json
 {"ok": true, "task_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6"}
 ```
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stream` | bool | `false` | With `?stream=true` the endpoint responds `200` with `text/event-stream` instead of the JSON envelope: a `{"kind": "task_created", "task_id": ...}` frame first, then the task's AgentEvents live (same format as `GET /api/task/{task_id}/stream`), closed by the `{"kind": "done", "finished": true}` sentinel. The non-streaming behaviour is unchanged when the parameter is absent. |
 
 ---
 
@@ -433,7 +439,7 @@ curl -s -X POST http://127.0.0.1:8002/api/task \
 ## Security Notes
 
 - **No authentication** is enforced. The API is designed to run inside a trusted network boundary (localhost or private LAN). Do not expose it to the public internet without adding your own auth layer (e.g. a reverse proxy with bearer tokens).
-- The default bind address is `0.0.0.0` (all interfaces), intended for sandbox/container use. Set `AUTOGUI_API_HOST=127.0.0.1` to restrict to loopback for local development — the API has no authentication.
+- The default bind address is loopback (`127.0.0.1`). Setting `AUTOGUI_API_HOST=0.0.0.0` is the explicit opt-in for exposing the API on all interfaces — do this only when the runtime boundary (Docker container, VM, firewall) provides the isolation. The shipped `Dockerfile` sets it so published ports (`docker run -p 8002:8002`) keep working. A prominent warning is logged whenever the effective bind address is not loopback.
 - The agent operates at OS level: it can click anywhere, run shell commands, and read/write files. Only run it on machines where you accept this capability.
 - Set `allowed_shell: false` in `config.json` (or `allow.shell: false` per request) if you want to restrict shell access.
 - Restrict `config.json` permissions: `chmod 600 config.json` — it contains your API key.

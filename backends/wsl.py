@@ -1,4 +1,4 @@
-""" 
+"""
 backends/wsl.py — Desktop backend for WSL (Windows Subsystem for Linux).
 
 All display operations (screenshot, click, type, hotkey, scroll) are
@@ -98,7 +98,8 @@ def _decode_clixml(text: str) -> str:
             )
             decoded.append(m.strip())
         return " | ".join(s for s in decoded if s)
-    except Exception:
+    except Exception as e:
+        logger.debug("[backend:wsl] window-text decode failed; returning raw text: %s", e)
         return text
 
 
@@ -339,7 +340,7 @@ class WSLBackend(DesktopBackend):
                     ),
                 }
             try:
-                img = Image.open(io.BytesIO(img_bytes))
+                img: Image.Image = Image.open(io.BytesIO(img_bytes))
                 img.load()  # force the decode now so any UnidentifiedImageError surfaces here
             except Exception as e:
                 return {
@@ -353,7 +354,7 @@ class WSLBackend(DesktopBackend):
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
                 img = img.resize(
-                    (resize_width, int(img.height * ratio)), Image.LANCZOS
+                    (resize_width, int(img.height * ratio)), Image.Resampling.LANCZOS
                 )
 
             save_path = Path(save_dir)
@@ -750,7 +751,8 @@ class WSLBackend(DesktopBackend):
             except asyncio.TimeoutError:
                 # Still running after 3 s — normal for GUI apps.
                 pass
-            result = {"success": True, "application": application, "args": args, "method": "direct"}
+            result = {"success": True, "application": application, "args": args,
+                      "pid": proc.pid, "method": "direct"}
         except Exception as direct_err:
             # Fall back to PowerShell Start-Process.
             try:
@@ -770,6 +772,7 @@ class WSLBackend(DesktopBackend):
                     "success": True,
                     "application": application,
                     "args": args,
+                    "pid": None,  # Start-Process pid is not surfaced here
                     "method": "powershell",
                 }
             except Exception as ps_err:

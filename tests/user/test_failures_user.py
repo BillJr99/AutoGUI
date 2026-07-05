@@ -80,24 +80,24 @@ def _cfg(tmp_path, **agent_overrides):
 
 class TestFailureClassifier:
     def test_permission_error_maps_to_permission(self):
-        from failures import classify, FailureClass
+        from failures import FailureClass, classify
         v = classify(tool_name="desktop_click", error_message="Permission denied")
         assert v.cls == FailureClass.PERMISSION
 
     def test_missing_element_maps_to_missing_element(self):
-        from failures import classify, FailureClass
+        from failures import FailureClass, classify
         v = classify(tool_name="desktop_click_element",
                      error_message="Element not found: button[name=Login]")
         assert v.cls == FailureClass.MISSING_ELEMENT
 
     def test_timeout_maps_to_app_not_ready(self):
-        from failures import classify, FailureClass
+        from failures import FailureClass, classify
         v = classify(tool_name="desktop_screenshot",
                      error_message="operation timed out after 5s")
         assert v.cls == FailureClass.APP_NOT_READY
 
     def test_predicate_failed_flag_short_circuits(self):
-        from failures import classify, FailureClass
+        from failures import FailureClass, classify
         v = classify(tool_name="any", error_message="",
                      predicate_failed=True)
         assert v.cls == FailureClass.PREDICATE_NOT_MET
@@ -112,7 +112,7 @@ class TestStepFailureFlow:
     async def test_step_failure_emitted_when_step_exhausts_retries(self, tmp_path):
         from agent import Agent
         sys.path.insert(0, str(ROOT / "tests"))
-        from conftest import StubClient, StubRegistry, make_assistant_text, make_tool_call
+        from conftest import StubClient, StubRegistry, make_tool_call
 
         cfg = _cfg(tmp_path)
         client = StubClient()

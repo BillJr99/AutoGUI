@@ -1,0 +1,40 @@
+[tool.ruff]
+# Legacy modules carry long inline strings (AppleScript/PowerShell payloads
+# in backends/) with lines up to ~280 chars, so E501 is not enforced yet —
+# see [tool.ruff.lint] ignore below.  line-length still guides editors and
+# any future formatter adoption.
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "OSScreenObserver",   # git submodule — not ours to lint
+    "pi-extension",       # TypeScript package; any .py in it is vendored
+]
+
+[tool.ruff.lint]
+# E   pycodestyle errors (includes E722 bare-except)
+# F   pyflakes
+# W   pycodestyle warnings
+# I   isort import ordering
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line too long — legacy style predates the linter (max ~284)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests must set env vars before importing api/main, so module-level
+# imports legitimately follow executable statements.
+"tests/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = [
+    "^OSScreenObserver/",
+    "^pi-extension/",
+]
+
+[[tool.mypy.overrides]]
+# client.py is the OpenWebUI transport layer — keep it strictly typed.
+module = "client"
+disallow_untyped_defs = true
+check_untyped_defs = true

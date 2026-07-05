@@ -8,15 +8,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import pytest
-
 from oso_text import build_text_bundle, flatten_tree, trim_tree
 
 
 def _make_tree(branching: int, depth: int, label: str = "n") -> dict:
     """Build a synthetic OSO-shaped tree with given branching/depth."""
     def rec(d: int, path: str) -> dict:
-        node = {
+        node: dict = {
             "role": "ButtonControl",
             "name": f"{label}-{path}",
             "bounds": {"x": 0, "y": 0, "width": 10, "height": 10},
@@ -174,7 +172,7 @@ def _build_system_prompt_via_agent(screen_observer_caps: dict[str, Any]) -> tupl
         "prompts_dir": "prompts",
         "screen_observer": {"text_observation": {"enabled": True}},
     }
-    agent = Agent(_StubClient(), _StubRegistry(screen_observer_caps), cfg)
+    agent = Agent(_StubClient(), _StubRegistry(screen_observer_caps), cfg)  # type: ignore[arg-type]
     return agent._system_prompt, set()
 
 

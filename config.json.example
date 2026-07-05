@@ -7,7 +7,9 @@
     "model": "llama3.1:70b",
     "temperature": 0.2,
     "max_tokens": 4096,
-    "timeout_seconds": 120
+    "timeout_seconds": 120,
+    "_stream_comment": "stream=true makes the agent iterate the SSE streaming endpoint and emit incremental text_delta events (shown live in the TUI); the final text event is unchanged. On stream failure the agent falls back to non-streaming once per step.",
+    "stream": false
   },
   "prompts_dir": "prompts",
   "_install_comment": "Set install_dependencies=true to run scripts/install-dependencies.* at startup (system + Python + Playwright + pi-extension Node deps).",

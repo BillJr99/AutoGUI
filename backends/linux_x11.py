@@ -27,8 +27,8 @@ class X11Backend(DesktopBackend):
         try:
             import pyatspi  # noqa: F401
             find_element = True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[backend] pyatspi unavailable; find_element disabled: %s", e)
         caps.update({
             "find_element": find_element,
             "get_window_tree": False,
@@ -86,11 +86,13 @@ class X11Backend(DesktopBackend):
             def _node_to_dict(node):
                 try:
                     role_name = node.getRoleName()
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] getRoleName failed on node: %s", e)
                     role_name = ""
                 try:
                     n = node.name or ""
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] node name read failed: %s", e)
                     n = ""
                 rect = None
                 try:
@@ -98,8 +100,8 @@ class X11Backend(DesktopBackend):
                     extents = comp.getExtents(pyatspi.DESKTOP_COORDS)
                     rect = {"x": extents.x, "y": extents.y,
                             "width": extents.width, "height": extents.height}
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[backend:atspi] node extents read failed: %s", e)
                 return {"name": n, "control_type": role_name, "rect": rect}
 
             def _recurse(node, restrict_window=False):
@@ -113,7 +115,8 @@ class X11Backend(DesktopBackend):
                 try:
                     for child in node:
                         _recurse(child, restrict_window=restrict_window)
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] child iteration failed, pruning branch: %s", e)
                     return
 
             try:
@@ -124,7 +127,8 @@ class X11Backend(DesktopBackend):
                             if wanted_window and wanted_window not in top_name:
                                 continue
                             _recurse(top)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("[backend:atspi] app subtree walk failed, skipping: %s", e)
                         continue
             except Exception as e:
                 return {"error": f"AT-SPI walk failed: {e}"}
@@ -205,9 +209,87 @@ class X11Backend(DesktopBackend):
                 })
             return {"windows": windows, "count": len(windows)}
         except FileNotFoundError:
+            # wmctrl missing — degrade to the xdotool fallback (same schema)
+            # before giving up with an install hint.
+            fallback = await self._list_windows_xdotool()
+            if "error" not in fallback:
+                return fallback
             return {"error": "wmctrl not found — install with: sudo apt install wmctrl"}
         except Exception as e:
             logger.debug("[x11:list_windows] %s", traceback.format_exc())
+            return {"error": str(e)}
+
+    async def _list_windows_xdotool(self) -> dict:
+        """wmctrl-less fallback: enumerate visible windows with xdotool.
+
+        Returns the same schema as the wmctrl path: ``{"windows":
+        [{id, pid, app, x, y, width, height, title}], "count": int}``.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "search", "--onlyvisible", "--name", ".",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            wids = [w for w in stdout.decode(errors="replace").split() if w.isdigit()]
+            windows = []
+            for wid in wids[:40]:  # cap the per-window subprocess fan-out
+                info = {"id": hex(int(wid)), "pid": 0, "app": "",
+                        "x": 0, "y": 0, "width": 0, "height": 0, "title": ""}
+                try:
+                    p = await asyncio.create_subprocess_exec(
+                        "xdotool", "getwindowname", wid,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    out, _ = await asyncio.wait_for(p.communicate(), timeout=5)
+                    info["title"] = out.decode(errors="replace").strip()
+
+                    p = await asyncio.create_subprocess_exec(
+                        "xdotool", "getwindowpid", wid,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    out, _ = await asyncio.wait_for(p.communicate(), timeout=5)
+                    pid_str = out.decode(errors="replace").strip()
+                    if pid_str.isdigit():
+                        info["pid"] = int(pid_str)
+                        try:
+                            from pathlib import Path as _P
+                            info["app"] = _P(f"/proc/{pid_str}/comm").read_text().strip()
+                        except OSError:
+                            pass
+
+                    p = await asyncio.create_subprocess_exec(
+                        "xdotool", "getwindowgeometry", "--shell", wid,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    out, _ = await asyncio.wait_for(p.communicate(), timeout=5)
+                    for line in out.decode(errors="replace").splitlines():
+                        key, _, value = line.partition("=")
+                        if not value.strip().lstrip("-").isdigit():
+                            continue
+                        num = int(value.strip())
+                        if key == "X":
+                            info["x"] = num
+                        elif key == "Y":
+                            info["y"] = num
+                        elif key == "WIDTH":
+                            info["width"] = num
+                        elif key == "HEIGHT":
+                            info["height"] = num
+                except Exception as e:
+                    # keep the partial record — title/geometry best-effort
+                    logger.debug("[backend:x11] window geometry probe failed for %s: %s",
+                                 info.get("id"), e)
+                windows.append(info)
+            return {"windows": windows, "count": len(windows), "method": "xdotool"}
+        except FileNotFoundError:
+            return {"error": "xdotool not found — install with: sudo apt install xdotool"}
+        except Exception as e:
+            logger.debug("[x11:_list_windows_xdotool] %s", traceback.format_exc())
             return {"error": str(e)}
 
     async def _get_active_wid_int(self) -> int | None:
@@ -221,7 +303,8 @@ class X11Backend(DesktopBackend):
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             dec = stdout.decode().strip()
             return int(dec) if dec else None
-        except Exception:
+        except Exception as e:
+            logger.debug("[backend:x11] active-window id lookup failed: %s", e)
             return None
 
     async def activate_window(
@@ -254,13 +337,17 @@ class X11Backend(DesktopBackend):
         match = None
         for w in windows_result.get("windows", []):
             if window_id and w.get("id", "").lower() == window_id.lower():
-                match = w; break
+                match = w
+                break
             if pid and w.get("pid") == int(pid):
-                match = w; break
+                match = w
+                break
             if title and title.lower() in w.get("title", "").lower():
-                match = w; break
+                match = w
+                break
             if app and app.lower() in w.get("app", "").lower():
-                match = w; break
+                match = w
+                break
 
         if not match:
             return {"error": "No window found matching the given criteria"}
@@ -285,7 +372,7 @@ class X11Backend(DesktopBackend):
                     return {"success": True, "active": True, "method": "wmctrl", **match}
         except FileNotFoundError:
             pass
-        except Exception as e:
+        except Exception:
             logger.debug("[x11:activate_window:wmctrl] %s", traceback.format_exc())
 
         # --- Try xdotool windowfocus ---
@@ -303,7 +390,7 @@ class X11Backend(DesktopBackend):
                         return {"success": True, "active": True, "method": "xdotool", **match}
             except FileNotFoundError:
                 pass
-            except Exception as e:
+            except Exception:
                 logger.debug("[x11:activate_window:xdotool] %s", traceback.format_exc())
 
         # --- Click fallback ---
@@ -369,8 +456,8 @@ class X11Backend(DesktopBackend):
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            restore_proc.stdin.write(old_out)
-            restore_proc.stdin.close()
+            restore_proc.stdin.write(old_out)  # type: ignore[union-attr]  # stdin=PIPE above
+            restore_proc.stdin.close()  # type: ignore[union-attr]
             await asyncio.wait_for(restore_proc.wait(), timeout=5)
 
             truncated = len(text) > max_chars
@@ -402,7 +489,8 @@ class X11Backend(DesktopBackend):
                     raise RuntimeError(stderr.decode(errors="replace").strip())
             except asyncio.TimeoutError:
                 pass  # GUI app still running — expected
-            return {"success": True, "application": application, "args": args}
+            return {"success": True, "application": application, "args": args,
+                    "pid": proc.pid, "method": "subprocess"}
         except Exception as e:
             logger.debug("[x11:launch] %s", traceback.format_exc())
             return {"error": str(e)}

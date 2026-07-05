@@ -25,10 +25,14 @@ AUTOGUI_CONFIG      Path to config.json (default: ``config.json``).
                     An empty string is treated as "no config file".
 AUTOGUI_DRY_RUN     ``true`` forces all tasks through DryRunAgent.
 AUTOGUI_API_PORT    Listening port (default: ``8002``).
-AUTOGUI_API_HOST    Bind address (default: ``0.0.0.0``).
-                    The default binds on all interfaces for sandbox/
-                    container testing — set ``AUTOGUI_API_HOST=127.0.0.1``
-                    for local-only use.  The API has no authentication.
+AUTOGUI_API_HOST    Bind address (default: ``127.0.0.1``).
+                    The default binds to loopback only.  Set
+                    ``AUTOGUI_API_HOST=0.0.0.0`` to explicitly opt in to
+                    exposing the API on all interfaces (e.g. for Docker
+                    deployments where the container boundary provides
+                    isolation).  The API has no authentication — a
+                    prominent warning is logged whenever the effective
+                    bind address is not loopback.
 OPENWEBUI_BASE_URL  OpenWebUI base URL when no config file is present.
 OPENWEBUI_API_KEY   API key when no config file is present.
 OPENWEBUI_MODEL     Model name when no config file is present.
@@ -37,8 +41,10 @@ All HTTP responses follow the shape ``{ok: true|false, ...}``.
 Errors follow ``{ok: false, error: {code: str, message: str}}``.
 
 No authentication is enforced — this API is designed to run inside a
-trusted network boundary (e.g. localhost or a private LAN).  Do not
-expose it to untrusted networks without adding your own auth layer.
+trusted network boundary.  The default loopback bind keeps it local;
+opting in to ``0.0.0.0`` is safe only when the surrounding runtime
+(container, VM, firewall) provides the isolation.  Do not expose it to
+untrusted networks without adding your own auth layer.
 """
 
 import asyncio
@@ -116,13 +122,45 @@ _START_TIME = time.monotonic()
 # CLI launcher does not duplicate the defaults.
 # ---------------------------------------------------------------------------
 
-DEFAULT_API_HOST = "0.0.0.0"
+DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8002
 
 
 def get_api_host() -> str:
-    """Return the effective bind host, honouring ``AUTOGUI_API_HOST``."""
+    """Return the effective bind host, honouring ``AUTOGUI_API_HOST``.
+
+    Defaults to loopback (``127.0.0.1``).  Setting
+    ``AUTOGUI_API_HOST=0.0.0.0`` is the explicit opt-in for exposing the
+    unauthenticated API on all interfaces (e.g. inside a Docker container
+    whose boundary provides the isolation).
+    """
     return os.environ.get("AUTOGUI_API_HOST", DEFAULT_API_HOST)
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True when *host* is a loopback-only bind address."""
+    h = host.strip().lower()
+    return h in ("localhost", "::1") or h.startswith("127.")
+
+
+def warn_if_nonloopback_host(host: str) -> bool:
+    """Log a prominent warning when *host* exposes the API beyond loopback.
+
+    Returns True when a warning was emitted (i.e. the host is not a
+    loopback address), False otherwise.  Shared by the standalone
+    ``python api.py`` entry point and main.py's background launcher so
+    both paths surface the same message.
+    """
+    if is_loopback_host(host):
+        return False
+    logger.warning(
+        "SECURITY: unauthenticated desktop-control API exposed to the network "
+        "(binding to %s). Anyone who can reach this address can control the "
+        "desktop. Set AUTOGUI_API_HOST=127.0.0.1 for loopback-only use, or "
+        "ensure the runtime boundary (container/VM/firewall) provides isolation.",
+        host,
+    )
+    return True
 
 
 def get_api_port() -> int:
@@ -294,10 +332,10 @@ def _build_agent(cfg: dict, dry_run: bool):
         return DryRunAgent()
 
     # Lazy-import the real agent stack only when needed.
-    from client import OpenWebUIClient
-    from tools import ToolRegistry
     from agent import Agent
+    from client import OpenWebUIClient
     from main import build_components
+    from tools import ToolRegistry
 
     try:
         # build_components returns (client, registry, agent)
@@ -388,8 +426,8 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
             if _tui_event_callback is not None:
                 try:
                     _tui_event_callback(task_id, step)
-                except Exception:
-                    pass
+                except Exception as cb_exc:
+                    logger.debug("[api] TUI event callback failed for task %s: %s", task_id, cb_exc)
 
             if event.kind == "done":
                 break
@@ -412,8 +450,8 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
         if _tui_event_callback is not None:
             try:
                 _tui_event_callback(task_id, err_step)
-            except Exception:
-                pass
+            except Exception as cb_exc:
+                logger.debug("[api] TUI error-event callback failed for task %s: %s", task_id, cb_exc)
         task["status"] = "error"
 
     finally:
@@ -514,9 +552,58 @@ async def list_tools():
         return {"ok": True, "tools": [], "warning": "Tool registry unavailable."}
 
 
+def _task_sse_stream(task: dict) -> AsyncIterator[str]:
+    """
+    Shared SSE generator over a task's accumulated steps.
+
+    Polls ``task["steps"]`` by index so every subscriber gets the full
+    event history independently — events already emitted are replayed
+    first, then live events follow until the task reaches a terminal
+    status, when a ``{"kind": "done", "finished": true}`` sentinel closes
+    the stream.
+    """
+
+    async def _event_gen() -> AsyncIterator[str]:
+        sent = 0
+        while True:
+            # Drain any steps that have arrived since last iteration.
+            steps = task["steps"]
+            while sent < len(steps):
+                payload = json.dumps(steps[sent], default=str)
+                yield f"data: {payload}\n\n"
+                sent += 1
+
+            # Task finished — flush any trailing steps and close stream.
+            if task["status"] in ("done", "error", "cancelled"):
+                steps = task["steps"]
+                while sent < len(steps):
+                    payload = json.dumps(steps[sent], default=str)
+                    yield f"data: {payload}\n\n"
+                    sent += 1
+                yield 'data: {"kind": "done", "finished": true}\n\n'
+                return
+
+            # Not done yet — brief poll interval (also acts as a keep-alive).
+            await asyncio.sleep(0.1)
+
+    return _event_gen()
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",  # disable Nginx buffering when behind a proxy
+}
+
+
 @app.post("/api/task", status_code=202)
-async def create_task(req: TaskRequest):
-    """Submit a new task.  Returns immediately with a task_id."""
+async def create_task(req: TaskRequest, stream: bool = False):
+    """Submit a new task.
+
+    Returns immediately with a task_id, or — with ``?stream=true`` — a
+    ``text/event-stream`` of the task's AgentEvents.  The streamed variant
+    emits a ``{"kind": "task_created", "task_id": ...}`` frame first, then
+    the same event sequence ``GET /api/task/{id}/stream`` would deliver.
+    """
     logger.info("POST /api/task inbound body: %s", json.dumps(req.model_dump()))
 
     if not req.task.strip():
@@ -560,6 +647,21 @@ async def create_task(req: TaskRequest):
     _TASK_HANDLES[task_id] = async_task
 
     logger.info("Created task %s: %r (dry_run=%s)", task_id, req.task[:80], effective_dry_run)
+
+    if stream:
+        task = TASKS[task_id]
+
+        async def _created_then_events() -> AsyncIterator[str]:
+            yield f'data: {json.dumps({"kind": "task_created", "task_id": task_id})}\n\n'
+            async for frame in _task_sse_stream(task):
+                yield frame
+
+        return StreamingResponse(
+            _created_then_events(),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
     return {"ok": True, "task_id": task_id}
 
 
@@ -588,36 +690,10 @@ async def stream_task(task_id: str):
     """
     task = _task_or_404(task_id)
 
-    async def _event_gen() -> AsyncIterator[str]:
-        sent = 0
-        while True:
-            # Drain any steps that have arrived since last iteration.
-            steps = task["steps"]
-            while sent < len(steps):
-                payload = json.dumps(steps[sent], default=str)
-                yield f"data: {payload}\n\n"
-                sent += 1
-
-            # Task finished — flush any trailing steps and close stream.
-            if task["status"] in ("done", "error", "cancelled"):
-                steps = task["steps"]
-                while sent < len(steps):
-                    payload = json.dumps(steps[sent], default=str)
-                    yield f"data: {payload}\n\n"
-                    sent += 1
-                yield f'data: {{"kind": "done", "finished": true}}\n\n'
-                return
-
-            # Not done yet — brief poll interval (also acts as a keep-alive).
-            await asyncio.sleep(0.1)
-
     return StreamingResponse(
-        _event_gen(),
+        _task_sse_stream(task),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable Nginx buffering when behind a proxy
-        },
+        headers=_SSE_HEADERS,
     )
 
 
@@ -660,9 +736,10 @@ if __name__ == "__main__":
     import uvicorn
 
     port = get_api_port()
-    # Default binds on all interfaces (0.0.0.0) for sandbox/container testing.
-    # Set AUTOGUI_API_HOST=127.0.0.1 for local-only use — the API has no
-    # authentication and should not be exposed to untrusted networks.
+    # Default binds to loopback (127.0.0.1).  Set AUTOGUI_API_HOST=0.0.0.0
+    # to explicitly opt in to all-interface exposure (Docker etc.) — the API
+    # has no authentication and should not be reachable from untrusted networks.
     host = get_api_host()
+    warn_if_nonloopback_host(host)
     logger.info("Starting AutoGUI REST API on %s:%d (dry_run=%s)", host, port, DRY_RUN)
     uvicorn.run(app, host=host, port=port)

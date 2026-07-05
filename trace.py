@@ -20,6 +20,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
+from typing import IO, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class TraceWriter:
         d = Path(dir_path).expanduser()
         d.mkdir(parents=True, exist_ok=True)
         self.path = d / f"{self.session_id}.jsonl"
+        self._fh: Optional[IO[str]] = None
         try:
             self._fh = self.path.open("a", encoding="utf-8")
         except OSError as e:

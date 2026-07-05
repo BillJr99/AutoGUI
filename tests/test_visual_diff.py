@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from visual_diff import diff, hamming_distance, hash_b64, hash_png_bytes
-
 
 PIL_AVAILABLE = True
 try:
@@ -18,8 +15,9 @@ except ImportError:
 
 @pytest.mark.skipif(not PIL_AVAILABLE, reason="PIL not installed")
 def test_identical_images_hash_identically():
-    from PIL import Image
     from io import BytesIO
+
+    from PIL import Image
     img = Image.new("RGB", (64, 64), (128, 64, 200))
     buf = BytesIO()
     img.save(buf, "PNG")
@@ -35,8 +33,9 @@ def test_solid_color_images_collide_under_dhash():
     images have every adjacent pair equal, so opposite-intensity solids
     actually produce the *same* hash — this test pins that property so a
     future change to the dHash construction is noticed."""
-    from PIL import Image
     from io import BytesIO
+
+    from PIL import Image
     bufs = []
     for color in ((0, 0, 0), (255, 255, 255)):
         img = Image.new("RGB", (64, 64), color)
@@ -59,8 +58,9 @@ def test_structured_images_produce_nontrivial_distance():
     a non-zero Hamming distance, but dHash collapses them to 0 due to the resize
     step averaging away the gradient signal.  Marked xfail(strict=False) to
     document this algorithmic limitation without blocking CI."""
-    from PIL import Image
     from io import BytesIO
+
+    from PIL import Image
     h_grad = Image.new("L", (64, 64))
     v_grad = Image.new("L", (64, 64))
     for x in range(64):

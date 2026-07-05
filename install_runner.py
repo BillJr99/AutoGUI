@@ -10,11 +10,9 @@ the canonical source of truth — this module just spawns them.
 from __future__ import annotations
 
 import logging
-import os
 import platform as _platform
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)

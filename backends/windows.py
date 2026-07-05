@@ -35,7 +35,7 @@ _user32 = None
 
 if _platform.system() == "Windows":
     try:
-        _user32 = ctypes.WinDLL("user32", use_last_error=True)
+        _user32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
         _SENDINPUT_AVAILABLE = True
     except (OSError, AttributeError):
         _SENDINPUT_AVAILABLE = False
@@ -258,7 +258,7 @@ class WindowsBackend(DesktopBackend):
                 "success": True, "x": int(x), "y": int(y),
                 "button": button, "clicks": int(clicks), "method": "sendinput",
             }
-        except Exception as e:
+        except Exception:
             logger.debug("[windows:click] SendInput failed: %s", traceback.format_exc())
             return await super().click(x, y, button=button, clicks=clicks)
 
@@ -284,12 +284,12 @@ class WindowsBackend(DesktopBackend):
         # 1. Clipboard paste path — runs the same code as the base class
         # which now uses platform-aware modifiers + clipboard restore.
         try:
-            import pyperclip  # type: ignore
             base_result = await super().type_text(text)
             if isinstance(base_result, dict) and base_result.get("success"):
                 return base_result
-        except Exception:
-            pass  # Fall through to SendInput if clipboard fails.
+        except Exception as e:
+            # Fall through to SendInput if clipboard fails.
+            logger.debug("[backend:windows] clipboard type_text failed; using SendInput: %s", e)
 
         # 2. SendInput KEYEVENTF_UNICODE fallback with a small per-character
         # sleep so receiving windows have time to process each event.  The
@@ -362,12 +362,23 @@ class WindowsBackend(DesktopBackend):
             return await super().hotkey(keys)
 
     async def list_windows(self) -> dict:
-        """List visible windows; tries OS Screen Observer first, falls back to PowerShell."""
+        """List visible windows.
+
+        Priority: OS Screen Observer → native win32gui.EnumWindows (when
+        pywin32 is installed) → PowerShell.  All paths return the same
+        schema: ``{"windows": [{id, title, app, pid, active, x, y, width,
+        height}], "count": int}``.
+        """
         if self._screen_observer is not None:
             result = await self._screen_observer.get_windows()
             if result is not None:
                 return result
-            logger.warning("[windows:list_windows] OS Screen Observer unavailable; falling back to PowerShell")
+            logger.warning("[windows:list_windows] OS Screen Observer unavailable; falling back to native method")
+
+        native = await self._list_windows_win32()
+        if "error" not in native:
+            return native
+
         script = (
             self._WIN_FOCUS_TYPE +
             "$ErrorActionPreference = 'SilentlyContinue'\n"
@@ -399,6 +410,67 @@ class WindowsBackend(DesktopBackend):
             logger.debug("[windows:list_windows] %s", traceback.format_exc())
             return {"error": str(e)}
 
+    async def _list_windows_win32(self) -> dict:
+        """Native window enumeration via win32gui.EnumWindows (pywin32).
+
+        Returns ``{"error": ...}`` when pywin32 is not installed or the
+        enumeration fails, so list_windows can degrade to PowerShell.
+        """
+        try:
+            import win32gui  # type: ignore
+            import win32process  # type: ignore
+        except ImportError:
+            return {"error": "pywin32 not installed"}
+
+        def _enum() -> list[dict]:
+            active = win32gui.GetForegroundWindow()
+            results: list[dict] = []
+
+            def _cb(hwnd, _extra):
+                try:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return True
+                    title = win32gui.GetWindowText(hwnd)
+                    if not title:
+                        return True
+                    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                    _tid, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    app = ""
+                    try:
+                        import psutil  # type: ignore
+                        app = psutil.Process(int(pid)).name()
+                        if app.lower().endswith(".exe"):
+                            app = app[:-4]
+                    except Exception as e:
+                        logger.debug("[backend:windows] process name lookup failed for pid %s: %s",
+                                     pid, e)
+                    results.append({
+                        "id": str(hwnd),
+                        "title": title,
+                        "app": app,
+                        "pid": int(pid),
+                        "active": hwnd == active,
+                        "x": int(left),
+                        "y": int(top),
+                        "width": int(right - left),
+                        "height": int(bottom - top),
+                    })
+                except Exception as e:
+                    # skip windows that vanish mid-enumeration
+                    logger.debug("[backend:windows] window enumeration entry failed: %s", e)
+                return True
+
+            win32gui.EnumWindows(_cb, None)
+            return results
+
+        try:
+            loop = asyncio.get_event_loop()
+            windows = await loop.run_in_executor(None, _enum)
+            return {"windows": windows, "count": len(windows), "method": "win32gui"}
+        except Exception as e:
+            logger.debug("[windows:_list_windows_win32] %s", traceback.format_exc())
+            return {"error": str(e)}
+
     async def launch(
         self,
         application: str,
@@ -428,9 +500,34 @@ class WindowsBackend(DesktopBackend):
                     raise RuntimeError(stderr.decode(errors="replace").strip())
             except asyncio.TimeoutError:
                 pass
-            return {"success": True, "application": application, "args": args}
+            return {
+                "success": True,
+                "application": application,
+                "args": args,
+                "pid": proc.pid,
+                "method": "subprocess",
+            }
         except Exception as e:
             logger.debug("[windows:launch] %s", traceback.format_exc())
+            # os.startfile fallback — resolves registered app names and
+            # documents via ShellExecute (equivalent of the `start` command),
+            # which direct subprocess spawning cannot do.  Arguments are not
+            # supported by startfile, so only try it for bare launches.
+            import os as _os
+            if not args and hasattr(_os, "startfile"):
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, _os.startfile, application)
+                    return {
+                        "success": True,
+                        "application": application,
+                        "args": [],
+                        "pid": None,
+                        "method": "startfile",
+                    }
+                except Exception:
+                    logger.debug("[windows:launch] startfile fallback failed: %s",
+                                 traceback.format_exc())
             return {"error": str(e)}
 
     async def activate_window(

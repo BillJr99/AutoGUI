@@ -24,7 +24,6 @@ import asyncio
 import json
 import logging
 import sys
-import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -150,8 +149,10 @@ async def _check_drift(step: dict, registry) -> str:
         # we can surface "screen hash unavailable" as a distinct note
         # instead of letting the user assume the screen looked identical.
         try:
-            from visual_diff import diff as _vdiff, hash_b64 as _vhash
             import base64 as _b64
+
+            from visual_diff import diff as _vdiff
+            from visual_diff import hash_b64 as _vhash
             try:
                 expected = _b64.b64decode(expected_hash)
             except Exception:
