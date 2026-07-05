@@ -60,6 +60,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # REST API server settings (override at runtime with -e)
 ENV AUTOGUI_DRY_RUN=false
 ENV AUTOGUI_API_PORT=8002
+# Explicit opt-in: the API defaults to binding loopback (127.0.0.1), which
+# is unreachable through `docker run -p 8002:8002`.  Inside the container we
+# bind 0.0.0.0 so published ports work; the container boundary provides the
+# network isolation.  Override with -e AUTOGUI_API_HOST=127.0.0.1 if the API
+# should only be reachable from inside the container.
+ENV AUTOGUI_API_HOST=0.0.0.0
 
 # ── System packages ────────────────────────────────────────────────────────
 # These match what scripts/install-dependencies.sh installs on Linux/X11.

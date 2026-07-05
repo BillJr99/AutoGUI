@@ -26,8 +26,9 @@ is configured to use and exposes desktop tools plus `/autogui`.
 >
 > The agent operates at OS level: it can run shell commands, click anything, type
 > anywhere, read and write files, and take screenshots. **Run AutoGUI only in a
-> sandbox, VM, or container that you are willing to reset.** Restrict the REST API
-> to loopback (`AUTOGUI_API_HOST=127.0.0.1`) and consider disabling shell access
+> sandbox, VM, or container that you are willing to reset.** The REST API binds
+> to loopback (`127.0.0.1`) by default — only set `AUTOGUI_API_HOST=0.0.0.0` when
+> the runtime boundary provides isolation — and consider disabling shell access
 > (`"allowed_shell": false`) if you do not fully trust the task or the model driving
 > it. See the [Security Notes](#security-notes) section for further guidance.
 
@@ -555,7 +556,7 @@ startup. You can also start it standalone:
 ```bash
 # With config.json present:
 python api.py
-# Listening on http://0.0.0.0:8002
+# Listening on http://127.0.0.1:8002
 
 # Without a config file — use environment variables:
 OPENWEBUI_BASE_URL=http://localhost:3000 \
@@ -569,16 +570,18 @@ AUTOGUI_DRY_RUN=true python api.py
 
 ### Security and network bind address
 
-> **Warning: the REST API has no authentication and binds to `0.0.0.0`
-> (all interfaces) by default.**  This default suits sandbox / container
-> environments where network isolation is provided by the runtime.
-> **Do not expose the API port to an untrusted network without additional
-> access controls.**  For local development, restrict the server to
-> loopback (`127.0.0.1`) using the mechanisms below.
+> **The REST API has no authentication and binds to loopback
+> (`127.0.0.1`) by default.**  Exposing it on other interfaces is an
+> explicit opt-in: set `AUTOGUI_API_HOST=0.0.0.0` only when the runtime
+> boundary (Docker container, VM, firewall) provides the network
+> isolation — the shipped `Dockerfile` does this so published ports keep
+> working.  A prominent warning is logged whenever the effective bind
+> address is not loopback.  **Do not expose the API port to an untrusted
+> network without additional access controls.**
 
 | Mechanism | Effect |
 |---|---|
-| `AUTOGUI_API_HOST=127.0.0.1` | Restrict the API to loopback (recommended for local dev) |
+| `AUTOGUI_API_HOST=0.0.0.0` | Opt in to exposing the API on all interfaces (Docker/testing) |
 | `AUTOGUI_API_PORT=<port>` | Change the listen port (default `8002`) |
 | `AUTOGUI_DISABLE_API=1` | Disable the background API for all `main.py` invocations |
 
@@ -1243,10 +1246,12 @@ self._register(
   excluded from git via `.gitignore`.
 - **Desktop control** — the agent operates at OS level: it can click anything and type
   anywhere.  Only run on machines and accounts where you accept this capability.
-- **REST API** — no authentication is enforced; the server binds to `0.0.0.0` by default
-  (all interfaces).  Set `AUTOGUI_API_HOST=127.0.0.1` for loopback-only use, or
-  `AUTOGUI_DISABLE_API=1` to disable the background API entirely.  See
-  [docs/REST_API.md](docs/REST_API.md) for details.
+- **REST API** — no authentication is enforced; the server binds to loopback
+  (`127.0.0.1`) by default.  Setting `AUTOGUI_API_HOST=0.0.0.0` is the explicit
+  opt-in for exposing the API on all interfaces (e.g. Docker, where the shipped
+  `Dockerfile` sets it so published ports work) — a warning is logged whenever the
+  bind address is not loopback.  Set `AUTOGUI_DISABLE_API=1` to disable the
+  background API entirely.  See [docs/REST_API.md](docs/REST_API.md) for details.
 
 ---
 

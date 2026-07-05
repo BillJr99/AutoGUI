@@ -205,13 +205,14 @@ def _start_api_background():
     The server is launched only when fastapi and uvicorn are installed.
     Set AUTOGUI_DISABLE_API=1 to suppress the server entirely.
     The bind host and port can be overridden via AUTOGUI_API_HOST and
-    AUTOGUI_API_PORT (defaults: 0.0.0.0 and 8002).
+    AUTOGUI_API_PORT (defaults: 127.0.0.1 and 8002).
 
-    WARNING: The default host 0.0.0.0 binds on ALL network interfaces.
-    This is intended for isolated sandbox/container testing only.
-    Set AUTOGUI_API_HOST=127.0.0.1 for loopback-only use, or set
-    AUTOGUI_DISABLE_API=1 to disable the API entirely.  The API has
-    no authentication.
+    The default host binds to loopback only.  Setting
+    AUTOGUI_API_HOST=0.0.0.0 is the explicit opt-in to exposing the
+    unauthenticated API on ALL network interfaces (e.g. for Docker
+    deployments where the container boundary provides isolation) — a
+    prominent warning is logged in that case.  Set
+    AUTOGUI_DISABLE_API=1 to disable the API entirely.
     """
     import os
     import sys
@@ -221,7 +222,7 @@ def _start_api_background():
         return
     try:
         import uvicorn
-        from api import app, get_api_host, get_api_port
+        from api import app, get_api_host, get_api_port, warn_if_nonloopback_host
         host = get_api_host()
         port = get_api_port()
 
@@ -238,11 +239,7 @@ def _start_api_background():
         t = threading.Thread(target=_run, name="autogui-api", daemon=True)
         t.start()
         _api_log.info("[autogui] REST API starting on http://%s:%d", host, port)
-        if host == "0.0.0.0":
-            _api_log.warning(
-                "[autogui] REST API bound to 0.0.0.0 (all interfaces), no auth. "
-                "Set AUTOGUI_API_HOST=127.0.0.1 for loopback-only or AUTOGUI_DISABLE_API=1 to disable.",
-            )
+        warn_if_nonloopback_host(host)
     except ImportError:
         logging.getLogger("autogui.main").warning(
             "[autogui] REST API disabled: fastapi/uvicorn not installed."

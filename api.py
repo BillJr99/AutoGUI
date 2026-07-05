@@ -25,10 +25,14 @@ AUTOGUI_CONFIG      Path to config.json (default: ``config.json``).
                     An empty string is treated as "no config file".
 AUTOGUI_DRY_RUN     ``true`` forces all tasks through DryRunAgent.
 AUTOGUI_API_PORT    Listening port (default: ``8002``).
-AUTOGUI_API_HOST    Bind address (default: ``0.0.0.0``).
-                    The default binds on all interfaces for sandbox/
-                    container testing — set ``AUTOGUI_API_HOST=127.0.0.1``
-                    for local-only use.  The API has no authentication.
+AUTOGUI_API_HOST    Bind address (default: ``127.0.0.1``).
+                    The default binds to loopback only.  Set
+                    ``AUTOGUI_API_HOST=0.0.0.0`` to explicitly opt in to
+                    exposing the API on all interfaces (e.g. for Docker
+                    deployments where the container boundary provides
+                    isolation).  The API has no authentication — a
+                    prominent warning is logged whenever the effective
+                    bind address is not loopback.
 OPENWEBUI_BASE_URL  OpenWebUI base URL when no config file is present.
 OPENWEBUI_API_KEY   API key when no config file is present.
 OPENWEBUI_MODEL     Model name when no config file is present.
@@ -37,8 +41,10 @@ All HTTP responses follow the shape ``{ok: true|false, ...}``.
 Errors follow ``{ok: false, error: {code: str, message: str}}``.
 
 No authentication is enforced — this API is designed to run inside a
-trusted network boundary (e.g. localhost or a private LAN).  Do not
-expose it to untrusted networks without adding your own auth layer.
+trusted network boundary.  The default loopback bind keeps it local;
+opting in to ``0.0.0.0`` is safe only when the surrounding runtime
+(container, VM, firewall) provides the isolation.  Do not expose it to
+untrusted networks without adding your own auth layer.
 """
 
 import asyncio
@@ -116,13 +122,45 @@ _START_TIME = time.monotonic()
 # CLI launcher does not duplicate the defaults.
 # ---------------------------------------------------------------------------
 
-DEFAULT_API_HOST = "0.0.0.0"
+DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8002
 
 
 def get_api_host() -> str:
-    """Return the effective bind host, honouring ``AUTOGUI_API_HOST``."""
+    """Return the effective bind host, honouring ``AUTOGUI_API_HOST``.
+
+    Defaults to loopback (``127.0.0.1``).  Setting
+    ``AUTOGUI_API_HOST=0.0.0.0`` is the explicit opt-in for exposing the
+    unauthenticated API on all interfaces (e.g. inside a Docker container
+    whose boundary provides the isolation).
+    """
     return os.environ.get("AUTOGUI_API_HOST", DEFAULT_API_HOST)
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True when *host* is a loopback-only bind address."""
+    h = host.strip().lower()
+    return h in ("localhost", "::1") or h.startswith("127.")
+
+
+def warn_if_nonloopback_host(host: str) -> bool:
+    """Log a prominent warning when *host* exposes the API beyond loopback.
+
+    Returns True when a warning was emitted (i.e. the host is not a
+    loopback address), False otherwise.  Shared by the standalone
+    ``python api.py`` entry point and main.py's background launcher so
+    both paths surface the same message.
+    """
+    if is_loopback_host(host):
+        return False
+    logger.warning(
+        "SECURITY: unauthenticated desktop-control API exposed to the network "
+        "(binding to %s). Anyone who can reach this address can control the "
+        "desktop. Set AUTOGUI_API_HOST=127.0.0.1 for loopback-only use, or "
+        "ensure the runtime boundary (container/VM/firewall) provides isolation.",
+        host,
+    )
+    return True
 
 
 def get_api_port() -> int:
@@ -698,9 +736,10 @@ if __name__ == "__main__":
     import uvicorn
 
     port = get_api_port()
-    # Default binds on all interfaces (0.0.0.0) for sandbox/container testing.
-    # Set AUTOGUI_API_HOST=127.0.0.1 for local-only use — the API has no
-    # authentication and should not be exposed to untrusted networks.
+    # Default binds to loopback (127.0.0.1).  Set AUTOGUI_API_HOST=0.0.0.0
+    # to explicitly opt in to all-interface exposure (Docker etc.) — the API
+    # has no authentication and should not be reachable from untrusted networks.
     host = get_api_host()
+    warn_if_nonloopback_host(host)
     logger.info("Starting AutoGUI REST API on %s:%d (dry_run=%s)", host, port, DRY_RUN)
     uvicorn.run(app, host=host, port=port)

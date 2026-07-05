@@ -524,3 +524,57 @@ class TestErrorShapes:
         data = client.post("/api/task/bogus/approve").json()
         assert data["ok"] is False
         assert "error" in data
+
+
+# ---------------------------------------------------------------------------
+# Bind-host security defaults
+# ---------------------------------------------------------------------------
+
+class TestBindHostDefaults:
+    """The API must default to loopback; 0.0.0.0 is an explicit opt-in."""
+
+    def test_default_host_is_loopback(self, monkeypatch):
+        import api
+
+        monkeypatch.delenv("AUTOGUI_API_HOST", raising=False)
+        assert api.DEFAULT_API_HOST == "127.0.0.1"
+        assert api.get_api_host() == "127.0.0.1"
+
+    def test_env_var_opts_in_to_all_interfaces(self, monkeypatch):
+        import api
+
+        monkeypatch.setenv("AUTOGUI_API_HOST", "0.0.0.0")
+        assert api.get_api_host() == "0.0.0.0"
+
+    def test_is_loopback_host(self):
+        import api
+
+        assert api.is_loopback_host("127.0.0.1")
+        assert api.is_loopback_host("127.0.0.53")
+        assert api.is_loopback_host("localhost")
+        assert api.is_loopback_host("::1")
+        assert not api.is_loopback_host("0.0.0.0")
+        assert not api.is_loopback_host("192.168.1.10")
+
+    def test_warning_logged_for_nonloopback_host(self, caplog):
+        import api
+
+        with caplog.at_level("WARNING", logger="autogui.api"):
+            warned = api.warn_if_nonloopback_host("0.0.0.0")
+        assert warned is True
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "unauthenticated desktop-control API exposed to the network" in m
+            for m in messages
+        )
+
+    def test_no_warning_for_loopback_host(self, caplog):
+        import api
+
+        with caplog.at_level("WARNING", logger="autogui.api"):
+            warned = api.warn_if_nonloopback_host("127.0.0.1")
+        assert warned is False
+        assert not [
+            r for r in caplog.records
+            if "exposed to the network" in r.getMessage()
+        ]
