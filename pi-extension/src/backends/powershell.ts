@@ -493,7 +493,9 @@ $active = [PiWindow]::GetForegroundWindow()
     for (const candidate of launchCandidates) {
       try {
         await this.launchCandidate(candidate, args, signal);
-        return { success: true, application: candidate, requestedApplication: application, args };
+        // Start-Process / ShellExecute does not surface the launched pid, so
+        // pid is null by design, matching the Python backend's Start-Process path.
+        return { success: true, application: candidate, requestedApplication: application, args, pid: null, method: "powershell" };
       } catch (error) {
         lastError = error;
         await this.logger?.log("desktop_launch.candidate_failed", {

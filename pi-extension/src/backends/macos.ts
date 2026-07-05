@@ -343,7 +343,9 @@ end tell
   async launch(application: string, args: string[], signal?: AbortSignal): Promise<Record<string, unknown>> {
     const result = await execFile("open", ["-a", application, ...args], { timeoutMs: 10000, signal });
     if (result.code !== 0) throw new DesktopError("open failed", { stderr: result.stderr, code: result.code });
-    return { success: true, application, args };
+    // `open` hands off to LaunchServices, so the app's real pid is not
+    // observable here — pid is null by design, matching the Python backend.
+    return { success: true, application, args, pid: null, method: "open -a" };
   }
 
   async getCursorPos(): Promise<{ x: number; y: number }> {

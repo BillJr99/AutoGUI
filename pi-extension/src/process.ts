@@ -5,6 +5,7 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  pid?: number;
 }
 
 export async function execFile(
@@ -19,6 +20,7 @@ export async function execFile(
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    const childPid = child.pid;
 
     let stdout = "";
     let stderr = "";
@@ -57,7 +59,7 @@ export async function execFile(
       reject(error);
     });
     child.on("close", (code) => {
-      finish({ code, stdout, stderr, timedOut });
+      finish({ code, stdout, stderr, timedOut, pid: childPid });
     });
 
     if (options.signal?.aborted) {

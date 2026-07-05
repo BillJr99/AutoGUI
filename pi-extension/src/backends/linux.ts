@@ -227,7 +227,7 @@ export class LinuxBackend implements DesktopBackend {
   async launch(application: string, args: string[], signal?: AbortSignal): Promise<Record<string, unknown>> {
     const result = await execFile(application, args, { timeoutMs: 3000, signal });
     if (result.code !== 0 && !result.timedOut) throw new DesktopError("launch failed", { stderr: result.stderr, code: result.code });
-    return { success: true, application, args };
+    return { success: true, application, args, pid: result.pid ?? null, method: "subprocess" };
   }
 
   async getCursorPos(signal?: AbortSignal): Promise<{ x: number; y: number }> {
