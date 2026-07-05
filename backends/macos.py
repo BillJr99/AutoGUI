@@ -107,10 +107,10 @@ class MacOSBackend(DesktopBackend):
             if proc.returncode != 0:
                 return {"error": f"screencapture failed: {stderr.decode(errors='replace').strip()}"}
 
-            img = Image.open(filename)
+            img: Image.Image = Image.open(filename)
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
-                img = img.resize((resize_width, int(img.height * ratio)), Image.LANCZOS)
+                img = img.resize((resize_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
                 img.save(filename)
 
             buf = io.BytesIO()
@@ -627,11 +627,14 @@ end jsonEscape
                 match = None
                 for w in wins:
                     if app and app.lower() in w.get("app", "").lower():
-                        match = w; break
+                        match = w
+                        break
                     if pid and w.get("pid") == pid:
-                        match = w; break
+                        match = w
+                        break
                     if title and title.lower() in w.get("title", "").lower():
-                        match = w; break
+                        match = w
+                        break
                 if match:
                     cx = match["x"] + match["width"] // 2
                     cy = match["y"] + 15
@@ -727,8 +730,8 @@ end jsonEscape
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            restore_proc.stdin.write(old_clip)
-            restore_proc.stdin.close()
+            restore_proc.stdin.write(old_clip)  # type: ignore[union-attr]  # stdin=PIPE above
+            restore_proc.stdin.close()  # type: ignore[union-attr]
             await asyncio.wait_for(restore_proc.wait(), timeout=5)
 
             truncated = len(text) > max_chars

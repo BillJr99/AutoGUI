@@ -1,4 +1,4 @@
-""" 
+"""
 backends/base.py — Abstract base backend + shared pyautogui implementations.
 
 DesktopBackend is a concrete class whose default method implementations use
@@ -16,6 +16,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ class DesktopBackend:
         screen_observer  : bool — OS Screen Observer client is attached
         oso_supports     : dict — OSO /api/capabilities 'supports' dict (when populated)
         """
-        caps = {"find_element": False, "get_window_tree": False}
+        caps: dict[str, Any] = {"find_element": False, "get_window_tree": False}
         if self._screen_observer is not None and getattr(self._screen_observer, "enabled", False):
             caps["screen_observer"] = True
             oso_caps = getattr(self._screen_observer, "oso_capabilities", {})
@@ -188,12 +189,12 @@ class DesktopBackend:
                         if b64:
                             from PIL import Image
                             img_bytes = base64.b64decode(b64)
-                            img = Image.open(io.BytesIO(img_bytes))
+                            img: Image.Image = Image.open(io.BytesIO(img_bytes))
                             img.load()
                             if resize_width and img.width > resize_width:
                                 ratio = resize_width / img.width
                                 img = img.resize(
-                                    (resize_width, int(img.height * ratio)), Image.LANCZOS
+                                    (resize_width, int(img.height * ratio)), Image.Resampling.LANCZOS
                                 )
                             save_path = Path(save_dir)
                             save_path.mkdir(parents=True, exist_ok=True)
@@ -219,8 +220,8 @@ class DesktopBackend:
         # Cache lookup — only for full-screen captures with matching resize_width.
         cache_key = f"full:{resize_width}" if region is None else None
         if cache_key and self._screenshot_cache and self._cache_ttl > 0:
-            ts, key, cached = self._screenshot_cache
-            if key == cache_key and (time.monotonic() - ts) < self._cache_ttl:
+            cached_at, key, cached = self._screenshot_cache
+            if key == cache_key and (time.monotonic() - cached_at) < self._cache_ttl:
                 return dict(cached, cache_hit=True)
         try:
             from PIL import Image, ImageGrab  # noqa: F401 (ImageGrab used by region path)
@@ -241,7 +242,7 @@ class DesktopBackend:
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
                 img = img.resize(
-                    (resize_width, int(img.height * ratio)), Image.LANCZOS
+                    (resize_width, int(img.height * ratio)), Image.Resampling.LANCZOS
                 )
 
             save_path = Path(save_dir)
@@ -304,7 +305,7 @@ class DesktopBackend:
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
                 img = img.resize(
-                    (resize_width, int(img.height * ratio)), Image.LANCZOS
+                    (resize_width, int(img.height * ratio)), Image.Resampling.LANCZOS
                 )
 
             save_path = Path(save_dir)
@@ -427,7 +428,7 @@ class DesktopBackend:
             return {"error": "query cannot be empty"}
         try:
             import pytesseract  # type: ignore
-            from PIL import ImageGrab
+            from PIL import ImageGrab  # noqa: F401 — availability probe only
         except ImportError:
             return {
                 "error": (
@@ -531,7 +532,8 @@ class DesktopBackend:
             return located if isinstance(located, dict) else {"error": str(located)}
         rect = located.get("rect") or {}
         try:
-            x = int(rect["x"]); y = int(rect["y"])
+            x = int(rect["x"])
+            y = int(rect["y"])
             w = int(rect.get("width", rect.get("w", 0)))
             h = int(rect.get("height", rect.get("h", 0)))
         except (KeyError, TypeError, ValueError):

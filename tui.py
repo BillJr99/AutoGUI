@@ -35,9 +35,9 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from textual import on, work
-from textual.worker import Worker, WorkerState
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
@@ -57,6 +57,7 @@ from textual.widgets import (
     RichLog,
     Static,
 )
+from textual.worker import Worker, WorkerState
 
 logger = logging.getLogger(__name__)
 
@@ -1004,7 +1005,7 @@ class AgentTUI(App):
     def _cfg_get(self, dot_path: str):
         """Return the value at *dot_path* from the in-memory config dict."""
         parts = dot_path.split(".")
-        node = self._cfg
+        node: Any = self._cfg
         for part in parts:
             if not isinstance(node, dict):
                 return None
@@ -1041,6 +1042,7 @@ class AgentTUI(App):
             if result is None:
                 return
             # Coerce back to the original type so ints stay ints, etc.
+            new_val: Any
             if original_type is bool:
                 new_val = result.strip().lower() in ("true", "1", "yes", "on")
             elif original_type is int:

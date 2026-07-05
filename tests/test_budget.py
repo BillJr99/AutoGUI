@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 from budget import BudgetTracker
 
 
@@ -17,7 +15,9 @@ def test_no_ceiling_never_exceeded():
 
 def test_tool_call_ceiling_trips():
     b = BudgetTracker(max_tool_calls=3)
-    b.record_tool(); b.record_tool(); b.record_tool()
+    b.record_tool()
+    b.record_tool()
+    b.record_tool()
     assert b.exceeded is False
     b.record_tool()
     assert b.exceeded is True
@@ -50,5 +50,6 @@ def test_snapshot_fraction_used_caps_at_max_lever():
 
 def test_reason_string_describes_overflow():
     b = BudgetTracker(max_tool_calls=1)
-    b.record_tool(); b.record_tool()
+    b.record_tool()
+    b.record_tool()
     assert "tool_calls" in b.reason()

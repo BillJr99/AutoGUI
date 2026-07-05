@@ -35,11 +35,10 @@ import re
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Coroutine
+from typing import Callable
 
 import platform_detect
 from backends import get_backend
-from backends.base import DesktopBackend
 
 logger = logging.getLogger(__name__)
 

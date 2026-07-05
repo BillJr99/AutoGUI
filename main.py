@@ -64,10 +64,11 @@ def _quiet_unraisablehook(unraisable):
 
 sys.unraisablehook = _quiet_unraisablehook
 
-from agent import Agent
-from client import OpenWebUIClient
-from tools import ToolRegistry
-
+# These imports intentionally come after the unraisablehook install above so
+# any import-time subprocess/asyncio noise is already suppressed.
+from agent import Agent  # noqa: E402
+from client import OpenWebUIClient  # noqa: E402
+from tools import ToolRegistry  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration loading
@@ -170,8 +171,9 @@ def build_components(cfg: dict):
     """
     if cfg.get("install_dependencies", False):
         try:
-            from install_runner import run_installer
             from pathlib import Path as _Path
+
+            from install_runner import run_installer
             rc = run_installer(_Path(__file__).resolve().parent)
             if rc != 0:
                 print(f"[main] install-dependencies script returned exit code {rc} — continuing anyway.")
@@ -215,13 +217,13 @@ def _start_api_background():
     AUTOGUI_DISABLE_API=1 to disable the API entirely.
     """
     import os
-    import sys
     import threading
 
     if os.environ.get("AUTOGUI_DISABLE_API", "").lower() in ("1", "true", "yes"):
         return
     try:
         import uvicorn
+
         from api import app, get_api_host, get_api_port, warn_if_nonloopback_host
         host = get_api_host()
         port = get_api_port()
@@ -266,8 +268,8 @@ async def _escape_watcher(target_task: asyncio.Task) -> None:
         if platform.system() == "Windows":
             import msvcrt
             while not target_task.done():
-                if msvcrt.kbhit():
-                    ch = msvcrt.getch()
+                if msvcrt.kbhit():  # type: ignore[attr-defined]
+                    ch = msvcrt.getch()  # type: ignore[attr-defined]
                     if ch == b"\x1b":
                         target_task.cancel()
                         return

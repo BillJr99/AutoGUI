@@ -1,4 +1,4 @@
-""" 
+"""
 backends/wsl.py — Desktop backend for WSL (Windows Subsystem for Linux).
 
 All display operations (screenshot, click, type, hotkey, scroll) are
@@ -339,7 +339,7 @@ class WSLBackend(DesktopBackend):
                     ),
                 }
             try:
-                img = Image.open(io.BytesIO(img_bytes))
+                img: Image.Image = Image.open(io.BytesIO(img_bytes))
                 img.load()  # force the decode now so any UnidentifiedImageError surfaces here
             except Exception as e:
                 return {
@@ -353,7 +353,7 @@ class WSLBackend(DesktopBackend):
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
                 img = img.resize(
-                    (resize_width, int(img.height * ratio)), Image.LANCZOS
+                    (resize_width, int(img.height * ratio)), Image.Resampling.LANCZOS
                 )
 
             save_path = Path(save_dir)

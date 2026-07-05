@@ -8,7 +8,6 @@ OpenWebUI instance, or real desktop is required.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 
@@ -23,8 +22,8 @@ os.environ["AUTOGUI_DRY_RUN"] = "true"
 os.environ["AUTOGUI_CONFIG"] = "__no_config__.json"
 
 from fastapi.testclient import TestClient  # noqa: E402 — must come after env setup
-from api import app, TASKS, _TASK_HANDLES  # noqa: E402
 
+from api import _TASK_HANDLES, TASKS, app  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers

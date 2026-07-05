@@ -28,7 +28,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest httpx pytest-asyncio
+          pip install pytest httpx pytest-asyncio ruff mypy
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type check (mypy)
+        run: mypy .
 
       - name: Run regression tests
         run: pytest tests/ -v -m "not user" --ignore=tests/user

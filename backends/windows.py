@@ -35,7 +35,7 @@ _user32 = None
 
 if _platform.system() == "Windows":
     try:
-        _user32 = ctypes.WinDLL("user32", use_last_error=True)
+        _user32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
         _SENDINPUT_AVAILABLE = True
     except (OSError, AttributeError):
         _SENDINPUT_AVAILABLE = False
@@ -258,7 +258,7 @@ class WindowsBackend(DesktopBackend):
                 "success": True, "x": int(x), "y": int(y),
                 "button": button, "clicks": int(clicks), "method": "sendinput",
             }
-        except Exception as e:
+        except Exception:
             logger.debug("[windows:click] SendInput failed: %s", traceback.format_exc())
             return await super().click(x, y, button=button, clicks=clicks)
 
@@ -284,7 +284,6 @@ class WindowsBackend(DesktopBackend):
         # 1. Clipboard paste path — runs the same code as the base class
         # which now uses platform-aware modifiers + clipboard restore.
         try:
-            import pyperclip  # type: ignore
             base_result = await super().type_text(text)
             if isinstance(base_result, dict) and base_result.get("success"):
                 return base_result

@@ -332,10 +332,10 @@ def _build_agent(cfg: dict, dry_run: bool):
         return DryRunAgent()
 
     # Lazy-import the real agent stack only when needed.
-    from client import OpenWebUIClient
-    from tools import ToolRegistry
     from agent import Agent
+    from client import OpenWebUIClient
     from main import build_components
+    from tools import ToolRegistry
 
     try:
         # build_components returns (client, registry, agent)
@@ -580,7 +580,7 @@ def _task_sse_stream(task: dict) -> AsyncIterator[str]:
                     payload = json.dumps(steps[sent], default=str)
                     yield f"data: {payload}\n\n"
                     sent += 1
-                yield f'data: {{"kind": "done", "finished": true}}\n\n'
+                yield 'data: {"kind": "done", "finished": true}\n\n'
                 return
 
             # Not done yet — brief poll interval (also acts as a keep-alive).

@@ -16,14 +16,11 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from agent import Agent, AgentEvent
 from controller import StepStatus
 from progress import ProgressStore
 
 from .conftest import StubClient, StubRegistry, make_assistant_text, make_tool_call
-
 
 # ---------------------------------------------------------------------------
 # Scripted streaming client

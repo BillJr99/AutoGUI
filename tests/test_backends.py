@@ -16,14 +16,11 @@ import stat
 import sys
 import types
 
-import pytest
-
 from backends.base import DesktopBackend
 from backends.linux_x11 import X11Backend
 from backends.macos import MacOSBackend
 from backends.windows import WindowsBackend
 from backends.wsl import WSLBackend
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -238,7 +235,7 @@ def _install_fake_ax(monkeypatch, root: FakeAXElement, trusted: bool = True,
     """Register fake ApplicationServices + AppKit modules around an AX tree.
 
     Returns a log dict recording PerformAction invocations."""
-    log = {"pressed": [], "created_for_pid": []}
+    log: dict = {"pressed": [], "created_for_pid": []}
 
     def create_application(pid):
         log["created_for_pid"].append(pid)

@@ -39,8 +39,12 @@ import re
 import time
 import traceback
 from dataclasses import dataclass, field
+from trace import TraceWriter
 from typing import Any, AsyncIterator, Callable
 
+import predicates
+import preflight
+import visual_diff
 from app_memory import AppMemory, _normalize_app
 from artifacts import ArtifactStore
 from budget import BudgetTracker
@@ -55,18 +59,14 @@ from controller import (
     parse_plan,
     parse_step_outcome,
 )
-from failures import FailureClass, RecoveryAction, classify, escalate_action
-import predicates
+from failures import RecoveryAction, classify, escalate_action
 from planner import Planner
-import preflight
-from progress import ProgressStore
+from progress import ProgressStore, TaskProgress
 from prompt_loader import PromptLoader
 from screen_record import ScreenRecorder
 from skills import SkillStore
 from subagent import Subagent
 from tools import ToolRegistry
-from trace import TraceWriter
-import visual_diff
 from watchdog import Watchdog
 
 logger = logging.getLogger(__name__)
@@ -309,6 +309,7 @@ class Agent:
             logger.warning("[agent] TraceWriter init failed: %s", e)
             self._trace = None
 
+        self._skill_store: SkillStore | None = None
         try:
             # Constructed unconditionally — lazy disk semantics mean an
             # empty / missing skills file produces no side effects.
@@ -429,7 +430,7 @@ class Agent:
 
         # Per-task plan + state (populated by run()).
         self._plan: Plan | None = None
-        self._task_progress = None
+        self._task_progress: TaskProgress | None = None
         self._step_retry_counts: dict[str, int] = {}
         self._budget: BudgetTracker | None = None
         self._watchdog: Watchdog | None = None
@@ -1066,6 +1067,9 @@ class Agent:
         every step.  Cost telemetry, watchdog, predicate verification,
         and visual diff are wired into the per-step loop.
         """
+        # run() only dispatches here when a planner was constructed; the
+        # assert re-establishes that invariant for the type checker.
+        assert self._planner is not None
         # Fresh per-task budget tracker + watchdog so concurrent runs
         # don't share state.
         self._budget = BudgetTracker(
@@ -1132,7 +1136,7 @@ class Agent:
                 windows_summary=windows_json,
                 exemplars=exemplars,
                 memory_hints=memory_hints,
-                registered_tools=available_tools,
+                registered_tools=sorted(available_tools),
             )
             # Plan_typed wraps an internal client.chat call we can't
             # otherwise observe; count it for the budget tracker.
@@ -1144,20 +1148,20 @@ class Agent:
         # --- Critique pass: one extra LLM call to review the plan ------
         if self._critique_enabled and plan_text and plan_text.strip().startswith("{"):
             try:
-                verdict = await self._planner.critique(task=user_input, plan_json=plan_text)
+                critique_verdict = await self._planner.critique(task=user_input, plan_json=plan_text)
                 if self._budget is not None:
                     self._budget.chat_calls += 1
             except Exception as e:
                 logger.warning("[agent] critique failed: %s", e)
-                verdict = {"approve": True, "issues": [], "revised_plan_json": None}
-            if verdict.get("issues"):
+                critique_verdict = {"approve": True, "issues": [], "revised_plan_json": None}
+            if critique_verdict.get("issues"):
                 yield AgentEvent(
                     kind="plan_critique",
-                    content="critique issues: " + " | ".join(verdict["issues"][:5]),
-                    data={"issues": verdict["issues"], "approve": verdict.get("approve")},
+                    content="critique issues: " + " | ".join(critique_verdict["issues"][:5]),
+                    data={"issues": critique_verdict["issues"], "approve": critique_verdict.get("approve")},
                 )
-            if not verdict.get("approve") and verdict.get("revised_plan_json"):
-                plan_text = verdict["revised_plan_json"]
+            if not critique_verdict.get("approve") and critique_verdict.get("revised_plan_json"):
+                plan_text = critique_verdict["revised_plan_json"]
                 yield AgentEvent(
                     kind="plan_revised",
                     content="critique replaced plan",
@@ -1208,7 +1212,7 @@ class Agent:
                     # different reasons.  The done event below carries
                     # the same report under data["report"] for any
                     # consumer that wanted it.
-                    if self._task_progress is not None:
+                    if self._progress is not None and self._task_progress is not None:
                         self._progress.finalize(self._task_progress, status="failed")
                     yield AgentEvent(
                         kind="done",
@@ -1257,7 +1261,7 @@ class Agent:
                     content=f"Budget exceeded: {self._budget.reason()}",
                     data=self._budget.snapshot(note="exceeded").__dict__,
                 )
-                if self._task_progress is not None:
+                if self._progress is not None and self._task_progress is not None:
                     self._progress.finalize(self._task_progress, status="failed")
                 yield AgentEvent(
                     kind="done",
@@ -1335,7 +1339,6 @@ class Agent:
                 # may have actually succeeded!  Treat invalid-kind as
                 # "skip the check, accept STEP_DONE", log a warning so
                 # the planner authoring is visible, and move on.
-                predicate_skipped = False
                 if predicates.normalize(step.predicate) is None:
                     logger.warning(
                         "[agent] step %s predicate kind %r is not a recognised "
@@ -1353,7 +1356,6 @@ class Agent:
                             " — verification skipped (the model's STEP_DONE is authoritative)"
                         ),
                     )
-                    predicate_skipped = True
                 else:
                     # Race-tolerant predicate verification: process_running
                     # / text_visible / window_title_contains all probe GUI
@@ -1436,7 +1438,7 @@ class Agent:
                                 self._memory.record_success(app=active_app, tool=tool)
                     except Exception:
                         pass
-                if self._task_progress is not None:
+                if self._progress is not None and self._task_progress is not None:
                     self._progress.mark_done(self._task_progress, step.id)
                 self._persist_progress()
                 yield AgentEvent(
@@ -1453,7 +1455,7 @@ class Agent:
                         content=f"Budget exceeded: {self._budget.reason()}",
                         data=self._budget.snapshot(note="exceeded").__dict__,
                     )
-                    if self._task_progress is not None:
+                    if self._progress is not None and self._task_progress is not None:
                         self._progress.finalize(self._task_progress, status="failed")
                     yield AgentEvent(
                         kind="done",
@@ -1575,7 +1577,7 @@ class Agent:
             # ESCALATE / ABORT or replan-disabled.
             step.status = StepStatus.FAILED
             step.last_error = reason[:200]
-            if self._task_progress is not None:
+            if self._progress is not None and self._task_progress is not None:
                 self._progress.mark_failed(self._task_progress, step.id)
             self._persist_progress()
             yield AgentEvent(
@@ -1592,7 +1594,7 @@ class Agent:
         # --- Final summary ----------------------------------------------
         all_done = all(s.status == StepStatus.DONE for s in plan.steps)
         final_status = "done" if all_done else "failed"
-        if self._task_progress is not None:
+        if self._progress is not None and self._task_progress is not None:
             self._progress.finalize(self._task_progress, status=final_status)
         yield AgentEvent(
             kind="done",
@@ -1670,6 +1672,8 @@ class Agent:
                     f"  ({s.id}) {s.goal}" for s in done_steps[-6:]
                 )
 
+        # _run_with_controller assigns self._plan before dispatching steps.
+        assert self._plan is not None
         step_prompt = build_step_prompt(
             user_input=user_input,
             plan=self._plan,
@@ -2231,8 +2235,9 @@ class Agent:
                 pass
         if self._drift_anchor_phash and "desktop_screenshot" in tools:
             try:
-                from visual_diff import hash_b64 as _vhash
                 import base64 as _b64
+
+                from visual_diff import hash_b64 as _vhash
                 raw = await self._registry.dispatch("desktop_screenshot", {})
                 shot = json.loads(raw)
                 h = _vhash(shot.get("base64_png", ""))
@@ -2716,6 +2721,7 @@ class Agent:
                 break
 
             # ---- Extract message and finish_reason -------------------
+            assert response is not None  # all fall-through paths above assign it
             try:
                 message = self._client.extract_message(response)
             except ValueError as e:
@@ -3473,7 +3479,7 @@ class Agent:
 
         candidates: list[tuple[int, dict, str]] = []
         for i, resp in enumerate(responses):
-            if isinstance(resp, Exception):
+            if isinstance(resp, BaseException):
                 continue
             try:
                 msg = self._client.extract_message(resp)

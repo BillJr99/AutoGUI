@@ -41,7 +41,7 @@ class StreamAggregator:
     OpenAI streaming tool-call protocol.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._meta: dict = {}
         self._text_parts: list[str] = []
         self._tool_calls: dict[int, dict] = {}

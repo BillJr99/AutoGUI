@@ -36,6 +36,7 @@ import base64
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +57,12 @@ class BrowserBackend:
         self._viewport = viewport or {"width": 1280, "height": 800}
         self._lock = asyncio.Lock()
 
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._page = None
+        # Playwright is imported lazily inside _ensure(); annotate as Any so
+        # mypy doesn't infer the attribute type as None.
+        self._playwright: Any = None
+        self._browser: Any = None
+        self._context: Any = None
+        self._page: Any = None
 
     # ------------------------------------------------------------------
     # Lifecycle

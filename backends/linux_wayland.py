@@ -169,8 +169,8 @@ class WaylandBackend(DesktopBackend):
         import time as _time
         cache_key = f"full:{resize_width}" if region is None else None
         if cache_key and self._screenshot_cache and self._cache_ttl > 0:
-            ts, key, cached = self._screenshot_cache
-            if key == cache_key and (_time.monotonic() - ts) < self._cache_ttl:
+            cached_at, key, cached = self._screenshot_cache
+            if key == cache_key and (_time.monotonic() - cached_at) < self._cache_ttl:
                 return dict(cached, cache_hit=True)
 
         cmd = ["grim"]
@@ -193,11 +193,11 @@ class WaylandBackend(DesktopBackend):
                 raise RuntimeError(stderr.decode(errors="replace").strip() or "grim failed")
 
             from PIL import Image
-            img = Image.open(io.BytesIO(stdout))
+            img: Image.Image = Image.open(io.BytesIO(stdout))
 
             if resize_width and img.width > resize_width:
                 ratio = resize_width / img.width
-                img = img.resize((resize_width, int(img.height * ratio)), Image.LANCZOS)
+                img = img.resize((resize_width, int(img.height * ratio)), Image.Resampling.LANCZOS)
 
             save_path = Path(save_dir)
             save_path.mkdir(parents=True, exist_ok=True)
@@ -445,8 +445,8 @@ class WaylandBackend(DesktopBackend):
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            restore_proc.stdin.write(old_out)
-            restore_proc.stdin.close()
+            restore_proc.stdin.write(old_out)  # type: ignore[union-attr]  # stdin=PIPE above
+            restore_proc.stdin.close()  # type: ignore[union-attr]
             await asyncio.wait_for(restore_proc.wait(), timeout=5)
 
             truncated = len(text) > max_chars

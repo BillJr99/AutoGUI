@@ -330,13 +330,17 @@ class X11Backend(DesktopBackend):
         match = None
         for w in windows_result.get("windows", []):
             if window_id and w.get("id", "").lower() == window_id.lower():
-                match = w; break
+                match = w
+                break
             if pid and w.get("pid") == int(pid):
-                match = w; break
+                match = w
+                break
             if title and title.lower() in w.get("title", "").lower():
-                match = w; break
+                match = w
+                break
             if app and app.lower() in w.get("app", "").lower():
-                match = w; break
+                match = w
+                break
 
         if not match:
             return {"error": "No window found matching the given criteria"}
@@ -361,7 +365,7 @@ class X11Backend(DesktopBackend):
                     return {"success": True, "active": True, "method": "wmctrl", **match}
         except FileNotFoundError:
             pass
-        except Exception as e:
+        except Exception:
             logger.debug("[x11:activate_window:wmctrl] %s", traceback.format_exc())
 
         # --- Try xdotool windowfocus ---
@@ -379,7 +383,7 @@ class X11Backend(DesktopBackend):
                         return {"success": True, "active": True, "method": "xdotool", **match}
             except FileNotFoundError:
                 pass
-            except Exception as e:
+            except Exception:
                 logger.debug("[x11:activate_window:xdotool] %s", traceback.format_exc())
 
         # --- Click fallback ---
@@ -445,8 +449,8 @@ class X11Backend(DesktopBackend):
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            restore_proc.stdin.write(old_out)
-            restore_proc.stdin.close()
+            restore_proc.stdin.write(old_out)  # type: ignore[union-attr]  # stdin=PIPE above
+            restore_proc.stdin.close()  # type: ignore[union-attr]
             await asyncio.wait_for(restore_proc.wait(), timeout=5)
 
             truncated = len(text) > max_chars

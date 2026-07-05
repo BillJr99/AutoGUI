@@ -14,6 +14,7 @@ with screen coordinates after the downscale is applied.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ def annotate(img, marks: list[dict]):
 
     draw = ImageDraw.Draw(img, mode="RGBA")
 
-    font = None
+    font: Any = None
     for size in (22, 18, 14):
         try:
             font = ImageFont.truetype("DejaVuSans-Bold.ttf", size)
@@ -72,8 +73,10 @@ def annotate(img, marks: list[dict]):
 
     for m in marks:
         try:
-            x = int(m["x"]); y = int(m["y"])
-            w = int(m.get("width", 0)); h = int(m.get("height", 0))
+            x = int(m["x"])
+            y = int(m["y"])
+            w = int(m.get("width", 0))
+            h = int(m.get("height", 0))
             if w <= 1 or h <= 1:
                 continue
         except (KeyError, TypeError, ValueError):

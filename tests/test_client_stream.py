@@ -18,7 +18,6 @@ from aiohttp import web
 
 from client import OpenWebUIClient, StreamAggregator
 
-
 # ---------------------------------------------------------------------------
 # Local SSE test server
 # ---------------------------------------------------------------------------
@@ -71,7 +70,8 @@ async def sse_server(stream_frames: list[str], non_stream_body: dict | None = No
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]  # type: ignore[attr-defined]
     client = OpenWebUIClient(
         base_url=f"http://127.0.0.1:{port}",
         api_key="",
@@ -265,7 +265,8 @@ async def test_http_error_status_raises():
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]  # type: ignore[attr-defined]
     client = OpenWebUIClient(
         base_url=f"http://127.0.0.1:{port}", api_key="", model="test-model",
         timeout_seconds=10,
