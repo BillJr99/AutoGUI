@@ -98,7 +98,8 @@ def _decode_clixml(text: str) -> str:
             )
             decoded.append(m.strip())
         return " | ".join(s for s in decoded if s)
-    except Exception:
+    except Exception as e:
+        logger.debug("[backend:wsl] window-text decode failed; returning raw text: %s", e)
         return text
 
 

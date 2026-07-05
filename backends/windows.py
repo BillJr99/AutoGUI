@@ -287,8 +287,9 @@ class WindowsBackend(DesktopBackend):
             base_result = await super().type_text(text)
             if isinstance(base_result, dict) and base_result.get("success"):
                 return base_result
-        except Exception:
-            pass  # Fall through to SendInput if clipboard fails.
+        except Exception as e:
+            # Fall through to SendInput if clipboard fails.
+            logger.debug("[backend:windows] clipboard type_text failed; using SendInput: %s", e)
 
         # 2. SendInput KEYEVENTF_UNICODE fallback with a small per-character
         # sleep so receiving windows have time to process each event.  The
@@ -440,8 +441,9 @@ class WindowsBackend(DesktopBackend):
                         app = psutil.Process(int(pid)).name()
                         if app.lower().endswith(".exe"):
                             app = app[:-4]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[backend:windows] process name lookup failed for pid %s: %s",
+                                     pid, e)
                     results.append({
                         "id": str(hwnd),
                         "title": title,
@@ -453,8 +455,9 @@ class WindowsBackend(DesktopBackend):
                         "width": int(right - left),
                         "height": int(bottom - top),
                     })
-                except Exception:
-                    pass  # skip windows that vanish mid-enumeration
+                except Exception as e:
+                    # skip windows that vanish mid-enumeration
+                    logger.debug("[backend:windows] window enumeration entry failed: %s", e)
                 return True
 
             win32gui.EnumWindows(_cb, None)

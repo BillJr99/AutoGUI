@@ -73,7 +73,8 @@ class MacOSBackend(DesktopBackend):
             return False
         try:
             return bool(ax.AXIsProcessTrusted())
-        except Exception:
+        except Exception as e:
+            logger.debug("[backend:macos] AXIsProcessTrusted probe failed: %s", e)
             return False
 
     async def screenshot(
@@ -208,8 +209,9 @@ class MacOSBackend(DesktopBackend):
                         "width": int(bounds.get("Width") or 0),
                         "height": int(bounds.get("Height") or 0),
                     })
-                except Exception:
-                    continue  # skip malformed entries
+                except Exception as e:
+                    logger.debug("[backend:macos] skipping malformed window entry: %s", e)
+                    continue
             return windows
 
         try:
@@ -462,7 +464,8 @@ end jsonEscape
             """Normalize pyobjc's (err, value) tuple / direct-value returns."""
             try:
                 result = ax.AXUIElementCopyAttributeValue(elem, attr, None)
-            except Exception:
+            except Exception as e:
+                logger.debug("[backend:macos] AX attribute %s read failed: %s", attr, e)
                 return None
             if isinstance(result, tuple):
                 err, value = result
@@ -485,7 +488,8 @@ end jsonEscape
                 import AppKit  # type: ignore
                 front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
                 return int(front.processIdentifier()) if front is not None else None
-            except Exception:
+            except Exception as e:
+                logger.debug("[backend:macos] frontmost-app pid lookup failed: %s", e)
                 return None
 
         def _do() -> dict:

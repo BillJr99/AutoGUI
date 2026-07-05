@@ -426,8 +426,8 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
             if _tui_event_callback is not None:
                 try:
                     _tui_event_callback(task_id, step)
-                except Exception:
-                    pass
+                except Exception as cb_exc:
+                    logger.debug("[api] TUI event callback failed for task %s: %s", task_id, cb_exc)
 
             if event.kind == "done":
                 break
@@ -450,8 +450,8 @@ async def _run_task_async(task_id: str, task_str: str, cfg: dict, dry_run: bool)
         if _tui_event_callback is not None:
             try:
                 _tui_event_callback(task_id, err_step)
-            except Exception:
-                pass
+            except Exception as cb_exc:
+                logger.debug("[api] TUI error-event callback failed for task %s: %s", task_id, cb_exc)
         task["status"] = "error"
 
     finally:

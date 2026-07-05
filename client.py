@@ -280,8 +280,11 @@ class OpenWebUIClient:
                             # .get("detail") may return None, dict, or list depending
                             # on the error format; normalize to str to avoid TypeError.
                             detail = str(json.loads(raw).get("detail") or "")
-                        except Exception:
-                            pass
+                        except Exception as parse_exc:
+                            logger.debug(
+                                "[client.py:chat] could not parse error detail from "
+                                "HTTP %s body: %s", resp.status, parse_exc,
+                            )
                         if resp.status == 400 and (
                             "startswith" in detail or "NoneType" in detail
                         ):
@@ -566,6 +569,9 @@ class OpenWebUIClient:
             except PermissionError:
                 raise
             except Exception as e:
+                logger.debug(
+                    "[client.py:fetch_models] endpoint probe failed, trying next: %s", e
+                )
                 last_exc = e
                 continue
 

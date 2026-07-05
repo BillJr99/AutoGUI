@@ -27,8 +27,8 @@ class X11Backend(DesktopBackend):
         try:
             import pyatspi  # noqa: F401
             find_element = True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[backend] pyatspi unavailable; find_element disabled: %s", e)
         caps.update({
             "find_element": find_element,
             "get_window_tree": False,
@@ -86,11 +86,13 @@ class X11Backend(DesktopBackend):
             def _node_to_dict(node):
                 try:
                     role_name = node.getRoleName()
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] getRoleName failed on node: %s", e)
                     role_name = ""
                 try:
                     n = node.name or ""
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] node name read failed: %s", e)
                     n = ""
                 rect = None
                 try:
@@ -98,8 +100,8 @@ class X11Backend(DesktopBackend):
                     extents = comp.getExtents(pyatspi.DESKTOP_COORDS)
                     rect = {"x": extents.x, "y": extents.y,
                             "width": extents.width, "height": extents.height}
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[backend:atspi] node extents read failed: %s", e)
                 return {"name": n, "control_type": role_name, "rect": rect}
 
             def _recurse(node, restrict_window=False):
@@ -113,7 +115,8 @@ class X11Backend(DesktopBackend):
                 try:
                     for child in node:
                         _recurse(child, restrict_window=restrict_window)
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] child iteration failed, pruning branch: %s", e)
                     return
 
             try:
@@ -124,7 +127,8 @@ class X11Backend(DesktopBackend):
                             if wanted_window and wanted_window not in top_name:
                                 continue
                             _recurse(top)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("[backend:atspi] app subtree walk failed, skipping: %s", e)
                         continue
             except Exception as e:
                 return {"error": f"AT-SPI walk failed: {e}"}
@@ -276,8 +280,10 @@ class X11Backend(DesktopBackend):
                             info["width"] = num
                         elif key == "HEIGHT":
                             info["height"] = num
-                except Exception:
-                    pass  # keep the partial record — title/geometry best-effort
+                except Exception as e:
+                    # keep the partial record — title/geometry best-effort
+                    logger.debug("[backend:x11] window geometry probe failed for %s: %s",
+                                 info.get("id"), e)
                 windows.append(info)
             return {"windows": windows, "count": len(windows), "method": "xdotool"}
         except FileNotFoundError:
@@ -297,7 +303,8 @@ class X11Backend(DesktopBackend):
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             dec = stdout.decode().strip()
             return int(dec) if dec else None
-        except Exception:
+        except Exception as e:
+            logger.debug("[backend:x11] active-window id lookup failed: %s", e)
             return None
 
     async def activate_window(

@@ -325,8 +325,8 @@ class Agent:
                     model=(cfg.get("openwebui") or {}).get("model") or "?",
                     vision=self._vision_screenshots,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] trace session_start meta write failed: %s", e)
 
         if self._skill_store is not None:
             self._register_skill_tools()
@@ -562,8 +562,8 @@ class Agent:
                     }
             try:
                 store.increment_success(str(name))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] skill success-counter update failed for %r: %s", name, e)
             return {"skill": name, "executed": executed, "step_count": len(executed), "success": True}
 
         # skill_save creates new on-disk records, so it is only registered
@@ -1043,13 +1043,13 @@ class Agent:
             if self._trace is not None:
                 try:
                     self._trace.write_event(event)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[agent] trace write_event failed: %s", e)
             if self._event_sink is not None:
                 try:
                     self._event_sink(event)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[agent] event sink callback failed: %s", e)
             yield event
 
     # ------------------------------------------------------------------
@@ -1089,8 +1089,12 @@ class Agent:
         if "desktop_list_windows" in available_tools:
             try:
                 windows_json = await self._registry.dispatch("desktop_list_windows", {})
-            except Exception:
-                pass
+            except Exception as e:
+                failure_verdict = classify(tool_name="desktop_list_windows", error_message=str(e))
+                logger.debug(
+                    "[agent] planner windows probe failed (%s): %s",
+                    failure_verdict.cls.value, e,
+                )
 
         # --- Few-shot exemplars + memory hints ---------------------------
         # Surface up to 3 successful skills with overlapping keywords as
@@ -1100,7 +1104,8 @@ class Agent:
         if self._suggest_skills and self._skill_store is not None:
             try:
                 exemplars = self._skill_store.search(user_input, limit=3)
-            except Exception:
+            except Exception as e:
+                logger.debug("[agent] skill exemplar search failed: %s", e)
                 exemplars = []
 
         memory_hints: list[str] = []
@@ -1436,8 +1441,8 @@ class Agent:
                         if active_app:
                             for tool in step.tools_hint or []:
                                 self._memory.record_success(app=active_app, tool=tool)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[agent] app-memory success recording failed: %s", e)
                 if self._progress is not None and self._task_progress is not None:
                     self._progress.mark_done(self._task_progress, step.id)
                 self._persist_progress()
@@ -1492,8 +1497,8 @@ class Agent:
                             failure_class=verdict_failure.cls.value,
                             reason=predicate_failure_detail or reason[:120],
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[agent] app-memory failure recording failed: %s", e)
             action = escalate_action(
                 verdict_failure,
                 retry_count=retry_count,
@@ -2200,13 +2205,23 @@ class Agent:
             try:
                 raw = await self._registry.dispatch("desktop_list_windows", {})
                 windows = json.loads(raw).get("windows") or []
-            except Exception:
+            except Exception as e:
+                failure_verdict = classify(tool_name="desktop_list_windows", error_message=str(e))
+                logger.debug(
+                    "[agent] watchdog window snapshot failed (%s): %s",
+                    failure_verdict.cls.value, e,
+                )
                 windows = []
         if "desktop_get_active_window" in tools:
             try:
                 raw = await self._registry.dispatch("desktop_get_active_window", {})
                 active = json.loads(raw) or {}
-            except Exception:
+            except Exception as e:
+                failure_verdict = classify(tool_name="desktop_get_active_window", error_message=str(e))
+                logger.debug(
+                    "[agent] watchdog active-window snapshot failed (%s): %s",
+                    failure_verdict.cls.value, e,
+                )
                 active = {}
         return {"windows": windows, "active": active}
 
@@ -2231,8 +2246,8 @@ class Agent:
                 titles = [str(w.get("title", "")) for w in wins if w.get("title")]
                 if titles:
                     anchor["window_titles"] = titles
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] drift-anchor window titles capture failed: %s", e)
         if self._drift_anchor_phash and "desktop_screenshot" in tools:
             try:
                 import base64 as _b64
@@ -2243,8 +2258,8 @@ class Agent:
                 h = _vhash(shot.get("base64_png", ""))
                 if h:
                     anchor["screen_phash_b64"] = _b64.b64encode(h).decode("ascii")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] drift-anchor screenshot phash failed: %s", e)
         return anchor
 
     async def _emit_recovery_probe(self, step_id: str, reason: str) -> dict | None:
@@ -2292,16 +2307,16 @@ class Agent:
             try:
                 raw = await self._registry.dispatch("desktop_get_active_window", {})
                 probe["active_window"] = json.loads(raw)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] recovery probe active-window capture failed: %s", e)
         if "desktop_list_windows" in tools:
             try:
                 raw = await self._registry.dispatch("desktop_list_windows", {})
                 wins = json.loads(raw)
                 if isinstance(wins, dict) and isinstance(wins.get("windows"), list):
                     probe["window_list"] = wins["windows"][:25]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] recovery probe window-list capture failed: %s", e)
         # Direct OSO observe — only when the backend has an attached client.
         backend = getattr(self._registry, "_backend", None)
         oso = getattr(backend, "_screen_observer", None) if backend else None
@@ -2314,8 +2329,8 @@ class Agent:
                         "diff_token": obs.get("diff_token"),
                         "description": obs.get("description"),
                     }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] recovery probe oso_observe failed: %s", e)
             # Full text bundle (description + sketch + depth-trimmed tree)
             # when text_observation is enabled.  Gives the recovery flow the
             # same perception payload as the success-path injection.
@@ -2324,8 +2339,8 @@ class Agent:
                     bundle = await self._build_oso_text_bundle()
                     if bundle is not None:
                         probe["oso_text"] = bundle
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[agent] recovery probe oso_text bundle failed: %s", e)
         return probe
 
     async def _build_oso_text_bundle(self) -> dict | None:
@@ -2377,7 +2392,8 @@ class Agent:
             return None
         try:
             wins = await oso.get_windows()
-        except Exception:
+        except Exception as e:
+            logger.debug("[agent] OSO get_windows for active-window index failed: %s", e)
             return None
         if not wins:
             return None
@@ -2399,7 +2415,8 @@ class Agent:
             info = json.loads(raw)
             win = info.get("window") or info or {}
             return _normalize_app(str(win.get("app") or win.get("title") or ""))
-        except Exception:
+        except Exception as e:
+            logger.debug("[agent] best-effort active-app lookup failed: %s", e)
             return ""
 
     async def _apply_default_verifier(
@@ -2519,8 +2536,8 @@ class Agent:
                         verifier.setdefault("kind", "visual_diff")
                         verifier.setdefault("detail",
                                             "perceptual hash stayed nearly identical")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[agent] visual-diff default verifier failed: %s", e)
 
         if verifier:
             result["verifier"] = verifier
@@ -2563,8 +2580,12 @@ class Agent:
             try:
                 windows_json = await self._registry.dispatch("desktop_list_windows", {})
                 initial_suffix += f"\n\n[Desktop state at task start: {windows_json}]"
-            except Exception:
-                pass
+            except Exception as e:
+                failure_verdict = classify(tool_name="desktop_list_windows", error_message=str(e))
+                logger.debug(
+                    "[agent] task-start desktop state probe failed (%s): %s",
+                    failure_verdict.cls.value, e,
+                )
 
         # ---- Planner pass (Phase 12) -------------------------------------
         # One extra LLM call BEFORE the executor loop produces a numbered
@@ -2606,7 +2627,8 @@ class Agent:
         if self._suggest_skills and self._skill_store is not None and "skill_run" in available_tools:
             try:
                 candidates = self._skill_store.search(user_input, limit=3)
-            except Exception:
+            except Exception as e:
+                logger.debug("[agent] skill candidate search failed: %s", e)
                 candidates = []
             if candidates:
                 lines = ["[Candidate saved skills (call skill_run if one matches):]"]
@@ -2651,7 +2673,10 @@ class Agent:
                 else:
                     self._history.append({"role": "user",
                                           "content": user_input + initial_suffix})
-            except Exception:
+            except Exception as e:
+                logger.debug(
+                    "[agent] vision first-turn screenshot failed; using text-only turn: %s", e
+                )
                 self._history.append({"role": "user",
                                       "content": user_input + initial_suffix})
         else:
@@ -2839,7 +2864,8 @@ class Agent:
                 try:
                     pre_json = await self._registry.dispatch("desktop_list_windows", {})
                     pre_windows = json.loads(pre_json).get("windows", [])
-                except Exception:
+                except Exception as e:
+                    logger.debug("[agent] pre-action window snapshot failed: %s", e)
                     pre_windows = None
 
             for tc in tool_calls:
@@ -2965,8 +2991,9 @@ class Agent:
                                     "Use desktop_list_windows to verify which applications are open."
                                 )
                             history_content = json.dumps(result_obj)
-                    except Exception:
-                        pass  # fall back to original history_content
+                    except Exception as e:
+                        # fall back to original history_content
+                        logger.debug("[agent] screenshot result annotation failed: %s", e)
 
                 # ---- fs_read: annotate result so model must analyze it -----
                 if tool_name == "fs_read" and not self._result_is_error(result_json):
@@ -2977,8 +3004,8 @@ class Agent:
                                 self._prompts.text("runtime_fs_read_annotation") + "\n"
                                 + history_content
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[agent] fs_read annotation failed: %s", e)
 
                 # ---- Stderr warning for shell_run with exit_code 0 ---------
                 # Some programs write real errors to stderr and still exit 0.
@@ -2992,8 +3019,8 @@ class Agent:
                                 self._prompts.text("runtime_stderr_warning") + "\n"
                                 + history_content
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[agent] shell stderr annotation failed: %s", e)
 
                 # ---- Track successful actions for coherence / duplicate check --
                 if not self._result_is_error(result_json):
@@ -3132,7 +3159,8 @@ class Agent:
                         modal_banner = ""
                         try:
                             post_windows = json.loads(windows_json).get("windows", [])
-                        except Exception:
+                        except Exception as e:
+                            logger.debug("[agent] post-action window list parse failed: %s", e)
                             post_windows = []
                         if pre_windows is not None:
                             pre_ids = {(w.get("id"), w.get("title", "")) for w in pre_windows}
@@ -3187,8 +3215,8 @@ class Agent:
                             content=f"Auto-verify windows: {windows_json[:200]}",
                             data={"tool_name": "desktop_list_windows", "iteration": iteration},
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[agent] auto-verify window listing failed: %s", e)
 
                 # Always take a screenshot after desktop actions so there is a
                 # real file on disk the user can inspect.  For vision-on models
@@ -3257,8 +3285,8 @@ class Agent:
                                 content=f"Auto-screenshot saved ({why}): {path_str} ({dims})",
                                 data={"tool_name": "desktop_screenshot", "iteration": iteration},
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[agent] auto-screenshot after desktop action failed: %s", e)
 
         # ---- Iteration ceiling reached --------------------------------
         yield AgentEvent(
@@ -3284,19 +3312,21 @@ class Agent:
             if self._recorder is not None:
                 self._recorder.stop()
                 self._recorder = None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[agent] recorder stop during shutdown failed: %s", e)
         try:
             if self._trace is not None:
                 self._trace.close()
                 self._trace = None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[agent] trace close during shutdown failed: %s", e)
 
     def __del__(self):
         try:
             self.shutdown()
         except Exception:
+            # Deliberately silent: __del__ may run during interpreter
+            # teardown when the logging machinery is already gone.
             pass
 
     @property
@@ -3485,7 +3515,8 @@ class Agent:
                 msg = self._client.extract_message(resp)
                 summary = self._summarize_candidate(msg)
                 candidates.append((i, resp, summary))
-            except Exception:
+            except Exception as e:
+                logger.debug("[agent] BoN candidate %d unusable, skipping: %s", i, e)
                 continue
 
         if not candidates:

@@ -46,8 +46,8 @@ class WaylandBackend(DesktopBackend):
         try:
             import pyatspi  # noqa: F401
             find_element = True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[backend] pyatspi unavailable; find_element disabled: %s", e)
         caps.update({
             "find_element": find_element,
             "get_window_tree": False,
@@ -96,11 +96,13 @@ class WaylandBackend(DesktopBackend):
             def _node_to_dict(node):
                 try:
                     role_name = node.getRoleName()
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] getRoleName failed on node: %s", e)
                     role_name = ""
                 try:
                     n = node.name or ""
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] node name read failed: %s", e)
                     n = ""
                 rect = None
                 try:
@@ -108,8 +110,8 @@ class WaylandBackend(DesktopBackend):
                     extents = comp.getExtents(pyatspi.DESKTOP_COORDS)
                     rect = {"x": extents.x, "y": extents.y,
                             "width": extents.width, "height": extents.height}
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[backend:atspi] node extents read failed: %s", e)
                 return {"name": n, "control_type": role_name, "rect": rect}
 
             def _recurse(node):
@@ -123,7 +125,8 @@ class WaylandBackend(DesktopBackend):
                 try:
                     for child in node:
                         _recurse(child)
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:atspi] child iteration failed, pruning branch: %s", e)
                     return
 
             try:
@@ -134,7 +137,8 @@ class WaylandBackend(DesktopBackend):
                             if wanted_window and wanted_window not in top_name:
                                 continue
                             _recurse(top)
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("[backend:atspi] app subtree walk failed, skipping: %s", e)
                         continue
             except Exception as e:
                 return {"error": f"AT-SPI walk failed: {e}"}

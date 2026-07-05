@@ -384,7 +384,8 @@ class DesktopBackend:
         marks: list[dict] = []
         try:
             wins = await self.list_windows()
-        except Exception:
+        except Exception as e:
+            logger.debug("[backend:marks] list_windows failed; no window marks: %s", e)
             return marks
         if not isinstance(wins, dict) or "windows" not in wins:
             return marks
@@ -603,7 +604,8 @@ class DesktopBackend:
                 # the user's clipboard isn't clobbered by automation.
                 try:
                     saved = pyperclip.paste()
-                except Exception:
+                except Exception as e:
+                    logger.debug("[backend:type_text] clipboard save failed: %s", e)
                     saved = None
                 pyperclip.copy(text)
                 # Tiny pause so the clipboard write is visible to the OS
@@ -616,8 +618,8 @@ class DesktopBackend:
                 if saved is not None:
                     try:
                         pyperclip.copy(saved)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("[backend:type_text] clipboard restore failed: %s", e)
                 result = {"success": True, "length": len(text), "method": "clipboard_paste"}
                 if self._screen_observer is not None:
                     obs = await self._screen_observer.observe()
