@@ -750,7 +750,8 @@ class WSLBackend(DesktopBackend):
             except asyncio.TimeoutError:
                 # Still running after 3 s — normal for GUI apps.
                 pass
-            result = {"success": True, "application": application, "args": args, "method": "direct"}
+            result = {"success": True, "application": application, "args": args,
+                      "pid": proc.pid, "method": "direct"}
         except Exception as direct_err:
             # Fall back to PowerShell Start-Process.
             try:
@@ -770,6 +771,7 @@ class WSLBackend(DesktopBackend):
                     "success": True,
                     "application": application,
                     "args": args,
+                    "pid": None,  # Start-Process pid is not surfaced here
                     "method": "powershell",
                 }
             except Exception as ps_err:

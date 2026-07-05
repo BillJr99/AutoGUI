@@ -338,14 +338,38 @@ window moves, and async UI redraws.
 | Platform     | Backend used                        | Install                                                |
 |--------------|-------------------------------------|--------------------------------------------------------|
 | Windows      | UIAutomation (`uiautomation` pkg)   | `pip install uiautomation pywin32`                     |
-| macOS        | Not available (Pi extension only)   | Use Pi extension for macOS AX element clicking                                         |
+| macOS        | System Events AX walk + AXPress     | `pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz` (optional; see below) |
 | Linux X11    | AT-SPI 2 (`pyatspi`)                | `sudo apt install python3-pyatspi gir1.2-atspi-2.0`    |
 | Linux Wayland| AT-SPI 2 (`pyatspi`)                | same as X11                                             |
+
+On macOS, `find_element` walks the frontmost process's accessibility tree
+via System Events (needs Accessibility permission for your terminal), and
+`desktop_click_element` performs the element's native `AXPress` action
+through `AXUIElementPerformAction` when the pyobjc ApplicationServices
+bindings are installed and the process is accessibility-trusted (reported
+as the `ax_actions` capability).  Without pyobjc it degrades to locating
+the element and clicking its rect centre.
 
 When the a11y backend isn't available the fallback ladder is:
 `desktop_click_text` (OCR/a11y text match) → `desktop_click_mark`
 (Set-of-Mark) → `desktop_click(x, y)`. The agent's system prompt
 encourages the model to walk this ladder.
+
+### Backend parity: launch and window listing
+
+Every backend now shares one `launch` / `list_windows` contract.  `launch`
+has a real generic default (detached subprocess spawn returning
+`{success, application, args, pid, method}`) with native overrides —
+`open -a` on macOS, `os.startfile`/detached spawn on Windows, PowerShell
+`Start-Process` on WSL.  `list_windows` gains native fallbacks so each
+platform returns the same window schema: `win32gui.EnumWindows` on Windows
+(when pywin32 is installed), `Quartz.CGWindowListCopyWindowInfo` on macOS
+(when AppleScript fails), and `xdotool` on X11 (when `wmctrl` is absent) —
+each degrading gracefully with an install hint when the tooling is missing.
+
+> **Note:** the macOS and Windows native paths are exercised in CI with
+> injected fake platform modules (mock-verified only); manual verification
+> on real hardware is still required.
 
 ### Browser automation (Playwright)
 

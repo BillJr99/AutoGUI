@@ -478,7 +478,8 @@ class WaylandBackend(DesktopBackend):
                     raise RuntimeError(stderr.decode(errors="replace").strip())
             except asyncio.TimeoutError:
                 pass
-            return {"success": True, "application": application, "args": args}
+            return {"success": True, "application": application, "args": args,
+                    "pid": proc.pid, "method": "subprocess"}
         except Exception as e:
             logger.debug("[wayland:launch] %s", traceback.format_exc())
             return {"error": str(e)}

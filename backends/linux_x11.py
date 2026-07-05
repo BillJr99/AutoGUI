@@ -205,9 +205,85 @@ class X11Backend(DesktopBackend):
                 })
             return {"windows": windows, "count": len(windows)}
         except FileNotFoundError:
+            # wmctrl missing — degrade to the xdotool fallback (same schema)
+            # before giving up with an install hint.
+            fallback = await self._list_windows_xdotool()
+            if "error" not in fallback:
+                return fallback
             return {"error": "wmctrl not found — install with: sudo apt install wmctrl"}
         except Exception as e:
             logger.debug("[x11:list_windows] %s", traceback.format_exc())
+            return {"error": str(e)}
+
+    async def _list_windows_xdotool(self) -> dict:
+        """wmctrl-less fallback: enumerate visible windows with xdotool.
+
+        Returns the same schema as the wmctrl path: ``{"windows":
+        [{id, pid, app, x, y, width, height, title}], "count": int}``.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "search", "--onlyvisible", "--name", ".",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            wids = [w for w in stdout.decode(errors="replace").split() if w.isdigit()]
+            windows = []
+            for wid in wids[:40]:  # cap the per-window subprocess fan-out
+                info = {"id": hex(int(wid)), "pid": 0, "app": "",
+                        "x": 0, "y": 0, "width": 0, "height": 0, "title": ""}
+                try:
+                    p = await asyncio.create_subprocess_exec(
+                        "xdotool", "getwindowname", wid,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    out, _ = await asyncio.wait_for(p.communicate(), timeout=5)
+                    info["title"] = out.decode(errors="replace").strip()
+
+                    p = await asyncio.create_subprocess_exec(
+                        "xdotool", "getwindowpid", wid,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    out, _ = await asyncio.wait_for(p.communicate(), timeout=5)
+                    pid_str = out.decode(errors="replace").strip()
+                    if pid_str.isdigit():
+                        info["pid"] = int(pid_str)
+                        try:
+                            from pathlib import Path as _P
+                            info["app"] = _P(f"/proc/{pid_str}/comm").read_text().strip()
+                        except OSError:
+                            pass
+
+                    p = await asyncio.create_subprocess_exec(
+                        "xdotool", "getwindowgeometry", "--shell", wid,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    out, _ = await asyncio.wait_for(p.communicate(), timeout=5)
+                    for line in out.decode(errors="replace").splitlines():
+                        key, _, value = line.partition("=")
+                        if not value.strip().lstrip("-").isdigit():
+                            continue
+                        num = int(value.strip())
+                        if key == "X":
+                            info["x"] = num
+                        elif key == "Y":
+                            info["y"] = num
+                        elif key == "WIDTH":
+                            info["width"] = num
+                        elif key == "HEIGHT":
+                            info["height"] = num
+                except Exception:
+                    pass  # keep the partial record — title/geometry best-effort
+                windows.append(info)
+            return {"windows": windows, "count": len(windows), "method": "xdotool"}
+        except FileNotFoundError:
+            return {"error": "xdotool not found — install with: sudo apt install xdotool"}
+        except Exception as e:
+            logger.debug("[x11:_list_windows_xdotool] %s", traceback.format_exc())
             return {"error": str(e)}
 
     async def _get_active_wid_int(self) -> int | None:
@@ -402,7 +478,8 @@ class X11Backend(DesktopBackend):
                     raise RuntimeError(stderr.decode(errors="replace").strip())
             except asyncio.TimeoutError:
                 pass  # GUI app still running — expected
-            return {"success": True, "application": application, "args": args}
+            return {"success": True, "application": application, "args": args,
+                    "pid": proc.pid, "method": "subprocess"}
         except Exception as e:
             logger.debug("[x11:launch] %s", traceback.format_exc())
             return {"error": str(e)}

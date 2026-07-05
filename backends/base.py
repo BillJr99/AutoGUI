@@ -728,7 +728,38 @@ class DesktopBackend:
         application: str,
         args: list[str] | None = None,
     ) -> dict:
-        return {"error": "launch not implemented for this platform"}
+        """Generic default: spawn the application as a detached subprocess.
+
+        Platform subclasses override this with native launchers (`open -a`
+        on macOS, Start-Process via PowerShell on WSL, DETACHED_PROCESS on
+        Windows) but every backend keeps the same return schema:
+        ``{"success": True, "application", "args", "pid", "method"}`` or
+        ``{"error": str}``.
+        """
+        try:
+            parts = [application] + [str(a) for a in (args or [])]
+            proc = await asyncio.create_subprocess_exec(
+                *parts,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=3)
+                if proc.returncode not in (0, None):
+                    raise RuntimeError(stderr.decode(errors="replace").strip())
+            except asyncio.TimeoutError:
+                pass  # GUI app still running after 3 s — expected.
+            return {
+                "success": True,
+                "application": application,
+                "args": args or [],
+                "pid": proc.pid,
+                "method": "subprocess",
+            }
+        except Exception as e:
+            logger.debug("[backend:launch] %s", traceback.format_exc())
+            return {"error": str(e)}
 
     # ------------------------------------------------------------------
     # Optional extended capabilities
