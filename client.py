@@ -69,7 +69,12 @@ class StreamAggregator:
             if event.get("id"):
                 slot["id"] = event["id"]
             if event.get("name"):
-                slot["function"]["name"] += event["name"]
+                # The function name is sent whole (per the OpenAI protocol);
+                # some providers repeat it across deltas. Overwrite rather
+                # than concatenate so a repeated name doesn't become
+                # "shell_runshell_run" and break dispatch. Only ``arguments``
+                # fragments are streamed and accumulated.
+                slot["function"]["name"] = event["name"]
             if event.get("arguments"):
                 slot["function"]["arguments"] += event["arguments"]
         elif etype == "finish":
@@ -475,8 +480,7 @@ class OpenWebUIClient:
                         done = True
 
         except aiohttp.ClientError as e:
-            print(f"[client.py:chat_stream] HTTP client error: {e}")
-            traceback.print_exc()
+            logger.exception("[client.py:chat_stream] HTTP client error")
             raise RuntimeError(f"[client.py:chat_stream] Connection error: {e}") from e
 
         if not done:

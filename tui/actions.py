@@ -8,7 +8,6 @@ original tui.py as a mixin of ``AgentTUI``.
 
 import json
 import logging
-import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -118,8 +117,7 @@ class AgentTUIActionsMixin(_Base):
                 f"[dim]History saved to {self._history_file}[/dim]"
             )
         except Exception as e:
-            print(f"[tui.py:action_save] {e}")
-            traceback.print_exc()
+            logger.exception("[tui.py:action_save] history save failed")
             self.query_one("#conversation", RichLog).write(f"[red]Save failed: {e}[/red]")
 
     async def action_toggle_tools(self) -> None:

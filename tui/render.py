@@ -9,7 +9,6 @@ tui.py as a mixin of ``AgentTUI``.
 
 import asyncio
 import logging
-import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -230,8 +229,7 @@ class AgentTUIRenderMixin(_Base):
             self._log_session("CANCELLED by user")
             raise
         except Exception as e:
-            print(f"[tui.py:_run_agent_work] {e}")
-            traceback.print_exc()
+            logger.exception("[tui.py:_run_agent_work] agent work failed")
             log.write(f"[bold red]Internal error: {e}[/bold red]")
             self._log_session(f"INTERNAL_ERROR: {e}")
         finally:

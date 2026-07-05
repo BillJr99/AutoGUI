@@ -293,3 +293,18 @@ def test_aggregator_defaults_finish_reason():
     agg.add({"type": "tool_call_delta", "index": 0, "id": "c1",
              "name": "t", "arguments": "{}"})
     assert agg.response()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_aggregator_repeated_name_delta_does_not_concatenate():
+    """A provider that repeats the function name across deltas must not
+    yield "shell_runshell_run"; only the arguments fragments accumulate."""
+    agg = StreamAggregator()
+    agg.add({"type": "tool_call_delta", "index": 0, "id": "c1",
+             "name": "shell_run", "arguments": '{"comm'})
+    # Second delta repeats the name (some providers do this) and streams
+    # the rest of the arguments.
+    agg.add({"type": "tool_call_delta", "index": 0,
+             "name": "shell_run", "arguments": 'and": "ls"}'})
+    call = agg.response()["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "shell_run"
+    assert json.loads(call["function"]["arguments"]) == {"command": "ls"}

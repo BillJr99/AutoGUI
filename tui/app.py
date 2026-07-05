@@ -139,7 +139,7 @@ class AgentTUI(
         self.show_tools = self._tui_cfg.get("show_tool_calls", True)
         # Per-session log file — created on mount, one file per TUI invocation.
         self._session_log: Path | None = None
-        # Logging handler that routes WARNING+ records into the
+        # Logging handler that routes INFO+ records into the
         # conversation pane so library warnings (urllib3, asyncio, etc.)
         # don't paint over the TUI layout.  Installed on mount, removed
         # on unmount.  See _install_log_handler for details.

@@ -138,6 +138,11 @@ async def shell_run(
             timed_out = False
         except asyncio.TimeoutError:
             proc.kill()
+            # Reap the killed process so it doesn't linger as a zombie.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
             stdout_b, stderr_b = b"", b""
             timed_out = True
 
@@ -165,12 +170,17 @@ async def fs_read(path: str, max_bytes: int = 65536) -> dict:
             return {"error": f"Path does not exist: {path}"}
         if p.is_dir():
             return {"error": f"Path is a directory; use fs_list instead: {path}"}
-        content = p.read_bytes()
+        # Report the true file size from stat(), but only read up to
+        # max_bytes + 1 bytes: enough to decide truncation without pulling a
+        # potentially huge file into memory.
+        size_bytes = p.stat().st_size
+        with p.open("rb") as fh:
+            content = fh.read(max_bytes + 1)
         truncated = len(content) > max_bytes
         return {
             "content": content[:max_bytes].decode("utf-8", errors="replace"),
             "truncated": truncated,
-            "size_bytes": len(content),
+            "size_bytes": size_bytes,
         }
     except Exception as e:
         print(f"[tools.py:fs_read] {e}")

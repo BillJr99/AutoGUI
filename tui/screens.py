@@ -7,6 +7,7 @@ used by command-palette config editing.  Split out of the original tui.py.
 
 import logging
 
+from rich.markup import escape as _rich_escape
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -110,14 +111,16 @@ class ModelPickerScreen(ModalScreen):
         try:
             self._models = await self._client.fetch_models()
         except Exception as e:
-            self.query_one("#picker-status", Static).update(f"[red]Error: {e}[/red]")
+            self.query_one("#picker-status", Static).update(
+                f"[red]Error: {_rich_escape(str(e))}[/red]"
+            )
             return
 
         lv = self.query_one("#model-list", ListView)
         lv.clear()
         for m in self._models:
             marker = " [green]●[/green]" if m == self._current_model else ""
-            lv.append(ListItem(Label(f"{m}{marker}", markup=True)))
+            lv.append(ListItem(Label(f"{_rich_escape(m)}{marker}", markup=True)))
 
         n = len(self._models)
         self.query_one("#picker-status", Static).update(

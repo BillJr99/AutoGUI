@@ -54,10 +54,16 @@ class _TUILogHandler(logging.Handler):
 
     main.py installs a stderr StreamHandler at WARNING; under the TUI
     that paints raw ``[WARNING] …`` lines over the layout.  We attach
-    this handler on mount and detach the stderr handler so warnings
+    this handler on mount and detach the stderr handler so records
     coming from our own code or from libraries (urllib3 retry, asyncio,
     pyautogui fail-safe, etc.) land in the visible conversation log
     instead.
+
+    The handler is constructed at ``INFO`` so INFO-and-above records are
+    forwarded; ``emit`` colours them by severity (dim for INFO, yellow
+    for WARNING, red for ERROR/CRITICAL).  What actually reaches the
+    conversation pane is still gated by the effective level of the
+    emitting logger.
     """
 
     def __init__(self, app: "AgentTUI") -> None:
