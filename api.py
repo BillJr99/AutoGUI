@@ -514,9 +514,58 @@ async def list_tools():
         return {"ok": True, "tools": [], "warning": "Tool registry unavailable."}
 
 
+def _task_sse_stream(task: dict) -> AsyncIterator[str]:
+    """
+    Shared SSE generator over a task's accumulated steps.
+
+    Polls ``task["steps"]`` by index so every subscriber gets the full
+    event history independently — events already emitted are replayed
+    first, then live events follow until the task reaches a terminal
+    status, when a ``{"kind": "done", "finished": true}`` sentinel closes
+    the stream.
+    """
+
+    async def _event_gen() -> AsyncIterator[str]:
+        sent = 0
+        while True:
+            # Drain any steps that have arrived since last iteration.
+            steps = task["steps"]
+            while sent < len(steps):
+                payload = json.dumps(steps[sent], default=str)
+                yield f"data: {payload}\n\n"
+                sent += 1
+
+            # Task finished — flush any trailing steps and close stream.
+            if task["status"] in ("done", "error", "cancelled"):
+                steps = task["steps"]
+                while sent < len(steps):
+                    payload = json.dumps(steps[sent], default=str)
+                    yield f"data: {payload}\n\n"
+                    sent += 1
+                yield f'data: {{"kind": "done", "finished": true}}\n\n'
+                return
+
+            # Not done yet — brief poll interval (also acts as a keep-alive).
+            await asyncio.sleep(0.1)
+
+    return _event_gen()
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",  # disable Nginx buffering when behind a proxy
+}
+
+
 @app.post("/api/task", status_code=202)
-async def create_task(req: TaskRequest):
-    """Submit a new task.  Returns immediately with a task_id."""
+async def create_task(req: TaskRequest, stream: bool = False):
+    """Submit a new task.
+
+    Returns immediately with a task_id, or — with ``?stream=true`` — a
+    ``text/event-stream`` of the task's AgentEvents.  The streamed variant
+    emits a ``{"kind": "task_created", "task_id": ...}`` frame first, then
+    the same event sequence ``GET /api/task/{id}/stream`` would deliver.
+    """
     logger.info("POST /api/task inbound body: %s", json.dumps(req.model_dump()))
 
     if not req.task.strip():
@@ -560,6 +609,21 @@ async def create_task(req: TaskRequest):
     _TASK_HANDLES[task_id] = async_task
 
     logger.info("Created task %s: %r (dry_run=%s)", task_id, req.task[:80], effective_dry_run)
+
+    if stream:
+        task = TASKS[task_id]
+
+        async def _created_then_events() -> AsyncIterator[str]:
+            yield f'data: {json.dumps({"kind": "task_created", "task_id": task_id})}\n\n'
+            async for frame in _task_sse_stream(task):
+                yield frame
+
+        return StreamingResponse(
+            _created_then_events(),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
     return {"ok": True, "task_id": task_id}
 
 
@@ -588,36 +652,10 @@ async def stream_task(task_id: str):
     """
     task = _task_or_404(task_id)
 
-    async def _event_gen() -> AsyncIterator[str]:
-        sent = 0
-        while True:
-            # Drain any steps that have arrived since last iteration.
-            steps = task["steps"]
-            while sent < len(steps):
-                payload = json.dumps(steps[sent], default=str)
-                yield f"data: {payload}\n\n"
-                sent += 1
-
-            # Task finished — flush any trailing steps and close stream.
-            if task["status"] in ("done", "error", "cancelled"):
-                steps = task["steps"]
-                while sent < len(steps):
-                    payload = json.dumps(steps[sent], default=str)
-                    yield f"data: {payload}\n\n"
-                    sent += 1
-                yield f'data: {{"kind": "done", "finished": true}}\n\n'
-                return
-
-            # Not done yet — brief poll interval (also acts as a keep-alive).
-            await asyncio.sleep(0.1)
-
     return StreamingResponse(
-        _event_gen(),
+        _task_sse_stream(task),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable Nginx buffering when behind a proxy
-        },
+        headers=_SSE_HEADERS,
     )
 
 

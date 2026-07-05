@@ -447,6 +447,54 @@ class TestStreamTask:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/task?stream=true — direct SSE run endpoint
+# ---------------------------------------------------------------------------
+
+class TestCreateTaskStreaming:
+    def test_stream_true_returns_event_stream(self):
+        TASKS.clear()
+        _TASK_HANDLES.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            r = client.post("/api/task?stream=true", json={"task": "run streamed"})
+            assert r.status_code == 200
+            assert "text/event-stream" in r.headers.get("content-type", "")
+
+    def test_stream_true_emits_task_created_then_events_then_done(self):
+        import json as _json
+        TASKS.clear()
+        _TASK_HANDLES.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            r = client.post("/api/task?stream=true", json={"task": "run streamed events"})
+            payloads = []
+            for line in r.text.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        payloads.append(_json.loads(line[len("data:"):].strip()))
+                    except _json.JSONDecodeError:
+                        pass
+            assert payloads, "no SSE data frames in response"
+            # First frame announces the task id so the caller can poll/cancel.
+            assert payloads[0].get("kind") == "task_created"
+            task_id = payloads[0].get("task_id")
+            assert task_id in TASKS
+            # The stream carries AgentEvents and closes with the done sentinel.
+            kinds = [p.get("kind") for p in payloads[1:]]
+            assert "done" in kinds
+            assert any(k not in ("task_created", "done") for k in kinds)
+
+    def test_stream_false_path_unchanged(self):
+        """Without ?stream=true, the endpoint still returns 202 + task_id JSON."""
+        TASKS.clear()
+        _TASK_HANDLES.clear()
+        with TestClient(app, raise_server_exceptions=True) as client:
+            r = client.post("/api/task", json={"task": "plain submit"})
+            assert r.status_code == 202
+            data = r.json()
+            assert data["ok"] is True
+            assert data["task_id"] in TASKS
+
+
+# ---------------------------------------------------------------------------
 # Error shape consistency
 # ---------------------------------------------------------------------------
 

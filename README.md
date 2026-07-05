@@ -490,6 +490,16 @@ installation required, and no API key needed.  The `openwebui` config
 section name is kept for backwards compatibility; it works for any
 OpenAI-compatible endpoint regardless of whether OpenWebUI is involved.
 
+#### Streaming responses
+
+Set `"stream": true` in the `openwebui` section to have the agent consume the
+endpoint's SSE streaming interface.  Assistant text then arrives as
+incremental `text_delta` events — rendered live in the TUI output pane — with
+the complete message still following as the usual `text` event, so consumers
+that ignore deltas see no behavioural change.  If a stream fails mid-call the
+agent falls back to a non-streaming request (once per step) automatically.
+Default: `false`.
+
 ### Verify connectivity
 
 ```bash
@@ -577,6 +587,11 @@ TASK_ID=$(curl -s -X POST http://localhost:8002/api/task \
 
 # Stream live events
 curl -N http://localhost:8002/api/task/$TASK_ID/stream
+
+# Or submit and stream in one call (SSE; first frame carries the task_id)
+curl -N -X POST 'http://localhost:8002/api/task?stream=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"task": "Take a screenshot of the desktop"}'
 
 # Or poll for the finished result
 curl -s http://localhost:8002/api/task/$TASK_ID | python3 -m json.tool

@@ -233,6 +233,12 @@ Submit a new automation task. Returns immediately with a `task_id`; the agent ru
 {"ok": true, "task_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6"}
 ```
 
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `stream` | bool | `false` | With `?stream=true` the endpoint responds `200` with `text/event-stream` instead of the JSON envelope: a `{"kind": "task_created", "task_id": ...}` frame first, then the task's AgentEvents live (same format as `GET /api/task/{task_id}/stream`), closed by the `{"kind": "done", "finished": true}` sentinel. The non-streaming behaviour is unchanged when the parameter is absent. |
+
 ---
 
 ### GET /api/task/{task_id}

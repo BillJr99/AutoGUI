@@ -651,6 +651,12 @@ class AgentTUI(App):
         # paint the terminal) and re-attach them on uninstall so the
         # process's logging state is restored when the TUI exits.
         self._displaced_handlers: list[tuple[logging.Logger, logging.Handler]] = []
+        # Streamed text_delta accumulation (openwebui.stream=true): deltas
+        # are buffered and flushed to the conversation pane one completed
+        # line at a time (RichLog is append-only, so partial lines wait for
+        # their newline or for the final "text" event).
+        self._stream_buffer: str = ""
+        self._streamed_this_turn: bool = False
 
     # ------------------------------------------------------------------
     # Composition
@@ -744,6 +750,11 @@ class AgentTUI(App):
         input_widget = self.query_one("#input-bar", Input)
 
         self._log_session(f"USER: {user_input}")
+
+        # Reset streamed-text state so leftovers from an aborted run never
+        # bleed into this one.
+        self._stream_buffer = ""
+        self._streamed_this_turn = False
 
         try:
             async for event in self._agent.run(user_input):
@@ -845,11 +856,34 @@ class AgentTUI(App):
                     self._log_session(f"{event.kind.upper()}: {event.content}")
                     continue
 
+                if event.kind == "text_delta":
+                    # Live streamed fragment — append to the output pane at
+                    # line granularity (RichLog is append-only, so a partial
+                    # line stays buffered until its newline arrives or the
+                    # final "text" event flushes it).
+                    if not self._streamed_this_turn:
+                        self._streamed_this_turn = True
+                        log.write("\n[bold white]Agent:[/bold white]")
+                    self._stream_buffer += event.content
+                    while "\n" in self._stream_buffer:
+                        line, self._stream_buffer = self._stream_buffer.split("\n", 1)
+                        log.write(line)
+                    continue
+
                 iteration = event.data.get("iteration", "?")
                 self._update_status(f"Running… iteration {iteration}")
 
                 if event.kind == "text":
-                    log.write(f"\n[bold white]Agent:[/bold white] {event.content}")
+                    if self._streamed_this_turn:
+                        # The text already streamed into the pane via
+                        # text_delta events — just flush any partial line
+                        # instead of repeating the full message.
+                        if self._stream_buffer:
+                            log.write(self._stream_buffer)
+                        self._stream_buffer = ""
+                        self._streamed_this_turn = False
+                    else:
+                        log.write(f"\n[bold white]Agent:[/bold white] {event.content}")
                     self._log_session(f"AGENT [{iteration}]: {event.content}")
 
                 elif event.kind == "tool_call":
@@ -1232,6 +1266,11 @@ class AgentTUI(App):
             if seq == 0:
                 log.write(f"\n[bold cyan]⟳ API task [{short_id}…]:[/bold cyan]")
 
+            if kind == "text_delta":
+                # Streamed fragments are too granular for the API bridge's
+                # per-line rendering; the final "text" event carries the
+                # complete message.
+                return
             if kind == "plan":
                 log.write(f"[cyan]  Plan: {content}[/cyan]")
             elif kind == "text":

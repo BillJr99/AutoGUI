@@ -22,6 +22,9 @@ plumbing in the callers.
 AgentEvent types
 ----------------
   "text"       — A text segment from the assistant.
+  "text_delta" — An incremental text fragment streamed from the assistant
+                 (only when openwebui.stream is enabled); the complete text
+                 still follows as a normal "text" event.
   "tool_call"  — The model is about to invoke a tool (name + args).
   "tool_result" — The result of a tool call.
   "error"      — An error occurred (message included).
@@ -41,7 +44,7 @@ from typing import Any, AsyncIterator, Callable
 from app_memory import AppMemory, _normalize_app
 from artifacts import ArtifactStore
 from budget import BudgetTracker
-from client import OpenWebUIClient
+from client import OpenWebUIClient, StreamAggregator
 from controller import (
     Plan,
     PlanStep,
@@ -111,7 +114,8 @@ class AgentEvent:
     Fields
     ------
     kind : str
-        One of "text", "tool_call", "tool_result", "error", "done".
+        One of "text", "text_delta", "tool_call", "tool_result", "error",
+        "done".
     content : str
         Human-readable content string appropriate to the kind.
     data : dict
@@ -217,6 +221,16 @@ class Agent:
         # so vision-capable models can actually see it.  Set False for text-only models.
         self._vision_screenshots: bool = bool(self._agent_cfg.get("vision_screenshots", True))
         logger.info("[agent] vision_screenshots=%s", self._vision_screenshots)
+
+        # Streaming chat (openwebui.stream, default false): when enabled the
+        # chat call sites iterate client.chat_stream and emit a "text_delta"
+        # AgentEvent per text fragment before the usual final "text" event.
+        # Gated on the client actually exposing chat_stream so stub clients
+        # without it keep working unchanged.
+        self._stream_enabled: bool = bool(
+            (cfg.get("openwebui") or {}).get("stream", False)
+        ) and hasattr(client, "chat_stream")
+        logger.info("[agent] stream=%s", self._stream_enabled)
 
         # Pre-create the screenshots directory at startup so it's always
         # there for the user to inspect, even if a backend's screenshot()
@@ -977,6 +991,35 @@ class Agent:
                 step.status = StepStatus.FAILED
 
     # ------------------------------------------------------------------
+    # Streaming chat helper
+    # ------------------------------------------------------------------
+
+    async def _chat_streamed(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> dict:
+        """
+        One streaming chat call: iterate ``client.chat_stream``, forward each
+        text fragment to ``on_text_delta`` as it arrives, and return the
+        aggregated response (shape-identical to ``client.chat()``).
+
+        Raises on any stream failure — the caller decides the fallback
+        (one non-streaming retry per step).
+        """
+        aggregator = StreamAggregator()
+        async for delta in self._client.chat_stream(messages=messages, tools=tools):
+            aggregator.add(delta)
+            if (
+                on_text_delta is not None
+                and delta.get("type") == "text_delta"
+                and delta.get("text")
+            ):
+                on_text_delta(delta["text"])
+        return aggregator.response()
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
@@ -1238,11 +1281,36 @@ class Agent:
                 data={"step": step.to_public(), "attempts": step.attempts},
             )
 
-            verdict, reason, used_iters, failure = await self._run_step(
-                user_input=user_input,
-                step=step,
-                event_yield=None,  # we re-yield via the queue below
-            )
+            if self._stream_enabled:
+                # Streaming: run the step as a task and drain its event
+                # queue concurrently so text_delta events reach the caller
+                # while the step is still executing.
+                step_queue: asyncio.Queue = asyncio.Queue()
+                step_task = asyncio.create_task(self._run_step(
+                    user_input=user_input,
+                    step=step,
+                    event_yield=step_queue.put_nowait,
+                ))
+                while True:
+                    getter = asyncio.create_task(step_queue.get())
+                    finished, _ = await asyncio.wait(
+                        {getter, step_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if getter in finished:
+                        yield getter.result()
+                        continue
+                    getter.cancel()
+                    break
+                while not step_queue.empty():
+                    yield step_queue.get_nowait()
+                verdict, reason, used_iters, failure = step_task.result()
+            else:
+                verdict, reason, used_iters, failure = await self._run_step(
+                    user_input=user_input,
+                    step=step,
+                    event_yield=None,  # no live event forwarding when not streaming
+                )
             global_iter += used_iters
 
             # Predicate verification: when the step declared a typed
@@ -1574,6 +1642,10 @@ class Agent:
         Per-step history is constructed fresh from the system prompt + the
         scoped step prompt — it does NOT touch ``self._history``, so steps
         don't contaminate each other's context.
+
+        ``event_yield`` — optional callable receiving AgentEvent objects to
+        forward live (used for "text_delta" events while streaming); pass
+        None to drop intra-step events.
         """
         # Watchdog history is per-step: a "stuck on step X" signal must
         # not bleed into step Y, even when both legitimately repeat the
@@ -1673,6 +1745,19 @@ class Agent:
         # genuinely-stuck model still escalates.
         _gemma_format_reminder_used = False
 
+        # Streaming: try chat_stream while this stays True; on the first
+        # stream failure fall back to non-streaming for the REST of the
+        # step (one fallback per step, per the streaming contract).
+        stream_active = self._stream_enabled
+
+        def _emit_text_delta(fragment: str) -> None:
+            if event_yield is not None:
+                event_yield(AgentEvent(
+                    kind="text_delta",
+                    content=fragment,
+                    data={"step": step.id},
+                ))
+
         while iterations < self._step_max_iterations:
             iterations += 1
 
@@ -1687,10 +1772,27 @@ class Agent:
                 break
 
             try:
-                response = await self._client.chat(
-                    messages=local_history,
-                    tools=self._registry.schemas,
-                )
+                response = None
+                if stream_active:
+                    try:
+                        response = await self._chat_streamed(
+                            local_history,
+                            self._registry.schemas,
+                            on_text_delta=_emit_text_delta,
+                        )
+                    except Exception as stream_exc:
+                        stream_active = False
+                        logger.warning(
+                            "[agent] step %s: chat_stream failed (%s); "
+                            "falling back to non-streaming for the rest of "
+                            "this step.",
+                            step.id, stream_exc,
+                        )
+                if response is None:
+                    response = await self._client.chat(
+                        messages=local_history,
+                        tools=self._registry.schemas,
+                    )
                 if self._budget is not None:
                     self._budget.record_chat(response)
             except Exception as e:
@@ -2551,6 +2653,9 @@ class Agent:
             self._history.append({"role": "user", "content": user_input + initial_suffix})
 
         iteration = 0
+        # Streaming: try chat_stream while this stays True; the first stream
+        # failure falls back to non-streaming for the rest of the run.
+        stream_active = self._stream_enabled
 
         while iteration < self._max_iterations:
             iteration += 1
@@ -2571,10 +2676,34 @@ class Agent:
                         },
                     )
                 else:
-                    response = await self._client.chat(
-                        messages=self._history,
-                        tools=self._registry.schemas,
-                    )
+                    response = None
+                    if stream_active:
+                        try:
+                            aggregator = StreamAggregator()
+                            async for delta in self._client.chat_stream(
+                                messages=self._history,
+                                tools=self._registry.schemas,
+                            ):
+                                aggregator.add(delta)
+                                if delta.get("type") == "text_delta" and delta.get("text"):
+                                    yield AgentEvent(
+                                        kind="text_delta",
+                                        content=delta["text"],
+                                        data={"iteration": iteration},
+                                    )
+                            response = aggregator.response()
+                        except Exception as stream_exc:
+                            stream_active = False
+                            logger.warning(
+                                "[agent.py:run] chat_stream failed on iteration "
+                                "%d (%s); falling back to non-streaming.",
+                                iteration, stream_exc,
+                            )
+                    if response is None:
+                        response = await self._client.chat(
+                            messages=self._history,
+                            tools=self._registry.schemas,
+                        )
             except Exception as e:
                 print(f"[agent.py:run] API call failed on iteration {iteration}: {e}")
                 traceback.print_exc()
