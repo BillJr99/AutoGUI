@@ -914,7 +914,15 @@ The default suite — no display, no LLM, no network. Drives
 `Agent._run_with_controller` through scripted `StubClient` responses and
 asserts the controller / planner / artifact / predicate / failure /
 memory / budget / preflight / watchdog / visual-diff modules behave
-correctly. Stays green on every push; runs in <5 s.
+correctly. `tests/test_agent_loop.py` drives the full agent loop (both
+the legacy ReAct executor and the controller path) with a scripted fake
+client: tool dispatch + history feedback, failed-tool retry directives,
+the hallucination guards, budget stops, progress persistence/resume,
+and the streaming (`text_delta`) paths. `tests/test_client_stream.py`
+exercises the SSE streaming client against a local scripted server, and
+`tests/test_backends.py` mock-verifies the platform backends' launch /
+list_windows / macOS AX-click parity. Stays green on every push; runs
+in <10 s.
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
