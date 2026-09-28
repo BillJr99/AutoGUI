@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.74.2",
-    "@earendil-works/pi-coding-agent": "^0.79.10",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
     "typebox": "^1.0.55"
   },
   "devDependencies": {
